@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=myRemote
+Comment=Control this desktop using the Apple TV Remote on your iPhone
+Exec=myremote
+Icon=myremote
+Terminal=false
+Categories=Utility;

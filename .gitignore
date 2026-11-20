@@ -1,0 +1,13 @@
+/target/
+/dist/
+/.upstream-atv-core/
+._*
+__pycache__/
+*.sync-conflict-*
+**/identity.key
+**/phone-*.pub
+**/receiver.lock
+.env*
+*.pem
+*.p12
+*.pfx

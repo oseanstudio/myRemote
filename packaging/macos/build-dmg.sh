@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+version=${1:?Pass the Cargo package version}
+[[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$root"
+target_dir=${CARGO_TARGET_DIR:-"$root/target"}
+staging="$(mktemp -d)"
+trap 'rm -rf "$staging"' EXIT
+app="$staging/myRemote.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" dist
+export MACOSX_DEPLOYMENT_TARGET=14.0
+
+for target in aarch64-apple-darwin x86_64-apple-darwin; do
+    rustup target add "$target"
+    cargo build --locked --release --target "$target" --bin myremote
+done
+lipo -create \
+    "$target_dir/aarch64-apple-darwin/release/myremote" \
+    "$target_dir/x86_64-apple-darwin/release/myremote" \
+    -output "$app/Contents/MacOS/myremote"
+lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/myremote"
+
+cp packaging/macos/Info.plist "$app/Contents/Info.plist"
+cp LICENSE "$app/Contents/Resources/"
+python3 packaging/dependency-notices.py aarch64-apple-darwin "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"
+plutil -lint "$app/Contents/Info.plist"
+codesign --force --sign - "$app"
+codesign --verify --strict "$app"
+test "$("$app/Contents/MacOS/myremote" --version)" = "myRemote $version"
+ln -s /Applications "$staging/Applications"
+hdiutil create -ov -format UDZO -volname "myRemote $version" -srcfolder "$staging" "dist/myRemote-macOS-Universal.dmg"
+hdiutil verify "dist/myRemote-macOS-Universal.dmg"

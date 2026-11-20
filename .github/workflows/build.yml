@@ -1,0 +1,161 @@
+name: Build and release myRemote
+
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: python3 tests/check_public_source.py
+      - id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [[ "$GITHUB_REF_TYPE" == tag ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            package: macOS-Universal
+          - runner: ubuntu-24.04
+            package: Linux-x86_64
+            architecture: x86_64
+          - runner: ubuntu-24.04-arm
+            package: Linux-aarch64
+            architecture: aarch64
+          - runner: windows-2025
+            package: Windows-x64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            package: Windows-arm64
+            target: aarch64-pc-windows-msvc
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - run: rustup update stable
+      - run: cargo fmt --all -- --check
+      - run: cargo test --locked
+      - name: Test with an independent Companion client
+        if: runner.os == 'Linux' && runner.arch == 'X64'
+        shell: bash
+        run: |
+          cargo build --locked
+          python3 -m venv target/interop
+          target/interop/bin/python -m pip install pyatv==0.18.0 srptools==1.0.1
+          target/interop/bin/python tests/companion_smoke.py target/debug/myremote
+      - name: Build a universal macOS DMG
+        if: runner.os == 'macOS'
+        run: bash packaging/macos/build-dmg.sh "$VERSION"
+      - name: Build a Linux AppImage
+        if: runner.os == 'Linux'
+        env:
+          ARCHITECTURE: ${{ matrix.architecture }}
+        run: bash packaging/linux/build-appimage.sh "$ARCHITECTURE" "$VERSION"
+      - name: Build a Windows ZIP
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          PACKAGE: ${{ matrix.package }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          rustup target add $env:TARGET
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cargo build --locked --release --target $env:TARGET
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $binary = "target/$env:TARGET/release/myremote.exe"
+          $version = & $binary --version
+          if ($LASTEXITCODE -or $version -ne "myRemote $env:VERSION") { throw 'Unexpected version' }
+          New-Item -ItemType Directory -Path dist | Out-Null
+          python packaging/dependency-notices.py $env:TARGET dist/THIRD-PARTY-NOTICES.txt
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          Compress-Archive -Path $binary,LICENSE,docs/setup.md,dist/THIRD-PARTY-NOTICES.txt -DestinationPath "dist/myRemote-$env:PACKAGE.zip"
+      - name: Write and verify release checksum
+        shell: bash
+        run: |
+          cd dist
+          for asset in myRemote-*; do
+            openssl dgst -sha256 -r "$asset" | awk '{print $1 "  " $2}' > "$asset.sha256"
+            test -s "$asset.sha256"
+          done
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: myRemote-${{ matrix.package }}
+          path: dist/myRemote-*
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: myRemote-*
+          merge-multiple: true
+          path: release
+      - name: Publish the versioned release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd release
+          tag="v$VERSION"
+          packages=(
+            myRemote-macOS-Universal.dmg
+            myRemote-Linux-x86_64.AppImage
+            myRemote-Linux-aarch64.AppImage
+            myRemote-Windows-x64.zip
+            myRemote-Windows-arm64.zip
+          )
+          assets=()
+          for package in "${packages[@]}"; do
+            test -s "$package"
+            sha256sum --check "$package.sha256"
+            assets+=("$package" "$package.sha256")
+          done
+          if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$draft" == false ]]; then exit 0; fi
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --verify-tag --draft --title "myRemote $VERSION" \
+              --notes "Includes a universal macOS DMG (ad-hoc signed), Linux AppImages, and Windows ZIPs. See the [setup guide](https://github.com/$GH_REPO/blob/$tag/docs/setup.md) for desktop permissions and iPhone pairing."
+          fi
+          uploaded=$(gh release view "$tag" --json assets --jq '.assets[].name')
+          for asset in "${assets[@]}"; do
+            grep -Fxq "$asset" <<< "$uploaded"
+          done
+          gh release edit "$tag" --draft=false --latest

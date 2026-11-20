@@ -1,0 +1,49 @@
+[package]
+name = "myremote"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.90"
+license = "MIT"
+description = "Control your desktop with the iPhone's built-in Apple TV Remote"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+ed25519-dalek = "2"
+hex = "0.4"
+hkdf = "0.12"
+mdns-sd = "0.13"
+num-bigint = "0.4"
+num-traits = "0.2"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
+uuid = "1"
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std", "NSAlert", "NSApplication", "NSButton", "NSControl", "NSImage", "NSMenu", "NSMenuItem",
+    "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem",
+    "NSView", "NSWorkspace", "objc2-core-foundation",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSURL"] }
+
+[target.'cfg(windows)'.dependencies]
+tray-icon = { version = "0.26.1", default-features = false }
+windows = { version = "0.61", features = [
+    "Win32_Media_Audio_Endpoints",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Console",
+    "Win32_System_Variant",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+] }
