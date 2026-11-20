@@ -102,8 +102,9 @@ jobs:
         run: |
           cd dist
           for asset in myRemote-*; do
-            openssl dgst -sha256 -r "$asset" | awk '{print $1 "  " $2}' > "$asset.sha256"
-            test -s "$asset.sha256"
+            digest=$(openssl dgst -sha256 -r "$asset" | awk '{print $1}')
+            [[ "$digest" =~ ^[a-f0-9]{64}$ ]]
+            printf '%s  %s\n' "$digest" "$asset" > "$asset.sha256"
           done
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
