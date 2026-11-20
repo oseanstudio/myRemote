@@ -7,14 +7,18 @@ use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
     NSMenuItem, NSStatusBar, NSWorkspace,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSURL};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
 use tokio::runtime::Runtime;
 
-use crate::{start_receiver, ActiveReceiver, Options, VERSION};
+use crate::{start_receiver, update::Updater, ActiveReceiver, Options, VERSION};
 
 const STATUS: isize = 1;
 const PAIR: isize = 2;
 const TOGGLE: isize = 3;
+const UPDATE_STATUS: isize = 4;
+const UPDATE_NOW: isize = 5;
+const AUTO_CHECK: isize = 6;
+const AUTO_INSTALL: isize = 7;
 
 struct State {
     options: Options,
@@ -22,6 +26,7 @@ struct State {
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     needs_accessibility: Cell<bool>,
+    updater: RefCell<Updater>,
 }
 
 define_class!(
@@ -52,6 +57,19 @@ define_class!(
             if let Some(item) = menu.itemWithTag(TOGGLE) {
                 item.setTitle(if active.is_some() { objc2_foundation::ns_string!("Stop Receiver") }
                               else { objc2_foundation::ns_string!("Start Receiver") });
+            }
+            let updater = self.ivars().updater.borrow();
+            if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
+                item.setTitle(&NSString::from_str(updater.status()));
+            }
+            if let Some(item) = menu.itemWithTag(UPDATE_NOW) {
+                item.setEnabled(!updater.busy());
+            }
+            if let Some(item) = menu.itemWithTag(AUTO_CHECK) {
+                item.setState(isize::from(updater.checking()));
+            }
+            if let Some(item) = menu.itemWithTag(AUTO_INSTALL) {
+                item.setState(isize::from(updater.automatic()));
             }
         }
     }
@@ -89,17 +107,42 @@ define_class!(
             self.stop();
             NSApplication::sharedApplication(self.mtm()).stop(None);
         }
+
+        #[unsafe(method(myRemoteUpdateNow:))]
+        fn update_now(&self, _sender: &NSMenuItem) {
+            self.ivars().updater.borrow_mut().update_now();
+        }
+
+        #[unsafe(method(myRemoteAutoCheck:))]
+        fn toggle_checks(&self, _sender: &NSMenuItem) {
+            self.ivars().updater.borrow_mut().toggle_checks();
+        }
+
+        #[unsafe(method(myRemoteAutoInstall:))]
+        fn toggle_install(&self, _sender: &NSMenuItem) {
+            self.ivars().updater.borrow_mut().toggle_installation();
+        }
+
+        #[unsafe(method(myRemotePollUpdates:))]
+        fn poll_updates(&self, _timer: &NSTimer) {
+            if self.ivars().updater.borrow_mut().poll() {
+                self.stop();
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+            }
+        }
     }
 );
 
 impl MenuController {
     fn new(mtm: MainThreadMarker, options: Options, runtime: Runtime) -> Retained<Self> {
+        let updater = RefCell::new(Updater::new(&options));
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
             needs_accessibility: Cell::new(false),
+            updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
         unsafe { msg_send![super(this), init] }
@@ -196,6 +239,26 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             0,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        controller.add_item(&menu, "Updates", None, UPDATE_STATUS);
+        controller.add_item(
+            &menu,
+            "Update Now",
+            Some(sel!(myRemoteUpdateNow:)),
+            UPDATE_NOW,
+        );
+        controller.add_item(
+            &menu,
+            "Check for Updates Automatically",
+            Some(sel!(myRemoteAutoCheck:)),
+            AUTO_CHECK,
+        );
+        controller.add_item(
+            &menu,
+            "Install Updates Automatically",
+            Some(sel!(myRemoteAutoInstall:)),
+            AUTO_INSTALL,
+        );
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Quit myRemote", Some(sel!(myRemoteQuit:)), 0);
 
         let bar = NSStatusBar::systemStatusBar();
@@ -219,7 +282,18 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         if controller.ivars().options.pair {
             controller.show_pairing();
         }
+        // Keeps update downloads and verification off the main thread.
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                0.25,
+                &controller,
+                sel!(myRemotePollUpdates:),
+                None,
+                true,
+            )
+        };
         app.run();
+        timer.invalidate();
         controller.stop();
         bar.removeStatusItem(&item);
     });

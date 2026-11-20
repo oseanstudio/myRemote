@@ -11,6 +11,7 @@ mod input;
 mod mac_menu;
 #[cfg(any(windows, target_os = "linux"))]
 mod tray_menu;
+mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -278,6 +279,18 @@ async fn shutdown_signal() -> io::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--apply-update")
+    {
+        return match update::run_helper() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("myRemote update: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     let options = match Options::parse() {
         Ok(Some(options)) => options,
         Ok(None) => return std::process::ExitCode::SUCCESS,
@@ -304,6 +317,7 @@ fn main() -> std::process::ExitCode {
 }
 
 fn launch(options: Options) -> Result<(), Box<dyn std::error::Error>> {
+    update::clean_helper();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

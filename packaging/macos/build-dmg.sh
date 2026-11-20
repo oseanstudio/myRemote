@@ -20,7 +20,7 @@ lipo -create \
     "$target_dir/aarch64-apple-darwin/release/myremote" \
     "$target_dir/x86_64-apple-darwin/release/myremote" \
     -output "$app/Contents/MacOS/myremote"
-lipo -verify_arch arm64 x86_64 "$app/Contents/MacOS/myremote"
+lipo "$app/Contents/MacOS/myremote" -verify_arch arm64 x86_64
 
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/"

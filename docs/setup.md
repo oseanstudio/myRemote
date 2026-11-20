@@ -21,6 +21,12 @@ The phone can reconnect after a server restart. Run the receiver on another comp
 
 The macOS build is ad-hoc signed. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it. Grant Accessibility again after an update if macOS prompts.
 
+### Updates
+
+**Check for Updates Automatically** is on by default. myRemote checks GitHub shortly after launch and every six hours. **Update Now** checks, downloads, verifies, installs, and relaunches myRemote when a newer release is available. Enable **Install Updates Automatically** to do the same whenever a check finds an update. Turning off automatic checks also turns off automatic installation.
+
+Install myRemote in a writable folder to enable replacement. On macOS, move the app out of the DMG first. On Linux, launch the AppImage itself and have `curl` installed. An update briefly interrupts the receiver and preserves pairing and settings.
+
 On Linux, get the [udev rule](../packaging/70-myremote-uinput.rules) from the source repository and run these commands once from the folder containing it.
 
 ```sh

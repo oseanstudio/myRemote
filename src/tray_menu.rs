@@ -7,11 +7,11 @@ use std::time::Duration;
 
 use tokio::runtime::Runtime;
 use tray_icon::{
-    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder,
 };
 
-use crate::{shutdown_signal, start_receiver, ActiveReceiver, Options, VERSION};
+use crate::{shutdown_signal, start_receiver, update::Updater, ActiveReceiver, Options, VERSION};
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
@@ -23,6 +23,21 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let pair = MenuItem::new("Pair iPhone…", false, None);
     let code = MenuItem::new("Pairing closed", false, None);
     let toggle = MenuItem::new("Start Receiver", true, None);
+    let mut updater = Updater::new(&options);
+    let update_status = MenuItem::new(updater.status(), false, None);
+    let update_now = MenuItem::new("Update Now", true, None);
+    let check_updates = CheckMenuItem::new(
+        "Check for Updates Automatically",
+        true,
+        updater.checking(),
+        None,
+    );
+    let install_updates = CheckMenuItem::new(
+        "Install Updates Automatically",
+        true,
+        updater.automatic(),
+        None,
+    );
     let quit = MenuItem::new("Quit myRemote", true, None);
     menu.append_items(&[
         &version,
@@ -31,6 +46,11 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         &pair,
         &code,
         &toggle,
+        &PredefinedMenuItem::separator(),
+        &update_status,
+        &update_now,
+        &check_updates,
+        &install_updates,
         &PredefinedMenuItem::separator(),
         &quit,
     ])?;
@@ -60,6 +80,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     #[cfg(windows)]
     let message_loop = windows_loop::MessageLoop::new()?;
     let mut displayed_code = None;
+    let mut displayed_update = updater.status().to_owned();
+    let mut update_busy = false;
     let mut pending_event = None;
     let events = MenuEvent::receiver();
     while !quit_requested.load(Ordering::Relaxed) {
@@ -83,6 +105,19 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
                     receiver.state.enable_pairing();
                 }
             }
+            if event.id == *update_now.id() {
+                updater.update_now();
+            }
+            if event.id == *check_updates.id() {
+                updater.toggle_checks();
+                check_updates.set_checked(updater.checking());
+                install_updates.set_checked(updater.automatic());
+            }
+            if event.id == *install_updates.id() {
+                updater.toggle_installation();
+                check_updates.set_checked(updater.checking());
+                install_updates.set_checked(updater.automatic());
+            }
         }
         let pin = active
             .as_ref()
@@ -100,6 +135,17 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
         if quit_requested.load(Ordering::Relaxed) {
             break;
+        }
+        if updater.poll() {
+            break;
+        }
+        if displayed_update != updater.status() {
+            displayed_update = updater.status().to_owned();
+            update_status.set_text(&displayed_update);
+        }
+        if update_busy != updater.busy() {
+            update_busy = updater.busy();
+            update_now.set_enabled(!update_busy);
         }
         #[cfg(windows)]
         if !message_loop.dispatch()? {
