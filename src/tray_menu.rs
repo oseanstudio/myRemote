@@ -92,7 +92,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             }
             if event.id == *toggle.id() {
                 if let Some(receiver) = active.take() {
-                    runtime.block_on(receiver.receiver.stop());
+                    runtime.block_on(receiver.stop());
                     status.set_text("Receiver stopped");
                     pair.set_enabled(false);
                     toggle.set_text("Start Receiver");
@@ -157,7 +157,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
     }
     if let Some(active) = active {
-        runtime.block_on(active.receiver.stop());
+        runtime.block_on(active.stop());
     }
     Ok(())
 }

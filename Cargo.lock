@@ -892,13 +892,15 @@ dependencies = [
 
 [[package]]
 name = "myremote"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
  "evdev",
  "hex",
  "hkdf",
+ "if-addrs",
+ "libc",
  "mdns-sd",
  "num-bigint",
  "num-traits",
@@ -910,6 +912,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2 0.6.5",
  "subtle",
  "tempfile",
  "thiserror",

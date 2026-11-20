@@ -24,6 +24,19 @@ lipo "$app/Contents/MacOS/myremote" -verify_arch arm64 x86_64
 
 cp packaging/macos/Info.plist "$app/Contents/Info.plist"
 cp LICENSE "$app/Contents/Resources/"
+iconset="$staging/AppIcon.iconset"
+mkdir -p "$iconset"
+swift packaging/macos/icon.swift "$iconset/icon_512x512@2x.png"
+for pixels in 16 32 128 256 512; do
+    sips -z "$pixels" "$pixels" "$iconset/icon_512x512@2x.png" --out "$iconset/icon_${pixels}x${pixels}.png" >/dev/null
+    if [[ "$pixels" != 512 ]]; then
+        retina=$((pixels * 2))
+        sips -z "$retina" "$retina" "$iconset/icon_512x512@2x.png" --out "$iconset/icon_${pixels}x${pixels}@2x.png" >/dev/null
+    fi
+done
+iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+test -s "$app/Contents/Resources/AppIcon.icns"
+rm -r "$iconset"
 python3 packaging/dependency-notices.py aarch64-apple-darwin "$app/Contents/Resources/THIRD-PARTY-NOTICES.txt"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $version" "$app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $version" "$app/Contents/Info.plist"

@@ -11,7 +11,7 @@ def git(*args):
 
 allowed_files = {".gitattributes", ".gitignore", "Cargo.toml", "Cargo.lock", "README.md", "LICENSE"}
 allowed_dirs = {".github", "docs", "packaging", "src", "tests"}
-allowed_extensions = {".rs", ".md", ".py", ".sh", ".yml", ".plist", ".rules", ".desktop", ".svg"}
+allowed_extensions = {".rs", ".md", ".py", ".sh", ".swift", ".yml", ".plist", ".rules", ".desktop", ".svg"}
 markers = re.compile(
     rb"-----BEGIN [A-Z ]*PRIVATE " rb"KEY-----"
     rb"|" rb"gh[pousr]_[A-Za-z0-9]{20,}"

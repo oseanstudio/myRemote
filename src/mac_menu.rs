@@ -10,7 +10,9 @@ use objc2_app_kit::{
 use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
 use tokio::runtime::Runtime;
 
-use crate::{start_receiver, update::Updater, ActiveReceiver, Options, VERSION};
+use crate::{
+    input, mac_bonjour, start_receiver, update::Updater, ActiveReceiver, Options, VERSION,
+};
 
 const STATUS: isize = 1;
 const PAIR: isize = 2;
@@ -19,13 +21,15 @@ const UPDATE_STATUS: isize = 4;
 const UPDATE_NOW: isize = 5;
 const AUTO_CHECK: isize = 6;
 const AUTO_INSTALL: isize = 7;
+const ACCESSIBILITY: isize = 8;
+const LOCAL_NETWORK: isize = 9;
 
 struct State {
     options: Options,
     runtime: Runtime,
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
-    needs_accessibility: Cell<bool>,
+    accessibility_requested: Cell<bool>,
     updater: RefCell<Updater>,
 }
 
@@ -42,14 +46,19 @@ define_class!(
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
             let active = self.ivars().active.borrow();
-            let status = match active.as_ref() {
-                Some(receiver) => format!("Listening on {}", receiver.ip),
-                None if self.ivars().needs_accessibility.get() => "Accessibility permission required".to_owned(),
-                None if self.ivars().error.borrow().is_some() => "Receiver could not start".to_owned(),
-                None => "Receiver stopped".to_owned(),
+            let discovery = active.as_ref().and_then(|receiver| receiver.bonjour.as_ref())
+                .map(mac_bonjour::Bonjour::status);
+            let status = match discovery {
+                Some(mac_bonjour::Status::Starting) => "Starting Bonjour discovery…",
+                Some(mac_bonjour::Status::Ready) => "Receiver ready on the local network",
+                Some(mac_bonjour::Status::LocalNetworkPermission) => "Local Network permission needed",
+                Some(mac_bonjour::Status::Failed) => "Bonjour discovery could not start",
+                None if active.is_some() => "Receiver ready for a Tailscale bridge",
+                None if self.ivars().error.borrow().is_some() => "Receiver could not start",
+                None => "Receiver stopped",
             };
             if let Some(item) = menu.itemWithTag(STATUS) {
-                item.setTitle(&NSString::from_str(&status));
+                item.setTitle(&NSString::from_str(status));
             }
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
@@ -57,6 +66,12 @@ define_class!(
             if let Some(item) = menu.itemWithTag(TOGGLE) {
                 item.setTitle(if active.is_some() { objc2_foundation::ns_string!("Stop Receiver") }
                               else { objc2_foundation::ns_string!("Start Receiver") });
+            }
+            if let Some(item) = menu.itemWithTag(ACCESSIBILITY) {
+                item.setHidden(self.ivars().options.dry_run || input::accessibility_is_trusted());
+            }
+            if let Some(item) = menu.itemWithTag(LOCAL_NETWORK) {
+                item.setHidden(discovery.is_none() || discovery == Some(mac_bonjour::Status::Ready));
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
@@ -89,17 +104,20 @@ define_class!(
                 let error = self.ivars().error.borrow().clone();
                 if let Some(error) = error {
                     self.alert("Unable to start myRemote", &error);
+                } else {
+                    self.request_accessibility(false);
                 }
             }
         }
 
         #[unsafe(method(myRemoteAccessibility:))]
         fn accessibility(&self, _sender: &NSMenuItem) {
-            if let Some(url) = NSURL::URLWithString(objc2_foundation::ns_string!(
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"
-            )) {
-                NSWorkspace::sharedWorkspace().openURL(&url);
-            }
+            self.request_accessibility(true);
+        }
+
+        #[unsafe(method(myRemoteLocalNetwork:))]
+        fn local_network(&self, _sender: &NSMenuItem) {
+            open_settings("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork");
         }
 
         #[unsafe(method(myRemoteQuit:))]
@@ -125,6 +143,9 @@ define_class!(
 
         #[unsafe(method(myRemotePollUpdates:))]
         fn poll_updates(&self, _timer: &NSTimer) {
+            if self.ivars().active.borrow().is_some() {
+                self.request_accessibility(false);
+            }
             if self.ivars().updater.borrow_mut().poll() {
                 self.stop();
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
@@ -141,7 +162,7 @@ impl MenuController {
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
-            needs_accessibility: Cell::new(false),
+            accessibility_requested: Cell::new(false),
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -154,23 +175,33 @@ impl MenuController {
             Ok(receiver) => {
                 state.active.replace(Some(receiver));
                 state.error.replace(None);
-                state.needs_accessibility.set(false);
             }
             Err(error) => {
-                state.needs_accessibility.set(
-                    error
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied),
-                );
                 state.error.replace(Some(error.to_string()));
             }
+        }
+    }
+
+    fn request_accessibility(&self, clicked: bool) {
+        let state = self.ivars();
+        if state.options.dry_run || state.accessibility_requested.get() && !clicked {
+            return;
+        }
+        if input::accessibility_is_trusted() {
+            state.accessibility_requested.set(true);
+        } else if state.accessibility_requested.replace(true) && clicked {
+            open_settings(
+                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+            );
+        } else {
+            input::request_accessibility();
         }
     }
 
     fn stop(&self) {
         let state = self.ivars();
         if let Some(active) = state.active.take() {
-            state.runtime.block_on(active.receiver.stop());
+            state.runtime.block_on(active.stop());
         }
     }
 
@@ -218,6 +249,12 @@ impl MenuController {
     }
 }
 
+fn open_settings(location: &str) {
+    if let Some(url) = NSURL::URLWithString(&NSString::from_str(location)) {
+        NSWorkspace::sharedWorkspace().openURL(&url);
+    }
+}
+
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
     let mtm = MainThreadMarker::new().ok_or("macOS menu must run on the main thread")?;
     autoreleasepool(|_| {
@@ -234,9 +271,15 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.add_item(&menu, "Start Receiver", Some(sel!(myRemoteToggle:)), TOGGLE);
         controller.add_item(
             &menu,
-            "Accessibility Settings…",
+            "Allow Accessibility…",
             Some(sel!(myRemoteAccessibility:)),
-            0,
+            ACCESSIBILITY,
+        );
+        controller.add_item(
+            &menu,
+            "Local Network Settings…",
+            Some(sel!(myRemoteLocalNetwork:)),
+            LOCAL_NETWORK,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Updates", None, UPDATE_STATUS);

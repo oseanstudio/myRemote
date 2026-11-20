@@ -16,10 +16,12 @@ The phone can reconnect after a server restart. Run the receiver on another comp
 | OS | Setup |
 | --- | --- |
 | Windows | Extract the ZIP and open `myremote.exe`. If Windows Firewall asks, allow access on your private network. Windows limits synthetic input into elevated apps and secure screens. |
-| macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. The app opens in the menu bar. In its menu, open **Accessibility Settings…**, grant myRemote access, then choose **Start Receiver**. Allow Local Network access if prompted. |
+| macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. Open the app to start the receiver. macOS prompts for Accessibility and Local Network access as needed. Allow both, then choose **Pair iPhone…** from the menu bar. |
 | Linux | Make the AppImage executable and launch it. The tray requires a desktop that supports StatusNotifier/AppIndicator. The receiver uses `/dev/uinput` for Wayland and X11. |
 
 The macOS build is ad-hoc signed. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it. Grant Accessibility again after an update if macOS prompts.
+
+If your iPhone cannot see myRemote, check the status at the top of the Mac menu. Use **Local Network Settings…** if macOS blocked discovery. Connect the iPhone and the computer to the same LAN when using local discovery.
 
 ### Updates
 
@@ -61,9 +63,19 @@ The current release covers pointer movement, left-click, navigation, and media c
 ./myremote --help
 ```
 
-The server uses the selected LAN IPv4 address and Bonjour/mDNS. Use `--ip` if the automatic selection picks a VPN or a different adapter. The iPhone must be able to reach UDP 5353 for discovery and the three TCP ports reported by `--verbose`. Guest Wi‑Fi and client isolation may block discovery. Pairing and input stay on your local network.
+The receiver uses Bonjour for discovery. On macOS, it advertises through the system Bonjour service and listens on IPv4 and IPv6 by default. On Windows and Linux, use `--ip` to select a LAN adapter if needed. Guest Wi‑Fi and client isolation can block discovery.
 
 Pairing opens only when you request it, and closes after a successful pairing or after two minutes. The server verifies each paired controller and encrypts the input session. To revoke access, stop myRemote and run `myremote --forget-phones` with the same `--state-dir` override, if used. If the iPhone still shows outdated credentials, remove the old device from the picker if available, reopen Control Center, and pair again.
+
+## Tailscale
+
+If the iPhone and computer share a LAN, use normal Bonjour discovery even while Tailscale is connected. For different networks, run a myRemote bridge on a computer that shares the iPhone's Wi‑Fi and can reach the target over Tailscale. Tailscale carries the connection between the bridge and the target. The Apple TV Remote still discovers the bridge on local Wi‑Fi.
+
+1. Quit myRemote on the target, then start it with `myremote --menu --tailscale-host TARGET_IP`. On a Mac, use `open -a myRemote --args --menu --tailscale-host TARGET_IP`. Replace `TARGET_IP` with the target's Tailscale IPv4 address.
+2. On the bridge computer, run `myremote --tailscale-bridge TARGET_IP`. If needed, pass `--ip BRIDGE_LAN_IP` to pick its Wi‑Fi-facing adapter. Allow the bridge to use its local network if prompted.
+3. On the target, choose **Pair iPhone…**. On the iPhone, open Apple TV Remote and pick the target's name. Enter the code shown on the target.
+
+Allow the bridge to reach the target on TCP ports 49151–49154 in your tailnet policy. Pairing and encryption still terminate at the target. The bridge forwards encrypted input without handling the pairing keys.
 
 ## Build and test
 

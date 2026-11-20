@@ -19,10 +19,8 @@ pub const ASSET: &str = "myRemote-macOS-Universal.dmg";
 pub const ASSET: &str = "myRemote-Linux-x86_64.AppImage";
 #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 pub const ASSET: &str = "myRemote-Linux-aarch64.AppImage";
-#[cfg(all(windows, target_arch = "x86_64"))]
+#[cfg(windows)]
 pub const ASSET: &str = "myRemote-Windows-x64.zip";
-#[cfg(all(windows, target_arch = "aarch64"))]
-pub const ASSET: &str = "myRemote-Windows-arm64.zip";
 
 #[cfg(target_os = "macos")]
 const PAYLOAD: &str = "myRemote.app";

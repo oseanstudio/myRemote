@@ -50,9 +50,6 @@ jobs:
           - runner: windows-2025
             package: Windows-x64
             target: x86_64-pc-windows-msvc
-          - runner: windows-11-arm
-            package: Windows-arm64
-            target: aarch64-pc-windows-msvc
     env:
       VERSION: ${{ needs.prepare.outputs.version }}
     steps:
@@ -62,6 +59,11 @@ jobs:
       - run: rustup update stable
       - run: cargo fmt --all -- --check
       - run: cargo test --locked
+      - name: Resolve myRemote through native Bonjour
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --locked
+          python3 tests/bonjour_smoke.py target/debug/myremote
       - name: Test with an independent Companion client
         if: runner.os == 'Linux' && runner.arch == 'X64'
         shell: bash
@@ -140,20 +142,19 @@ jobs:
             myRemote-Linux-x86_64.AppImage
             myRemote-Linux-aarch64.AppImage
             myRemote-Windows-x64.zip
-            myRemote-Windows-arm64.zip
           )
           assets=()
           for package in "${packages[@]}"; do
             test -s "$package"
             sha256sum --check "$package.sha256"
-            assets+=("$package" "$package.sha256")
+            assets+=("$package")
           done
           if draft=$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null); then
             if [[ "$draft" == false ]]; then exit 0; fi
             gh release upload "$tag" "${assets[@]}" --clobber
           else
             gh release create "$tag" "${assets[@]}" --verify-tag --draft --title "myRemote $VERSION" \
-              --notes "Includes a universal macOS DMG (ad-hoc signed), Linux AppImages, and Windows ZIPs. See the [setup guide](https://github.com/$GH_REPO/blob/$tag/docs/setup.md) for desktop permissions and iPhone pairing."
+              --notes "Includes a universal macOS DMG (ad-hoc signed), Linux AppImages, and a Windows x64 ZIP. If you are running 0.2.1, download and install this version once to switch to GitHub's built-in asset verification. See the [setup guide](https://github.com/$GH_REPO/blob/$tag/docs/setup.md) for permissions and pairing."
           fi
           uploaded=$(gh release view "$tag" --json assets --jq '.assets[].name')
           for asset in "${assets[@]}"; do

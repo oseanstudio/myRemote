@@ -1,10 +1,12 @@
 use std::io;
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::Duration;
 
 use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceInfo};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
@@ -19,10 +21,16 @@ const MAX_CONNECTIONS: usize = 32;
 const SOURCE_VERSION: &str = "715.2";
 
 pub struct Receiver {
-    mdns: ServiceDaemon,
-    services: Vec<String>,
+    mdns: Option<(ServiceDaemon, Vec<String>)>,
     listeners: Vec<JoinHandle<()>>,
     pub ports: [u16; 3],
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct DiscoveryRecord {
+    pub service_type: String,
+    pub port: u16,
+    pub txt: Vec<(String, String)>,
 }
 
 impl Receiver {
@@ -33,44 +41,141 @@ impl Receiver {
         mode: TrackpadMode,
         input: Arc<dyn RemoteInput>,
     ) -> Result<Self> {
-        let mrp = bind(ip, 49152).await?;
-        let companion = bind(ip, 49153).await?;
-        let airplay = bind(ip, 0).await?;
+        let (mut receiver, records) =
+            Self::listen(name.clone(), ip.into(), pairing.clone(), mode, input).await?;
+        let device_id = hex::encode(pairing.mac);
+        let host = format!("myremote-{device_id}.local.");
+        let result = receiver.advertise(&name, &host, ip, &records);
+        if let Err(error) = result {
+            receiver.stop().await;
+            return Err(error);
+        }
+        Ok(receiver)
+    }
+
+    pub fn advertise(
+        &mut self,
+        name: &str,
+        host: &str,
+        ip: Ipv4Addr,
+        records: &[DiscoveryRecord],
+    ) -> Result<()> {
+        let mdns = ServiceDaemon::new().map_err(mdns_error)?;
+        // Keep the handle available for cleanup even if registration is interrupted.
+        self.mdns = Some((mdns.clone(), Vec::new()));
+        let events = mdns.monitor().map_err(mdns_error)?;
+        mdns.disable_interface(IfKind::All).map_err(mdns_error)?;
+        mdns.enable_interface(IfKind::Addr(ip.into()))
+            .map_err(mdns_error)?;
+        let (_, services) = self.mdns.as_mut().unwrap();
+        for record in records {
+            let txt: Vec<_> = record
+                .txt
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            let info = ServiceInfo::new(
+                &format!("{}.local.", record.service_type),
+                name,
+                host,
+                IpAddr::V4(ip),
+                record.port,
+                &txt[..],
+            )
+            .map_err(mdns_error)?;
+            services.push(info.get_fullname().to_owned());
+            mdns.register(info).map_err(mdns_error)?;
+        }
+
+        self.listeners.push(tokio::spawn(async move {
+            while let Ok(event) = events.recv_async().await {
+                match event {
+                    DaemonEvent::Error(error) => warn!("Bonjour: {error}"),
+                    DaemonEvent::Announce(service, interface) => {
+                        debug!("Bonjour announced {service} on {interface}");
+                    }
+                    DaemonEvent::NameChange(change) => {
+                        debug!("Bonjour renamed a record: {change:?}")
+                    }
+                    _ => {}
+                }
+            }
+        }));
+        Ok(())
+    }
+
+    /// Forward the advertised endpoints without decoding or modifying Companion traffic.
+    pub async fn relay(
+        ip: IpAddr,
+        remote: Ipv4Addr,
+        records: &mut [DiscoveryRecord],
+    ) -> Result<Self> {
+        let mut sockets = Vec::with_capacity(records.len());
+        for record in records {
+            let destination = SocketAddr::new(remote.into(), record.port);
+            let listener = bind(ip, 0).await?;
+            record.port = listener.local_addr()?.port();
+            sockets.push((listener, destination));
+        }
+        Ok(Self {
+            mdns: None,
+            listeners: sockets
+                .into_iter()
+                .map(|(listener, target)| tokio::spawn(relay_endpoint(listener, target)))
+                .collect(),
+            ports: [0; 3],
+        })
+    }
+
+    /// Start the TCP endpoints so the caller can publish them through platform Bonjour.
+    pub async fn listen(
+        name: String,
+        ip: IpAddr,
+        pairing: Arc<PairingState>,
+        mode: TrackpadMode,
+        input: Arc<dyn RemoteInput>,
+    ) -> Result<(Self, Vec<DiscoveryRecord>)> {
+        Self::listen_endpoints(name, ip, pairing, mode, input, false).await
+    }
+
+    pub async fn listen_tailnet(
+        name: String,
+        ip: Ipv4Addr,
+        pairing: Arc<PairingState>,
+        mode: TrackpadMode,
+        input: Arc<dyn RemoteInput>,
+    ) -> Result<(Self, Vec<DiscoveryRecord>)> {
+        Self::listen_endpoints(name, ip.into(), pairing, mode, input, true).await
+    }
+
+    async fn listen_endpoints(
+        name: String,
+        ip: IpAddr,
+        pairing: Arc<PairingState>,
+        mode: TrackpadMode,
+        input: Arc<dyn RemoteInput>,
+        fixed_ports: bool,
+    ) -> Result<(Self, Vec<DiscoveryRecord>)> {
+        let (mrp, companion, airplay) = if fixed_ports {
+            (
+                TcpListener::bind((ip, 49152)).await?,
+                TcpListener::bind((ip, 49153)).await?,
+                TcpListener::bind((ip, 49154)).await?,
+            )
+        } else {
+            (
+                bind(ip, 49152).await?,
+                bind(ip, 49153).await?,
+                bind(ip, 0).await?,
+            )
+        };
         let ports = [
             mrp.local_addr()?.port(),
             companion.local_addr()?.port(),
             airplay.local_addr()?.port(),
         ];
-        let records = discovery_records(&name, ip, &pairing, ports)?;
-        let mdns = ServiceDaemon::new().map_err(mdns_error)?;
-        let events = mdns.monitor().map_err(mdns_error)?;
-        mdns.disable_interface(IfKind::All).map_err(mdns_error)?;
-        mdns.enable_interface(IfKind::Addr(ip.into()))
-            .map_err(mdns_error)?;
-        let mut services = Vec::new();
-        for record in records {
-            services.push(record.get_fullname().to_owned());
-            if let Err(error) = mdns.register(record) {
-                let _ = mdns.shutdown();
-                return Err(mdns_error(error));
-            }
-        }
-
+        let records = discovery_records(&name, &pairing, ports);
         let listeners = vec![
-            tokio::spawn(async move {
-                while let Ok(event) = events.recv_async().await {
-                    match event {
-                        DaemonEvent::Error(error) => warn!("Bonjour: {error}"),
-                        DaemonEvent::Announce(service, interface) => {
-                            debug!("Bonjour announced {service} on {interface}");
-                        }
-                        DaemonEvent::NameChange(change) => {
-                            debug!("Bonjour renamed a record: {change:?}")
-                        }
-                        _ => {}
-                    }
-                }
-            }),
             tokio::spawn(discovery_endpoint(mrp, false)),
             tokio::spawn(discovery_endpoint(airplay, true)),
             tokio::spawn(companion_endpoint(
@@ -81,12 +186,14 @@ impl Receiver {
                 input,
             )),
         ];
-        Ok(Self {
-            mdns,
-            services,
-            listeners,
-            ports,
-        })
+        Ok((
+            Self {
+                mdns: None,
+                listeners,
+                ports,
+            },
+            records,
+        ))
     }
 
     pub async fn stop(self) {
@@ -96,11 +203,13 @@ impl Receiver {
         for listener in self.listeners {
             let _ = listener.await;
         }
-        for service in self.services {
-            let _ = self.mdns.unregister(&service);
-        }
-        if let Ok(done) = self.mdns.shutdown() {
-            let _ = timeout(Duration::from_secs(2), done.recv_async()).await;
+        if let Some((mdns, services)) = self.mdns {
+            for service in services {
+                let _ = mdns.unregister(&service);
+            }
+            if let Ok(done) = mdns.shutdown() {
+                let _ = timeout(Duration::from_secs(2), done.recv_async()).await;
+            }
         }
     }
 }
@@ -108,34 +217,51 @@ impl Receiver {
 pub fn detect_local_ip() -> Result<Ipv4Addr> {
     // UDP connect selects an interface without sending a packet.
     let socket = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
-    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9))?;
-    match socket.local_addr()?.ip() {
-        std::net::IpAddr::V4(ip) if !ip.is_loopback() && !ip.is_unspecified() => Ok(ip),
-        _ => Err(Error::Protocol(
-            "no LAN IPv4 address found. Pass --ip to select the interface.".into(),
-        )),
+    if socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).is_ok() {
+        if let IpAddr::V4(ip) = socket.local_addr()?.ip() {
+            if is_lan_candidate(ip) {
+                return Ok(ip);
+            }
+        }
     }
+    if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter_map(|interface| match interface.ip() {
+            IpAddr::V4(ip) if is_lan_candidate(ip) => Some(ip),
+            _ => None,
+        })
+        .min_by_key(|ip| (!ip.is_private(), ip.is_link_local()))
+        .ok_or_else(|| Error::Protocol("No active local-network IPv4 address found.".into()))
 }
 
-async fn bind(ip: Ipv4Addr, preferred: u16) -> io::Result<TcpListener> {
-    match TcpListener::bind((ip, preferred)).await {
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse && preferred != 0 => {
-            TcpListener::bind((ip, 0)).await
+fn is_lan_candidate(ip: Ipv4Addr) -> bool {
+    let [first, second, ..] = ip.octets();
+    !ip.is_loopback() && !ip.is_unspecified() && (first != 100 || !(64..128).contains(&second))
+}
+
+async fn bind(ip: IpAddr, preferred: u16) -> io::Result<TcpListener> {
+    let bind_port = |port| async move {
+        if ip.is_ipv6() && ip.is_unspecified() {
+            let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP))?;
+            socket.set_only_v6(false)?;
+            socket.set_nonblocking(true)?;
+            socket.bind(&SocketAddr::new(ip, port).into())?;
+            socket.listen(128)?;
+            TcpListener::from_std(socket.into())
+        } else {
+            TcpListener::bind((ip, port)).await
         }
+    };
+    match bind_port(preferred).await {
+        Err(err) if err.kind() == io::ErrorKind::AddrInUse && preferred != 0 => bind_port(0).await,
         result => result,
     }
 }
 
-fn discovery_records(
-    name: &str,
-    ip: Ipv4Addr,
-    identity: &PairingState,
-    ports: [u16; 3],
-) -> Result<Vec<ServiceInfo>> {
+fn discovery_records(name: &str, identity: &PairingState, ports: [u16; 3]) -> Vec<DiscoveryRecord> {
     let mac = identity.mac.map(|byte| format!("{byte:02X}")).join(":");
     let unique = identity.identifier.replace('-', "");
     let mac_id = mac.replace(':', "");
-    let host = format!("myremote-{}.local.", mac_id.to_ascii_lowercase());
     let alias = |label: &str, bytes| {
         let hash = Sha256::new()
             .chain_update(label)
@@ -179,28 +305,43 @@ fn discovery_records(
         ("name", name),
     ];
     [
-        ("_mediaremotetv", &mrp[..]),
-        ("_companion-link", &companion[..]),
-        ("_airplay", &airplay[..]),
+        ("_mediaremotetv._tcp", &mrp[..]),
+        ("_companion-link._tcp", &companion[..]),
+        ("_airplay._tcp", &airplay[..]),
     ]
     .into_iter()
     .zip(ports)
-    .map(|((service, txt), port)| {
-        ServiceInfo::new(
-            &format!("{service}._tcp.local."),
-            name,
-            &host,
-            std::net::IpAddr::V4(ip),
-            port,
-            txt,
-        )
-        .map_err(mdns_error)
+    .map(|((service_type, txt), port)| DiscoveryRecord {
+        service_type: service_type.to_owned(),
+        port,
+        txt: txt
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect(),
     })
     .collect()
 }
 
 fn mdns_error(error: mdns_sd::Error) -> Error {
     Error::Mdns(error.to_string())
+}
+
+async fn relay_endpoint(listener: TcpListener, destination: SocketAddr) {
+    let mut clients = JoinSet::new();
+    loop {
+        tokio::select! {
+            Some(_) = clients.join_next(), if !clients.is_empty() => {}
+            Ok((mut local, _)) = listener.accept(), if clients.len() < MAX_CONNECTIONS => {
+                clients.spawn(async move {
+                    if let Ok(Ok(mut remote)) = timeout(Duration::from_secs(5), TcpStream::connect(destination)).await {
+                        let _ = local.set_nodelay(true);
+                        let _ = remote.set_nodelay(true);
+                        let _ = tokio::io::copy_bidirectional(&mut local, &mut remote).await;
+                    }
+                });
+            }
+        }
+    }
 }
 
 async fn discovery_endpoint(listener: TcpListener, airplay: bool) {

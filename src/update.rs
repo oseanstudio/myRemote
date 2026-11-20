@@ -48,12 +48,14 @@ struct Release {
 struct Asset {
     name: String,
     size: u64,
+    digest: Option<String>,
 }
 
 struct Download {
     version: Version,
     asset: &'static str,
     size: u64,
+    digest: [u8; 32],
 }
 
 enum Finished {
@@ -271,25 +273,16 @@ fn choose_release(
     if !version.pre.is_empty() || !version.build.is_empty() || &version <= current {
         return Ok(None);
     }
-    let checksum = format!("{asset}.sha256");
-    let size = release
+    let package = release
         .assets
         .iter()
-        .find(|item| item.name == asset)
-        .map(|item| item.size)
-        .filter(|size| (1..=MAX_PACKAGE).contains(size))
+        .find(|item| item.name == asset && (1..=MAX_PACKAGE).contains(&item.size))
         .ok_or("release has no valid package for this computer")?;
-    if !release
-        .assets
-        .iter()
-        .any(|item| item.name == checksum && (64..=4096).contains(&item.size))
-    {
-        return Err("release checksum is missing".into());
-    }
     Ok(Some(Download {
         version,
         asset,
-        size,
+        size: package.size,
+        digest: parse_digest(package.digest.as_deref())?,
     }))
 }
 
@@ -311,11 +304,6 @@ fn prepare(download: Download) -> Result<install::Ready> {
         "https://github.com/{REPO}/releases/download/v{}/{}",
         download.version, download.asset
     );
-    let proof = curl(&format!("{url}.sha256"), 4096, 20).output()?;
-    if !proof.status.success() {
-        return Err("GitHub checksum download failed".into());
-    }
-    let expected = parse_checksum(&proof.stdout, download.asset)?;
     let package = stage.path().join(download.asset);
     let status = curl(&url, download.size, 180)
         .arg("--output")
@@ -324,7 +312,7 @@ fn prepare(download: Download) -> Result<install::Ready> {
     if !status.success() {
         return Err("GitHub package download failed".into());
     }
-    if fs::metadata(&package)?.len() != download.size || file_hash(&package)? != expected {
+    if fs::metadata(&package)?.len() != download.size || file_hash(&package)? != download.digest {
         return Err("download does not match its release checksum".into());
     }
     let prepared = install::prepare(stage.path(), &package, &download.version)?;
@@ -335,12 +323,10 @@ fn prepare(download: Download) -> Result<install::Ready> {
     })
 }
 
-fn parse_checksum(data: &[u8], asset: &str) -> Result<[u8; 32]> {
-    let mut fields = std::str::from_utf8(data)?.split_whitespace();
-    let digest = fields.next().ok_or("invalid release checksum")?;
-    if fields.next() != Some(asset) || fields.next().is_some() {
-        return Err("release checksum names a different package".into());
-    }
+fn parse_digest(value: Option<&str>) -> Result<[u8; 32]> {
+    let digest = value
+        .and_then(|value| value.strip_prefix("sha256:"))
+        .ok_or("GitHub did not provide a SHA-256 digest for this package")?;
     let mut output = [0; 32];
     hex::decode_to_slice(digest, &mut output)?;
     Ok(output)
@@ -426,20 +412,19 @@ mod tests {
             tag_name: "v2.0.0".into(),
             draft: false,
             prerelease: false,
-            assets: vec![
-                Asset {
-                    name: asset.into(),
-                    size: 1000,
-                },
-                Asset {
-                    name: "app.zip.sha256".into(),
-                    size: 74,
-                },
-            ],
+            assets: vec![Asset {
+                name: asset.into(),
+                size: 1000,
+                digest: Some(format!("sha256:{}", "01".repeat(32))),
+            }],
         };
-        assert!(choose_release(release, &Version::new(1, 0, 0), asset)
-            .unwrap()
-            .is_some());
+        assert_eq!(
+            choose_release(release, &Version::new(1, 0, 0), asset)
+                .unwrap()
+                .unwrap()
+                .digest,
+            [1; 32]
+        );
         let prerelease = Release {
             tag_name: "v2.0.0-rc.1".into(),
             draft: false,
@@ -452,12 +437,9 @@ mod tests {
     }
 
     #[test]
-    fn checksum_is_bound_to_the_package_name() {
-        let proof = format!("{}  app.zip\n", "01".repeat(32));
-        assert_eq!(
-            parse_checksum(proof.as_bytes(), "app.zip").unwrap(),
-            [1; 32]
-        );
-        assert!(parse_checksum(proof.as_bytes(), "other.zip").is_err());
+    fn rejects_missing_wrong_algorithm_and_truncated_digests() {
+        for value in [None, Some("sha512:aa"), Some("sha256:abcd")] {
+            assert!(parse_digest(value).is_err());
+        }
     }
 }
