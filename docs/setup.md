@@ -75,6 +75,8 @@ If the iPhone and computer share a LAN, use normal Bonjour discovery even while 
 2. On the bridge computer, run `myremote --tailscale-bridge TARGET_IP`. If needed, pass `--ip BRIDGE_LAN_IP` to pick its Wi‑Fi-facing adapter. Allow the bridge to use its local network if prompted.
 3. On the target, choose **Pair iPhone…**. On the iPhone, open Apple TV Remote and pick the target's name. Enter the code shown on the target.
 
+On a Mac bridge, the executable is `/Applications/myRemote.app/Contents/MacOS/myremote`. On Linux, pass the same arguments to the downloaded AppImage. On Windows, use `.\myremote.exe` from the extracted folder.
+
 Allow the bridge to reach the target on TCP ports 49151–49154 in your tailnet policy. Pairing and encryption still terminate at the target. The bridge forwards encrypted input without handling the pairing keys.
 
 ## Build and test

@@ -22,7 +22,8 @@ type RegisterCallback = unsafe extern "C" fn(
     *mut c_void,
 );
 
-#[link(name = "dns_sd")]
+// macOS exports DNS-SD through libSystem. The separate dns_sd library is not in the SDK.
+#[link(name = "System")]
 unsafe extern "C" {
     fn DNSServiceRegister(
         reference: *mut ServiceRef,
