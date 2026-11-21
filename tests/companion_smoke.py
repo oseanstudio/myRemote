@@ -79,6 +79,51 @@ async def command(client, name, values, frame=FrameType.E_OPACK):
     return await client.exchange_opack(frame, {"_i": name, "_t": 2, "_c": values}, timeout=2.0)
 
 
+def touch_event(client, phase, **coordinates):
+    client.send_opack(
+        FrameType.E_OPACK,
+        {
+            "_i": "HIDTouch",
+            "_t": 1,
+            "_c": {"TouchPhase": phase, "TouchFinger": 1, **coordinates},
+        },
+    )
+
+
+async def exercise_tv_remote(client, expect):
+    start = await command(client, "TVRCSessionStart", {"ProtocolVersionKey": "1.2"})
+    assert start["_c"]["ProtocolVersionKey"] == "1.2"
+    start_touch = await command(
+        client, "HIDTouchStart", {"Width": 1000, "Height": 1000, "TouchFlags": 0}
+    )
+    assert start_touch["_c"]["Identifier"] == 1
+
+    for phase, x, y in [(1, 350, 340), (2, 394, 355), (3, 433, 380)]:
+        touch_event(client, phase, CoordinateX=x, CoordinateY=y)
+    await command(client, "FetchAttentionState", {})
+    expect(r"^Received pointer motion \(44.0, 15.0\)$")
+    expect(r"^Received pointer motion \(39.0, 25.0\)$")
+
+    touch_event(client, 1, CoordinateX=120, CoordinateY=120)
+    touch_event(client, 4)
+    touch_event(client, 3, CoordinateX=120, CoordinateY=120)
+    for state in [1, 2]:
+        await command(client, "HIDCommand", {"HIDCommand": 5, "HIDButtonState": state})
+    assert expect(r"^Received (.*)$")[1] == "button menu"
+
+    touch_event(client, 1, CoordinateX=125, CoordinateY=120)
+    touch_event(client, 3, CoordinateX=125, CoordinateY=120)
+    await command(client, "HIDTouchStop", {})
+    assert expect(r"^Received (.*)$")[1] == "click"
+    await command(
+        client, "MediaControlCommand", {"MediaControlCommand": 6, "MessageKeyVolume": 0.25}
+    )
+    volume = await command(client, "MediaControlCommand", {"MediaControlCommand": 5})
+    assert volume["_c"]["MessageKeyVolume"] == 0.25
+    legacy = await command(client, "_mcc", {"_mcc": 5})
+    assert legacy["_c"]["_vol"] == 0.25
+
+
 async def exercise(binary, state):
     with receiver(binary, state, "--pair") as (port, expect):
         pin = int(expect(r"Pairing code (\d{4})")[1])
@@ -106,13 +151,21 @@ async def exercise(binary, state):
             # pyatv 0.18 enables its cipher even after a Pair Verify error reply.
             await client.start()
             try:
-                await command(client, "_hidC", {"_hidC": 9, "_hBtS": 2})
+                await command(client, "HIDCommand", {"HIDCommand": 9, "HIDButtonState": 2})
             except (asyncio.TimeoutError, exceptions.ConnectionLostError):
                 pass
             else:
                 raise AssertionError("Receiver accepted an unverified input command")
         except exceptions.AuthenticationError:
             pass
+        finally:
+            client.stop()
+
+        client = protocol(port, credentials)
+        try:
+            await client.start()
+            await command(client, "_sessionStart", {"_sid": 456})
+            await exercise_tv_remote(client, expect)
         finally:
             client.stop()
 
@@ -137,4 +190,4 @@ if __name__ == "__main__":
     # Resolve the executable before creating a short-lived pairing directory.
     with TemporaryDirectory(prefix="myremote-smoke-", dir=executable.parent) as directory:
         asyncio.run(exercise(executable, directory))
-    print("Companion pairing, reconnect, authorization, button, pointer and click passed.")
+    print("Companion pairing, reconnect, authorization, and legacy and TVRemoteCore input passed.")

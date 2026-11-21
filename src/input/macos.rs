@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void};
 use std::io;
 use std::process::Command;
-use std::ptr::{null, null_mut};
+use std::ptr::null_mut;
 
 type Event = *mut c_void;
 
@@ -12,24 +12,8 @@ struct Point {
     y: f64,
 }
 
-#[link(name = "ApplicationServices", kind = "framework")]
-unsafe extern "C" {
-    fn AXIsProcessTrusted() -> bool;
-    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
-    static kAXTrustedCheckOptionPrompt: *const c_void;
-}
-
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
-    static kCFBooleanTrue: *const c_void;
-    fn CFDictionaryCreate(
-        allocator: *const c_void,
-        keys: *const *const c_void,
-        values: *const *const c_void,
-        count: isize,
-        key_callbacks: *const c_void,
-        value_callbacks: *const c_void,
-    ) -> *const c_void;
     fn CFRelease(object: *const c_void);
 }
 
@@ -41,6 +25,7 @@ unsafe extern "C" {
     fn CGEventCreateMouseEvent(source: *mut c_void, kind: u32, point: Point, button: u32) -> Event;
     fn CGEventPost(tap: u32, event: Event);
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGRequestPostEventAccess() -> bool;
 }
 
 #[link(name = "AppKit", kind = "framework")]
@@ -55,21 +40,12 @@ unsafe extern "C" {
 
 pub struct Desktop;
 
-pub fn accessibility_is_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() || CGPreflightPostEventAccess() }
+pub fn can_post_input() -> bool {
+    unsafe { CGPreflightPostEventAccess() }
 }
 
-pub fn request_accessibility() {
-    // Both dictionary entries are process-lifetime Core Foundation constants.
-    unsafe {
-        let keys = [kAXTrustedCheckOptionPrompt];
-        let values = [kCFBooleanTrue];
-        let options = CFDictionaryCreate(null(), keys.as_ptr(), values.as_ptr(), 1, null(), null());
-        if !options.is_null() {
-            AXIsProcessTrustedWithOptions(options);
-            CFRelease(options);
-        }
-    }
+pub fn request_input_permission() {
+    unsafe { CGRequestPostEventAccess() };
 }
 
 impl Desktop {
@@ -78,7 +54,7 @@ impl Desktop {
     }
 
     pub fn button(&mut self, name: &str) {
-        if !accessibility_is_trusted() {
+        if !can_post_input() {
             return;
         }
         let key = match name {
@@ -105,7 +81,7 @@ impl Desktop {
     }
 
     pub fn move_pointer(&mut self, dx: i32, dy: i32) {
-        if !accessibility_is_trusted() {
+        if !can_post_input() {
             return;
         }
         if let Some(point) = pointer_location() {
@@ -118,7 +94,7 @@ impl Desktop {
     }
 
     pub fn click(&mut self) {
-        if !accessibility_is_trusted() {
+        if !can_post_input() {
             return;
         }
         if let Some(point) = pointer_location() {
@@ -129,7 +105,7 @@ impl Desktop {
     }
 
     pub fn volume(&self) -> Option<f64> {
-        if !accessibility_is_trusted() {
+        if !can_post_input() {
             return None;
         }
         let output = Command::new("/usr/bin/osascript").args([
@@ -148,7 +124,7 @@ impl Desktop {
     }
 
     pub fn set_volume(&self, volume: f64) {
-        if !accessibility_is_trusted() {
+        if !can_post_input() {
             return;
         }
         let script = format!("set volume output volume {:.0}", volume * 100.0);

@@ -1,5 +1,5 @@
 //! Companion Link session: pairing, verification and the encrypted control
-//! channel. Ported from `fake_atv.py`'s `CompanionSession`.
+//! channel, including legacy Rapport and TVRemoteCore input messages.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -33,31 +33,39 @@ struct PendingVerification {
     server_public: [u8; 32],
 }
 
-fn hid_command_name(command: u64) -> String {
-    match command {
-        1 => "up".into(),
-        2 => "down".into(),
-        3 => "left".into(),
-        4 => "right".into(),
-        5 => "menu".into(),
-        6 => "select".into(),
-        7 => "home".into(),
-        8 => "volume_up".into(),
-        9 => "volume_down".into(),
-        10 => "siri".into(),
-        11 => "screensaver".into(),
-        12 => "sleep".into(),
-        13 => "wake".into(),
-        14 => "play_pause".into(),
-        15 => "channel_up".into(),
-        16 => "channel_down".into(),
-        17 => "guide".into(),
+fn hid_command_name(command: u64) -> Option<&'static str> {
+    Some(match command {
+        1 => "up",
+        2 => "down",
+        3 => "left",
+        4 => "right",
+        5 => "menu",
+        6 => "select",
+        7 => "home",
+        8 => "volume_up",
+        9 => "volume_down",
+        10 => "siri",
+        11 => "screensaver",
+        12 => "sleep",
+        13 => "wake",
+        14 => "play_pause",
+        15 => "channel_up",
+        16 => "channel_down",
+        17 => "guide",
         // iOS 26/27 repurposes the old PageUp/PageDown wire codes for the
         // Control Center remote's Mute and Power buttons.
-        18 => "mute".into(),
-        19 => "power".into(),
-        other => format!("unknown:{other}"),
-    }
+        18 => "mute",
+        19 => "power",
+        _ => return None,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TouchPhase {
+    Began,
+    Moved,
+    Ended,
+    Cancelled,
 }
 
 /// One Companion connection's state machine.
@@ -453,6 +461,7 @@ impl CompanionSession {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let xid = data.get("_x").and_then(Value::as_int);
+        let is_event = data.get("_t").and_then(Value::as_int) == Some(1);
         let content = data.get("_c").unwrap_or(&Value::Null);
 
         match self.current_identifier.as_deref() {
@@ -489,7 +498,7 @@ impl CompanionSession {
                 .await?;
                 self.send_media_state(xid).await?;
             }
-            Some("_sessionStop" | "_touchStop" | "_tiStop") => {
+            Some("_sessionStop" | "_touchStop" | "HIDTouchStop" | "_tiStop") => {
                 if self.current_identifier.as_deref() == Some("_sessionStop") {
                     self.remote_started = false;
                 }
@@ -497,46 +506,33 @@ impl CompanionSession {
                 self.touch_last = None;
                 self.send_response(xid, None, 0).await?;
             }
-            Some("_touchStart") => {
+            Some("_touchStart" | "HIDTouchStart") => {
+                let key = if self.current_identifier.as_deref() == Some("HIDTouchStart") {
+                    "Identifier"
+                } else {
+                    "_i"
+                };
+                self.touch_origin = None;
+                self.touch_last = None;
                 self.send_response(
                     xid,
-                    Some(Value::dict(vec![Value::kv("_i", Value::Int(1))])),
+                    Some(Value::dict(vec![Value::kv(key, Value::Int(1))])),
                     0,
                 )
                 .await?;
             }
-            Some("_hidC") => {
-                self.send_response(xid, None, 0).await?;
-                if content.get("_hBtS").and_then(Value::as_int) == Some(2) {
-                    let button =
-                        hid_command_name(content.get("_hidC").and_then(Value::as_int).unwrap_or(0));
-                    if button == "select" {
-                        self.select(false);
-                    } else {
-                        self.input.button(&button);
-                    }
-                    match button.as_str() {
-                        "volume_up" | "volume_down" => {
-                            let step = if button == "volume_up" {
-                                1.0 / 16.0
-                            } else {
-                                -1.0 / 16.0
-                            };
-                            self.volume = (self.volume + step).clamp(0.0, 1.0);
-                            self.muted = false;
-                            self.send_media_state(xid).await?;
-                        }
-                        "mute" => {
-                            self.muted = !self.muted;
-                            self.send_media_state(xid).await?;
-                        }
-                        _ => {}
-                    }
+            Some("_hidC" | "HIDCommand") => {
+                if !is_event {
+                    self.send_response(xid, None, 0).await?;
                 }
+                self.handle_hid_command(content, xid).await?;
             }
-            Some("_hidT") => {
-                self.send_response(xid, None, 0).await?;
-                self.handle_touch(content);
+            Some("_hidT" | "HIDTouch") => {
+                if !is_event {
+                    self.send_response(xid, None, 0).await?;
+                }
+                let modern = self.current_identifier.as_deref() == Some("HIDTouch");
+                self.handle_touch(content, modern);
             }
             Some("_interest") => {
                 if let Some(Value::Array(events)) = content.get("_regEvents") {
@@ -574,7 +570,49 @@ impl CompanionSession {
                 .await?;
             }
             Some("FetchLaunchableApplicationsEvent") => self.send_response(xid, None, 2).await?,
-            _ if xid.is_some() => self.send_response(xid, None, 0).await?,
+            _ if xid.is_some() && !is_event => self.send_response(xid, None, 0).await?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    async fn handle_hid_command(&mut self, content: &Value, xid: Option<u64>) -> Result<()> {
+        let (command_key, state_key) = if self.current_identifier.as_deref() == Some("HIDCommand") {
+            ("HIDCommand", "HIDButtonState")
+        } else {
+            ("_hidC", "_hBtS")
+        };
+        if content.get(state_key).and_then(Value::as_int) != Some(2) {
+            return Ok(());
+        }
+        let Some(button) = content
+            .get(command_key)
+            .and_then(Value::as_int)
+            .and_then(hid_command_name)
+        else {
+            return Ok(());
+        };
+        self.record_input();
+        if button == "select" {
+            self.select(false);
+        } else {
+            self.input.button(button);
+        }
+        match button {
+            "volume_up" | "volume_down" => {
+                let step = if button == "volume_up" {
+                    1.0 / 16.0
+                } else {
+                    -1.0 / 16.0
+                };
+                self.volume = (self.volume + step).clamp(0.0, 1.0);
+                self.muted = false;
+                self.send_media_state(xid).await?;
+            }
+            "mute" => {
+                self.muted = !self.muted;
+                self.send_media_state(xid).await?;
+            }
             _ => {}
         }
         Ok(())
@@ -599,6 +637,11 @@ impl CompanionSession {
     }
 
     async fn handle_media_control(&mut self, xid: Option<u64>, content: &Value) -> Result<()> {
+        let volume_key = if self.current_identifier.as_deref() == Some("MediaControlCommand") {
+            "MessageKeyVolume"
+        } else {
+            "_vol"
+        };
         let command = content
             .get("MediaControlCommand")
             .or_else(|| content.get("_mcc"))
@@ -609,16 +652,21 @@ impl CompanionSession {
                     self.input
                         .volume()
                         .unwrap_or(if self.muted { 0.0 } else { self.volume });
-                Some(Value::dict(vec![Value::kv("_vol", Value::Double(volume))]))
+                Some(Value::dict(vec![Value::kv(
+                    volume_key,
+                    Value::Double(volume),
+                )]))
             }
             Some(6) => {
                 if let Some(volume) = content
-                    .get("_vol")
+                    .get(volume_key)
+                    .or_else(|| content.get("_vol"))
                     .and_then(Value::as_float)
                     .filter(|v| v.is_finite())
                 {
                     self.volume = volume.clamp(0.0, 1.0);
                     self.muted = false;
+                    self.record_input();
                     self.input.set_volume(self.volume);
                 }
                 None
@@ -627,6 +675,11 @@ impl CompanionSession {
             _ => None,
         };
         self.send_response(xid, response, 0).await
+    }
+
+    fn record_input(&mut self) {
+        self.remote_started = true;
+        self.pairing.set_connection_status("iPhone input received");
     }
 
     fn select(&mut self, from_touch: bool) {
@@ -645,29 +698,46 @@ impl CompanionSession {
         }
     }
 
-    fn handle_touch(&mut self, content: &Value) {
-        let phase = content.get("_tPh").and_then(Value::as_int);
+    fn handle_touch(&mut self, content: &Value, modern: bool) {
+        let (phase_key, x_key, y_key) = if modern {
+            ("TouchPhase", "CoordinateX", "CoordinateY")
+        } else {
+            ("_tPh", "_cx", "_cy")
+        };
+        let phase = match (modern, content.get(phase_key).and_then(Value::as_int)) {
+            (_, Some(1)) => TouchPhase::Began,
+            (true, Some(2)) | (false, Some(2 | 3)) => TouchPhase::Moved,
+            (true, Some(3)) | (false, Some(4)) => TouchPhase::Ended,
+            (true, Some(4)) => TouchPhase::Cancelled,
+            _ => return,
+        };
+        if phase == TouchPhase::Cancelled {
+            self.touch_origin = None;
+            self.touch_last = None;
+            return;
+        }
         let coordinate = |key| {
             content
                 .get(key)
                 .and_then(Value::as_float)
                 .filter(|value| value.is_finite() && (-4000.0..=4000.0).contains(value))
         };
-        let (Some(x), Some(y)) = (coordinate("_cx"), coordinate("_cy")) else {
-            if phase == Some(4) {
+        let (Some(x), Some(y)) = (coordinate(x_key), coordinate(y_key)) else {
+            if phase == TouchPhase::Ended {
                 self.touch_origin = None;
                 self.touch_last = None;
             }
             return;
         };
+        self.record_input();
         let point = (x, y);
         match phase {
-            Some(1) => {
+            TouchPhase::Began => {
                 self.touch_origin = Some(point);
                 self.touch_last = Some(point);
                 self.touch_distance = 0.0;
             }
-            Some(2..=4) => {
+            TouchPhase::Moved | TouchPhase::Ended => {
                 let (Some(origin), Some(last)) = (self.touch_origin, self.touch_last) else {
                     return;
                 };
@@ -676,11 +746,11 @@ impl CompanionSession {
                 let distance = dx.abs().max(dy.abs());
                 self.touch_distance = self.touch_distance.max(distance);
                 if self.mode == TrackpadMode::Mouse
-                    && (phase != Some(4) || self.touch_distance >= TAP_MAX_DISTANCE)
+                    && (phase == TouchPhase::Moved || self.touch_distance >= TAP_MAX_DISTANCE)
                 {
                     self.input.move_pointer(x - last.0, y - last.1);
                 }
-                if phase != Some(4) {
+                if phase == TouchPhase::Moved {
                     self.touch_last = Some(point);
                     return;
                 }
@@ -703,7 +773,7 @@ impl CompanionSession {
                     self.input.button(button);
                 }
             }
-            _ => {}
+            TouchPhase::Cancelled => unreachable!(),
         }
     }
 }

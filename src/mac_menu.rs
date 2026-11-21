@@ -239,12 +239,12 @@ impl MenuController {
     }
 
     fn needs_accessibility(&self) -> bool {
-        !self.ivars().options.dry_run && !input::accessibility_is_trusted()
+        !self.ivars().options.dry_run && !input::can_post_input()
     }
 
     fn request_accessibility_if_needed(&self) {
         if self.needs_accessibility() {
-            input::request_accessibility();
+            input::request_input_permission();
         }
     }
 
