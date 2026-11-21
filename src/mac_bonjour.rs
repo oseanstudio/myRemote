@@ -5,12 +5,14 @@ use std::ptr::{null, null_mut};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use myremote::DiscoveryRecord;
 
 const PENDING: i32 = i32::MAX;
 const POLICY_DENIED: i32 = -65570;
 const SERVICE_UNAVAILABLE: i32 = -65563;
+const DEFUNCT_CONNECTION: i32 = -65569;
 type ServiceRef = *mut c_void;
 type RegisterCallback = unsafe extern "C" fn(
     ServiceRef,
@@ -47,6 +49,7 @@ unsafe extern "C" {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Starting,
+    Reconnecting,
     Ready,
     LocalNetworkPermission,
     Failed,
@@ -75,7 +78,13 @@ impl Bonjour {
         let thread = thread::Builder::new()
             .name("myremote-bonjour".into())
             .spawn(move || {
-                process(interface, &name, records, &worker_state, &worker_stop);
+                while !worker_stop.load(Ordering::Relaxed) {
+                    process(interface, &name, &records, &worker_state, &worker_stop);
+                    if !needs_reconnect(&worker_state) || worker_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    thread::park_timeout(Duration::from_secs(2));
+                }
             })?;
         Ok(Self {
             state,
@@ -92,6 +101,8 @@ impl Bonjour {
             .collect();
         if codes.contains(&POLICY_DENIED) {
             Status::LocalNetworkPermission
+        } else if codes.iter().any(|&code| daemon_disconnected(code)) {
+            Status::Reconnecting
         } else if codes.iter().any(|&code| code != PENDING && code != 0) {
             Status::Failed
         } else if codes.contains(&PENDING) {
@@ -106,6 +117,7 @@ impl Drop for Bonjour {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
             let _ = thread.join();
         }
     }
@@ -145,13 +157,14 @@ impl Drop for Registration {
 fn process(
     interface: u32,
     name: &CString,
-    records: Vec<DiscoveryRecord>,
+    records: &[DiscoveryRecord],
     state: &[AtomicI32],
     stop: &AtomicBool,
 ) {
     let mut services = Vec::new();
     let mut sockets = Vec::new();
     for (record, status) in records.iter().zip(state) {
+        status.store(PENDING, Ordering::Relaxed);
         match register(interface, name, record, status) {
             Ok(reference) => {
                 let fd = unsafe { DNSServiceRefSockFD(reference.0) };
@@ -172,7 +185,10 @@ fn process(
             }
         }
     }
-    while !stop.load(Ordering::Relaxed) && sockets.iter().any(|socket| socket.fd >= 0) {
+    while !stop.load(Ordering::Relaxed)
+        && !needs_reconnect(state)
+        && sockets.iter().any(|socket| socket.fd >= 0)
+    {
         // The registration callbacks run synchronously on this thread while we own the refs.
         let ready = unsafe { libc::poll(sockets.as_mut_ptr(), sockets.len() as libc::nfds_t, 125) };
         if ready < 0 {
@@ -194,10 +210,27 @@ fn process(
             };
             if error != 0 {
                 status.store(error, Ordering::Relaxed);
+            }
+            let code = status.load(Ordering::Relaxed);
+            if code != 0 && code != PENDING {
                 socket.fd = -1;
             }
         }
     }
+}
+
+fn daemon_disconnected(code: i32) -> bool {
+    matches!(code, SERVICE_UNAVAILABLE | DEFUNCT_CONNECTION)
+}
+
+fn needs_reconnect(state: &[AtomicI32]) -> bool {
+    // Policy denial requires the user's approval in System Settings.
+    !state
+        .iter()
+        .any(|code| code.load(Ordering::Relaxed) == POLICY_DENIED)
+        && state
+            .iter()
+            .any(|code| daemon_disconnected(code.load(Ordering::Relaxed)))
 }
 
 fn register(

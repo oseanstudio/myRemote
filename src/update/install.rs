@@ -312,11 +312,20 @@ fn replace_with_retry(candidate: &Path, target: &Path) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
+pub fn relaunch_current(target: &Path) -> Result<()> {
+    let arguments: Vec<_> = env::args_os().skip(1).collect();
+    relaunch(target, &arguments)
+}
+
 fn relaunch(target: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
     #[cfg(target_os = "macos")]
     let mut command = {
         let mut command = Command::new("/usr/bin/open");
-        command.arg("-n").arg(target).arg("--args");
+        command.arg("-n").arg(target);
+        if !arguments.is_empty() {
+            command.arg("--args");
+        }
         command
     };
     #[cfg(not(target_os = "macos"))]

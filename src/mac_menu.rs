@@ -1,18 +1,24 @@
 use std::cell::RefCell;
+use std::path::PathBuf;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSWorkspace,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSImage,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSPanel, NSStatusBar, NSTextField, NSWindowStyleMask,
+    NSWorkspace,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
+use objc2_foundation::{
+    NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
+};
 use tokio::runtime::Runtime;
 
 use crate::{
-    input, mac_bonjour, start_receiver, tailnet_menu::MenuNetwork, update::Updater, ActiveReceiver,
-    Options, VERSION,
+    input, mac_bonjour, start_receiver,
+    tailnet_menu::MenuNetwork,
+    update::{self, Updater},
+    ActiveReceiver, Options, VERSION,
 };
 
 const STATUS: isize = 1;
@@ -29,12 +35,16 @@ const TAILSCALE_STATUS: isize = 11;
 const TAILSCALE_SHARE: isize = 12;
 const TAILSCALE_BRIDGE: isize = 13;
 const CONNECTION: isize = 14;
+const ACCESSIBILITY_SETTINGS: &str =
+    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
 
 struct State {
     options: Options,
     runtime: Runtime,
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
+    accessibility_panel: RefCell<Option<Retained<NSPanel>>>,
+    relaunch_target: RefCell<Option<PathBuf>>,
     network: RefCell<MenuNetwork>,
     updater: RefCell<Updater>,
 }
@@ -56,6 +66,7 @@ define_class!(
                 .map(mac_bonjour::Bonjour::status);
             let status = match discovery {
                 Some(mac_bonjour::Status::Starting) => "Starting Bonjour discovery…",
+                Some(mac_bonjour::Status::Reconnecting) => "Reconnecting Bonjour discovery…",
                 Some(mac_bonjour::Status::Ready) => "Receiver ready on the local network",
                 Some(mac_bonjour::Status::LocalNetworkPermission) => "Local Network permission needed",
                 Some(mac_bonjour::Status::Failed) => "Bonjour discovery could not start",
@@ -84,8 +95,10 @@ define_class!(
             }
             let network = self.ivars().network.borrow();
             if let Some(item) = menu.itemWithTag(LOCAL_NETWORK) {
-                item.setHidden((discovery.is_none() && !network.bridging())
-                    || discovery == Some(mac_bonjour::Status::Ready));
+                item.setHidden(!matches!(
+                    discovery,
+                    Some(mac_bonjour::Status::LocalNetworkPermission | mac_bonjour::Status::Failed)
+                ) && (discovery.is_some() || !network.bridging()));
             }
             let submenu = menu.itemWithTag(TAILSCALE).and_then(|item| item.submenu());
             let tailscale_menu = submenu.as_deref().unwrap_or(menu);
@@ -138,9 +151,39 @@ define_class!(
         #[unsafe(method(myRemoteAccessibility:))]
         fn accessibility(&self, _sender: &NSMenuItem) {
             if self.needs_accessibility() {
-                open_settings(
-                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-                );
+                self.show_accessibility_setup();
+                open_settings(ACCESSIBILITY_SETTINGS);
+            }
+        }
+
+        #[unsafe(method(myRemoteOpenAccessibilitySettings:))]
+        fn open_accessibility_settings(&self, _sender: &NSButton) {
+            open_settings(ACCESSIBILITY_SETTINGS);
+        }
+
+        #[unsafe(method(myRemoteRevealInstalledApp:))]
+        fn reveal_installed_app(&self, _sender: &NSButton) {
+            if let Ok(bundle) = update::app_bundle_path() {
+                if let Some(path) = bundle.to_str() {
+                    let url = NSURL::fileURLWithPath_isDirectory(&NSString::from_str(path), true);
+                    NSWorkspace::sharedWorkspace().activateFileViewerSelectingURLs(
+                        &NSArray::from_retained_slice(&[url]),
+                    );
+                }
+            }
+        }
+
+        #[unsafe(method(myRemoteRelaunch:))]
+        fn relaunch(&self, _sender: &NSButton) {
+            if !self.needs_accessibility() {
+                return;
+            }
+            match update::app_bundle_path() {
+                Ok(path) => {
+                    self.ivars().relaunch_target.replace(Some(path));
+                    NSApplication::sharedApplication(self.mtm()).stop(None);
+                }
+                Err(error) => self.alert("Unable to relaunch myRemote", &error.to_string()),
             }
         }
 
@@ -191,6 +234,7 @@ define_class!(
 
         #[unsafe(method(myRemotePollUpdates:))]
         fn poll_updates(&self, _timer: &NSTimer) {
+            self.finish_accessibility_setup();
             let pin = self.ivars().active.borrow().as_ref()
                 .and_then(|receiver| receiver.state.take_requested_code());
             if let Some(pin) = pin {
@@ -213,6 +257,8 @@ impl MenuController {
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
+            accessibility_panel: RefCell::new(None),
+            relaunch_target: RefCell::new(None),
             network,
             updater,
         });
@@ -245,6 +291,94 @@ impl MenuController {
     fn request_accessibility_if_needed(&self) {
         if self.needs_accessibility() {
             input::request_input_permission();
+        }
+    }
+
+    fn show_accessibility_setup(&self) {
+        let panel = self
+            .ivars()
+            .accessibility_panel
+            .borrow_mut()
+            .get_or_insert_with(|| self.make_accessibility_panel())
+            .clone();
+        NSApplication::sharedApplication(self.mtm()).activate();
+        panel.makeKeyAndOrderFront(None);
+    }
+
+    fn make_accessibility_panel(&self) -> Retained<NSPanel> {
+        let mtm = self.mtm();
+        let panel = NSPanel::initWithContentRect_styleMask_backing_defer(
+            NSPanel::alloc(mtm),
+            rect(0.0, 0.0, 474.0, 180.0),
+            NSWindowStyleMask::Titled | NSWindowStyleMask::Closable,
+            NSBackingStoreType::Buffered,
+            false,
+        );
+        // The controller owns the panel until it is dismissed or access becomes available.
+        unsafe { panel.setReleasedWhenClosed(false) };
+        panel.setHidesOnDeactivate(false);
+        panel.setTitle(objc2_foundation::ns_string!(
+            "Allow myRemote to Control This Mac"
+        ));
+        panel.center();
+
+        if let Some(view) = panel.contentView() {
+            let instructions = NSString::from_str(
+                "Turn on myRemote in Accessibility settings.\n\nIf it’s already on, remove the old entry and add the copy shown in Finder. If this window stays open after you grant access, click Relaunch myRemote.",
+            );
+            let label = NSTextField::wrappingLabelWithString(&instructions, mtm);
+            label.setFrame(rect(22.0, 56.0, 430.0, 104.0));
+            view.addSubview(&label);
+            let bundled = update::app_bundle_path().is_ok();
+            for (label, action, x, width, enabled) in [
+                (
+                    "Open Settings",
+                    sel!(myRemoteOpenAccessibilitySettings:),
+                    18.0,
+                    130.0,
+                    true,
+                ),
+                (
+                    "Show in Finder",
+                    sel!(myRemoteRevealInstalledApp:),
+                    152.0,
+                    130.0,
+                    bundled,
+                ),
+                (
+                    "Relaunch myRemote",
+                    sel!(myRemoteRelaunch:),
+                    286.0,
+                    168.0,
+                    bundled,
+                ),
+            ] {
+                // These selectors target the live controller and receive the NSButton sender.
+                let button = unsafe {
+                    NSButton::buttonWithTitle_target_action(
+                        &NSString::from_str(label),
+                        Some(self),
+                        Some(action),
+                        mtm,
+                    )
+                };
+                button.setFrame(rect(x, 17.0, width, 31.0));
+                button.setEnabled(enabled);
+                view.addSubview(&button);
+            }
+        }
+        panel
+    }
+
+    fn finish_accessibility_setup(&self) {
+        let mut setup = self.ivars().accessibility_panel.borrow_mut();
+        if setup
+            .as_ref()
+            .is_some_and(|panel| !panel.isVisible() || !self.needs_accessibility())
+        {
+            if let Some(panel) = setup.take() {
+                panel.orderOut(None);
+            }
         }
     }
 
@@ -313,9 +447,13 @@ fn open_settings(location: &str) {
     }
 }
 
+fn rect(x: f64, y: f64, width: f64, height: f64) -> NSRect {
+    NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+}
+
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
     let mtm = MainThreadMarker::new().ok_or("macOS menu must run on the main thread")?;
-    autoreleasepool(|_| {
+    let relaunch_target = autoreleasepool(|_| {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         let controller = MenuController::new(mtm, options, runtime);
@@ -437,7 +575,14 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         accessibility_timer.invalidate();
         poll_timer.invalidate();
         controller.stop();
+        if let Some(panel) = controller.ivars().accessibility_panel.take() {
+            panel.orderOut(None);
+        }
         bar.removeStatusItem(&item);
+        controller.ivars().relaunch_target.take()
     });
+    if let Some(target) = relaunch_target {
+        update::relaunch_current(&target)?;
+    }
     Ok(())
 }
