@@ -315,20 +315,44 @@ fn replace_with_retry(candidate: &Path, target: &Path) -> Result<()> {
 #[cfg(target_os = "macos")]
 pub fn relaunch_current(target: &Path) -> Result<()> {
     let arguments: Vec<_> = env::args_os().skip(1).collect();
-    relaunch(target, &arguments)
+    relaunch_mac(target, &arguments, true)
 }
 
+#[cfg(target_os = "macos")]
 fn relaunch(target: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    let mut command = {
-        let mut command = Command::new("/usr/bin/open");
-        command.arg("-n").arg(target);
-        if !arguments.is_empty() {
-            command.arg("--args");
-        }
-        command
-    };
-    #[cfg(not(target_os = "macos"))]
+    relaunch_mac(target, arguments, false)
+}
+
+#[cfg(target_os = "macos")]
+fn relaunch_mac(
+    target: &Path,
+    arguments: &[std::ffi::OsString],
+    after_accessibility_grant: bool,
+) -> Result<()> {
+    let mut command = Command::new("/usr/bin/open");
+    command.arg("-n");
+    if after_accessibility_grant {
+        command.args(["-g", "--env"]);
+        command.arg(format!("{}=1", crate::mac_accessibility::RELAUNCHED_ENV));
+    }
+    command.arg(target);
+    if !arguments.is_empty() {
+        command.arg("--args").args(arguments);
+    }
+    if !command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?
+        .success()
+    {
+        return Err("Launch Services could not relaunch myRemote".into());
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn relaunch(target: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
     let mut command = quiet_command(target);
     #[cfg(windows)]
     if let Ok(exe) = env::current_exe() {
@@ -346,11 +370,6 @@ fn relaunch(target: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    #[cfg(target_os = "macos")]
-    if !command.status()?.success() {
-        return Err("Launch Services could not relaunch myRemote".into());
-    }
-    #[cfg(not(target_os = "macos"))]
     command.spawn()?;
     Ok(())
 }

@@ -1,6 +1,6 @@
 [package]
 name = "myremote"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -38,13 +38,12 @@ tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] 
 libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
-    "std", "NSAlert", "NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSGraphics", "NSGraphicsContext",
-    "NSImage", "NSMenu", "NSMenuItem",
-    "NSPanel", "NSResponder", "NSRunningApplication", "NSStatusBar", "NSStatusBarButton", "NSStatusItem",
-    "NSTextField", "NSView", "NSWindow", "NSWorkspace", "objc2-core-foundation",
+    "std", "NSAlert", "NSApplication", "NSButton", "NSCell", "NSControl", "NSEvent", "NSGraphicsContext",
+    "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar",
+    "NSStatusBarButton", "NSStatusItem", "NSView", "NSWorkspace", "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
-    "std", "NSArray", "NSGeometry", "NSString", "NSTimer", "NSURL",
+    "std", "NSGeometry", "NSString", "NSTimer", "NSURL",
 ] }
 
 [target.'cfg(windows)'.dependencies]

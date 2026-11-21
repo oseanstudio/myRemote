@@ -19,9 +19,7 @@ The phone can reconnect after a server restart. Run the receiver on another comp
 | macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. Open the app to start the receiver. Allow Accessibility and Local Network access when macOS asks. |
 | Linux | Make the AppImage executable and launch it. The tray requires a desktop that supports StatusNotifier/AppIndicator. The receiver uses `/dev/uinput` for Wayland and X11. |
 
-myRemote asks for mouse and keyboard access when macOS reports that access is missing. Choose **Allow Accessibility…** to request access again and open System Settings. After removing an old entry, use **Request Access** to ask macOS to list the running copy. **Show in Finder** helps locate that copy if you need to add it yourself.
-
-The setup window closes as soon as the app can send input. If myRemote detects a new grant but macOS still blocks event posting, it relaunches once. Use **Relaunch myRemote** if the setup window remains open after you enable access.
+myRemote uses the macOS permission prompt when mouse and keyboard access is missing. Choose **Allow Accessibility…** from the menu to request access again. In the system prompt, open System Settings and enable **myRemote**. The app relaunches once after macOS confirms access.
 
 The macOS build is ad-hoc signed, so an update can require a fresh grant. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it.
 

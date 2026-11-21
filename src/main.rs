@@ -10,6 +10,8 @@ use myremote::{PairingState, Receiver, RemoteInput, TrackpadMode};
 
 mod input;
 #[cfg(target_os = "macos")]
+mod mac_accessibility;
+#[cfg(target_os = "macos")]
 mod mac_bonjour;
 #[cfg(target_os = "macos")]
 mod mac_menu;
@@ -496,6 +498,10 @@ async fn shutdown_signal() -> io::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = mac_accessibility::run_probe() {
+        return result;
+    }
     if env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--apply-update")

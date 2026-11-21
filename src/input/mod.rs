@@ -8,9 +8,7 @@ use myremote::RemoteInput;
 mod platform;
 
 #[cfg(target_os = "macos")]
-pub use platform::{
-    accessibility_is_trusted, can_post_input, request_accessibility_entry, request_input_permission,
-};
+pub use platform::{can_post_input, request_accessibility_entry, request_input_permission};
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 mod platform;

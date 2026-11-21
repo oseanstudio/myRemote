@@ -44,6 +44,24 @@ plutil -lint "$app/Contents/Info.plist"
 codesign --force --sign - "$app"
 codesign --verify --strict "$app"
 test "$("$app/Contents/MacOS/myremote" --version)" = "myRemote $version"
+if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
+    python3 - "$app" "$staging/input-permission" <<'PY'
+from pathlib import Path
+import subprocess
+import sys
+
+app, result = sys.argv[1:]
+Path(result).touch(exist_ok=False)
+subprocess.run(
+    ["/usr/bin/open", "-n", "-g", "-j", "-W", "--stdout", result, app,
+     "--args", "--probe-input-permission"],
+    check=True,
+    timeout=15,
+)
+assert Path(result).read_bytes() in {b"granted\n", b"denied\n"}
+Path(result).unlink()
+PY
+fi
 ln -s /Applications "$staging/Applications"
 hdiutil create -ov -format UDZO -volname "myRemote $version" -srcfolder "$staging" "dist/myRemote-macOS-Universal.dmg"
 hdiutil verify "dist/myRemote-macOS-Universal.dmg"
