@@ -1,13 +1,14 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSImage,
-    NSMenu, NSMenuDelegate, NSMenuItem, NSPanel, NSStatusBar, NSTextField, NSWindowStyleMask,
-    NSWorkspace,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSButton, NSEvent,
+    NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSPanel,
+    NSStatusBar, NSTextField, NSWindowStyleMask, NSWorkspace,
 };
 use objc2_foundation::{
     NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
@@ -37,6 +38,35 @@ const TAILSCALE_BRIDGE: isize = 13;
 const CONNECTION: isize = 14;
 const ACCESSIBILITY_SETTINGS: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility";
+const PERMISSION_SETUP_TIMEOUT: Duration = Duration::from_secs(300);
+const PERMISSION_RELAUNCH_DELAY: Duration = Duration::from_secs(2);
+
+struct AccessibilityApproval {
+    expires: Instant,
+    saw_missing_access: bool,
+    granted_at: Option<Instant>,
+}
+
+impl AccessibilityApproval {
+    fn begin(now: Instant, trusted: bool) -> Self {
+        Self {
+            expires: now + PERMISSION_SETUP_TIMEOUT,
+            saw_missing_access: !trusted,
+            granted_at: None,
+        }
+    }
+
+    fn ready_to_relaunch(&mut self, now: Instant, trusted: bool) -> bool {
+        if !trusted {
+            self.saw_missing_access = true;
+            self.granted_at = None;
+            return false;
+        }
+        now < self.expires
+            && self.saw_missing_access
+            && now.duration_since(*self.granted_at.get_or_insert(now)) >= PERMISSION_RELAUNCH_DELAY
+    }
+}
 
 struct State {
     options: Options,
@@ -44,6 +74,7 @@ struct State {
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     accessibility_panel: RefCell<Option<Retained<NSPanel>>>,
+    accessibility_approval: RefCell<Option<AccessibilityApproval>>,
     relaunch_target: RefCell<Option<PathBuf>>,
     network: RefCell<MenuNetwork>,
     updater: RefCell<Updater>,
@@ -152,13 +183,13 @@ define_class!(
         fn accessibility(&self, _sender: &NSMenuItem) {
             if self.needs_accessibility() {
                 self.show_accessibility_setup();
-                open_settings(ACCESSIBILITY_SETTINGS);
+                self.begin_accessibility_setup();
             }
         }
 
         #[unsafe(method(myRemoteOpenAccessibilitySettings:))]
         fn open_accessibility_settings(&self, _sender: &NSButton) {
-            open_settings(ACCESSIBILITY_SETTINGS);
+            self.begin_accessibility_setup();
         }
 
         #[unsafe(method(myRemoteRevealInstalledApp:))]
@@ -179,10 +210,7 @@ define_class!(
                 return;
             }
             match update::app_bundle_path() {
-                Ok(path) => {
-                    self.ivars().relaunch_target.replace(Some(path));
-                    NSApplication::sharedApplication(self.mtm()).stop(None);
-                }
+                Ok(path) => self.schedule_relaunch(path),
                 Err(error) => self.alert("Unable to relaunch myRemote", &error.to_string()),
             }
         }
@@ -234,7 +262,10 @@ define_class!(
 
         #[unsafe(method(myRemotePollUpdates:))]
         fn poll_updates(&self, _timer: &NSTimer) {
-            self.finish_accessibility_setup();
+            let relaunching = self.ivars().relaunch_target.borrow().is_some();
+            if relaunching || self.poll_accessibility_setup() {
+                return;
+            }
             let pin = self.ivars().active.borrow().as_ref()
                 .and_then(|receiver| receiver.state.take_requested_code());
             if let Some(pin) = pin {
@@ -258,6 +289,7 @@ impl MenuController {
             active: RefCell::new(None),
             error: RefCell::new(None),
             accessibility_panel: RefCell::new(None),
+            accessibility_approval: RefCell::new(None),
             relaunch_target: RefCell::new(None),
             network,
             updater,
@@ -294,6 +326,44 @@ impl MenuController {
         }
     }
 
+    fn begin_accessibility_setup(&self) {
+        if !self.needs_accessibility() {
+            return;
+        }
+        // An explicit request lets macOS register this copy again after its row is removed.
+        let trusted = input::request_accessibility_entry();
+        if trusted {
+            self.request_accessibility_if_needed();
+        }
+        let now = Instant::now();
+        let mut approval = self.ivars().accessibility_approval.borrow_mut();
+        if !trusted
+            || approval
+                .as_ref()
+                .is_none_or(|approval| now >= approval.expires)
+        {
+            *approval = Some(AccessibilityApproval::begin(now, trusted));
+        }
+        drop(approval);
+        open_settings(ACCESSIBILITY_SETTINGS);
+    }
+
+    fn schedule_relaunch(&self, path: PathBuf) {
+        self.ivars().relaunch_target.replace(Some(path));
+        let app = NSApplication::sharedApplication(self.mtm());
+        app.stop(None);
+        // AppKit only honors stop after an event; a permission timer may fire with none pending.
+        let wake = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
+            NSEventType::ApplicationDefined,
+            NSPoint::new(0.0, 0.0),
+            NSEventModifierFlags::empty(),
+            0.0, 0, None, 0, 0, 0,
+        );
+        if let Some(wake) = wake {
+            app.postEvent_atStart(&wake, true);
+        }
+    }
+
     fn show_accessibility_setup(&self) {
         let panel = self
             .ivars()
@@ -324,7 +394,7 @@ impl MenuController {
 
         if let Some(view) = panel.contentView() {
             let instructions = NSString::from_str(
-                "Turn on myRemote in Accessibility settings.\n\nIf it’s already on, remove the old entry and add the copy shown in Finder. If this window stays open after you grant access, click Relaunch myRemote.",
+                "Turn on myRemote in Accessibility settings. If it’s missing, click Request Access.\n\nIf access still hasn’t taken effect after a few seconds, click Relaunch myRemote.",
             );
             let label = NSTextField::wrappingLabelWithString(&instructions, mtm);
             label.setFrame(rect(22.0, 56.0, 430.0, 104.0));
@@ -332,7 +402,7 @@ impl MenuController {
             let bundled = update::app_bundle_path().is_ok();
             for (label, action, x, width, enabled) in [
                 (
-                    "Open Settings",
+                    "Request Access",
                     sel!(myRemoteOpenAccessibilitySettings:),
                     18.0,
                     130.0,
@@ -370,16 +440,35 @@ impl MenuController {
         panel
     }
 
-    fn finish_accessibility_setup(&self) {
-        let mut setup = self.ivars().accessibility_panel.borrow_mut();
-        if setup
-            .as_ref()
-            .is_some_and(|panel| !panel.isVisible() || !self.needs_accessibility())
-        {
-            if let Some(panel) = setup.take() {
-                panel.orderOut(None);
+    fn poll_accessibility_setup(&self) -> bool {
+        let state = self.ivars();
+        let panel = state.accessibility_panel.borrow().clone();
+        let Some(panel) = panel else {
+            return false;
+        };
+        if !panel.isVisible() || !self.needs_accessibility() {
+            panel.orderOut(None);
+            state.accessibility_panel.take();
+            state.accessibility_approval.take();
+            return false;
+        }
+        let ready = state
+            .accessibility_approval
+            .borrow_mut()
+            .as_mut()
+            .is_some_and(|approval| {
+                let now = Instant::now();
+                now < approval.expires
+                    && approval.ready_to_relaunch(now, input::accessibility_is_trusted())
+            });
+        if ready {
+            state.accessibility_approval.take();
+            if let Ok(path) = update::app_bundle_path() {
+                self.schedule_relaunch(path);
+                return true;
             }
         }
+        false
     }
 
     fn stop(&self) {
@@ -585,4 +674,27 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         update::relaunch_current(&target)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_new_stable_grant_triggers_relaunch_during_setup() {
+        let start = Instant::now();
+        let one_second = Duration::from_secs(1);
+        let mut approval = AccessibilityApproval::begin(start, true);
+        assert!(!approval.ready_to_relaunch(start + Duration::from_secs(10), true));
+
+        let mut approval = AccessibilityApproval::begin(start, false);
+        assert!(!approval.ready_to_relaunch(start + one_second, false));
+        let grant = start + Duration::from_secs(10);
+        assert!(!approval.ready_to_relaunch(grant, true));
+        assert!(!approval.ready_to_relaunch(grant + one_second, false));
+        let grant = grant + Duration::from_secs(3);
+        assert!(!approval.ready_to_relaunch(grant, true));
+        assert!(approval.ready_to_relaunch(grant + PERMISSION_RELAUNCH_DELAY, true));
+        assert!(!approval.ready_to_relaunch(start + PERMISSION_SETUP_TIMEOUT, true));
+    }
 }

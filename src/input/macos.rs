@@ -1,7 +1,7 @@
 use std::ffi::{c_char, c_void};
 use std::io;
 use std::process::Command;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 
 type Event = *mut c_void;
 
@@ -12,8 +12,24 @@ struct Point {
     y: f64,
 }
 
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> bool;
+    fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    static kAXTrustedCheckOptionPrompt: *const c_void;
+}
+
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
+    static kCFBooleanTrue: *const c_void;
+    fn CFDictionaryCreate(
+        allocator: *const c_void,
+        keys: *const *const c_void,
+        values: *const *const c_void,
+        count: isize,
+        key_callbacks: *const c_void,
+        value_callbacks: *const c_void,
+    ) -> *const c_void;
     fn CFRelease(object: *const c_void);
 }
 
@@ -42,6 +58,25 @@ pub struct Desktop;
 
 pub fn can_post_input() -> bool {
     unsafe { CGPreflightPostEventAccess() }
+}
+
+pub fn accessibility_is_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
+
+pub fn request_accessibility_entry() -> bool {
+    // The dictionary refers only to process-lifetime Core Foundation constants.
+    unsafe {
+        let keys = [kAXTrustedCheckOptionPrompt];
+        let values = [kCFBooleanTrue];
+        let options = CFDictionaryCreate(null(), keys.as_ptr(), values.as_ptr(), 1, null(), null());
+        if options.is_null() {
+            return AXIsProcessTrusted();
+        }
+        let trusted = AXIsProcessTrustedWithOptions(options);
+        CFRelease(options);
+        trusted
+    }
 }
 
 pub fn request_input_permission() {
