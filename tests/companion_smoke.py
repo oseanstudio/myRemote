@@ -79,6 +79,34 @@ async def command(client, name, values, frame=FrameType.E_OPACK):
     return await client.exchange_opack(frame, {"_i": name, "_t": 2, "_c": values}, timeout=2.0)
 
 
+async def start_remote(client):
+    reply = await client.exchange_opack(
+        FrameType.E_OPACK,
+        {
+            "model": "_systemInfo",
+            "_i": None,
+            "_t": 2,
+            "_c": {"model": "iPhone17,1", "name": "Test phone", "_clFl": 128},
+        },
+        timeout=2.0,
+    )
+    assert set(reply) == {"_t", "_x", "_c"}
+    assert reply["_c"]["_stA"] == ["com.apple.tvremoteservices"]
+    assert reply["_c"]["model"] == "AppleTV14,1"
+    assert reply["_c"]["name"] == "myRemote smoke test"
+
+    # Extra frames and keepalives can arrive after verification. Nonempty encrypted
+    # frames consume a nonce even when their contents are unused by the Remote.
+    client.connection.send(FrameType.NoOp, b"")
+    client.connection.send(FrameType.SessionData, b"optional session data")
+    client.connection.send(FrameType.E_OPACK, b"\xff")
+    reply = await command(
+        client, "_sessionStart", {"_srvT": "com.apple.tvremoteservices", "_sid": 456}
+    )
+    assert set(reply) == {"_t", "_x", "_c"}
+    assert 0 <= reply["_c"]["_sid"] <= 0xFFFFFFFF
+
+
 def touch_event(client, phase, **coordinates):
     client.send_opack(
         FrameType.E_OPACK,
@@ -93,6 +121,8 @@ def touch_event(client, phase, **coordinates):
 async def exercise_tv_remote(client, expect):
     start = await command(client, "TVRCSessionStart", {"ProtocolVersionKey": "1.2"})
     assert start["_c"]["ProtocolVersionKey"] == "1.2"
+    apps = await command(client, "FetchLaunchableApplicationsEvent", {})
+    assert apps["_c"] == {"AppCountKey": 0, "AppInfos": {}}
     start_touch = await command(
         client, "HIDTouchStart", {"Width": 1000, "Height": 1000, "TouchFlags": 0}
     )
@@ -164,7 +194,7 @@ async def exercise(binary, state):
         client = protocol(port, credentials)
         try:
             await client.start()
-            await command(client, "_sessionStart", {"_sid": 456})
+            await start_remote(client)
             await exercise_tv_remote(client, expect)
         finally:
             client.stop()

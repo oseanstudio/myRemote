@@ -26,6 +26,8 @@ struct Pairing {
     window: Option<PairingWindow>,
     next_automatic: Option<Instant>,
     status: &'static str,
+    connected_remotes: usize,
+    remotes_with_input: usize,
 }
 
 pub struct PairingState {
@@ -80,6 +82,8 @@ impl PairingState {
                 window: None,
                 next_automatic: None,
                 status: "Waiting for iPhone",
+                connected_remotes: 0,
+                remotes_with_input: 0,
             }),
         })
     }
@@ -122,11 +126,34 @@ impl PairingState {
     }
 
     pub fn connection_status(&self) -> &'static str {
-        self.pairing.lock().unwrap().status
+        let pairing = self.pairing.lock().unwrap();
+        if pairing.remotes_with_input > 0 {
+            "iPhone input received"
+        } else if pairing.connected_remotes > 0 {
+            "iPhone remote connected"
+        } else {
+            pairing.status
+        }
     }
 
     pub(crate) fn set_connection_status(&self, status: &'static str) {
         self.pairing.lock().unwrap().status = status;
+    }
+
+    pub(crate) fn remote_started(&self) {
+        self.pairing.lock().unwrap().connected_remotes += 1;
+    }
+
+    pub(crate) fn remote_received_input(&self) {
+        self.pairing.lock().unwrap().remotes_with_input += 1;
+    }
+
+    pub(crate) fn remote_stopped(&self, received_input: bool) {
+        let mut pairing = self.pairing.lock().unwrap();
+        pairing.connected_remotes -= 1;
+        if received_input {
+            pairing.remotes_with_input -= 1;
+        }
     }
 
     pub(crate) fn begin_pairing(&self) -> Option<(u32, u64)> {
@@ -225,4 +252,27 @@ fn write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()?;
     drop(file);
     fs::rename(temporary, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn background_connection_status_does_not_hide_live_remote_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = PairingState::open(directory.path()).unwrap();
+        state.remote_started();
+        state.remote_received_input();
+        state.remote_started();
+        state.set_connection_status("iPhone verified · waiting for Remote session");
+        assert_eq!(state.connection_status(), "iPhone input received");
+
+        state.remote_stopped(true);
+        assert_eq!(state.connection_status(), "iPhone remote connected");
+
+        state.set_connection_status("iPhone remote disconnected");
+        state.remote_stopped(false);
+        assert_eq!(state.connection_status(), "iPhone remote disconnected");
+    }
 }

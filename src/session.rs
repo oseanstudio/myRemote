@@ -6,10 +6,9 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
-use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
-use tracing::info;
+use tracing::{debug, info};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
 use crate::crypto::{hkdf_expand, CompanionCipher};
@@ -22,6 +21,8 @@ use crate::tlv::{self, tags};
 use crate::FrameType;
 
 pub const DEVICE_MODEL: &str = "AppleTV14,1";
+pub(crate) const SOURCE_VERSION: &str = "715.2";
+const REMOTE_SERVICE: &str = "com.apple.tvremoteservices";
 pub const MEDIA_CONTROL_VOLUME: u64 = 0x0100;
 
 const SWIPE_MIN_DISTANCE: f64 = 150.0; // touchpad units; the surface is 1000x1000
@@ -68,6 +69,14 @@ enum TouchPhase {
     Cancelled,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RemoteState {
+    Waiting,
+    Connected,
+    ReceivingInput,
+    Closed,
+}
+
 /// One Companion connection's state machine.
 pub(crate) struct CompanionSession {
     writer: OwnedWriteHalf,
@@ -80,7 +89,8 @@ pub(crate) struct CompanionSession {
     setup_proved: bool,
     pending_verify: Option<PendingVerification>,
     cipher: Option<CompanionCipher>,
-    remote_started: bool,
+    remote: RemoteState,
+    background_probe: bool,
     current_identifier: Option<String>,
     remote_session_id: u32,
     touch_origin: Option<(f64, f64)>,
@@ -110,7 +120,8 @@ impl CompanionSession {
             setup_proved: false,
             pending_verify: None,
             cipher: None,
-            remote_started: false,
+            remote: RemoteState::Waiting,
+            background_probe: false,
             current_identifier: None,
             remote_session_id: rand::random(),
             touch_origin: None,
@@ -127,7 +138,26 @@ impl CompanionSession {
     }
 
     pub(crate) fn remote_started(&self) -> bool {
-        self.remote_started
+        matches!(
+            self.remote,
+            RemoteState::Connected | RemoteState::ReceivingInput
+        )
+    }
+
+    pub(crate) fn report_disconnect(&self, error: &Error) {
+        if !self.is_verified() || self.background_probe && self.remote == RemoteState::Waiting {
+            return;
+        }
+        let status = match error {
+            Error::Crypto(_) => "iPhone session lost encryption",
+            Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                "iPhone connection timed out"
+            }
+            Error::Io(_) if self.remote != RemoteState::Waiting => "iPhone remote disconnected",
+            Error::Io(_) => "iPhone disconnected before opening Remote",
+            _ => "iPhone session ended on a protocol error",
+        };
+        self.pairing.set_connection_status(status);
     }
 
     async fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
@@ -171,11 +201,13 @@ impl CompanionSession {
     ) -> Result<()> {
         let mut response = vec![
             Value::kv("_c", content.unwrap_or(Value::dict(vec![]))),
-            Value::kv("_rT", Value::Int(result_type)),
             Value::kv("_t", Value::Int(3)),
         ];
-        if let Some(identifier) = &self.current_identifier {
-            response.push(Value::kv("_i", Value::str(identifier)));
+        if !matches!(
+            self.current_identifier.as_deref(),
+            Some("_systemInfo" | "SystemInfo" | "_sessionStart" | "_sessionStop")
+        ) {
+            response.push(Value::kv("_rT", Value::Int(result_type)));
         }
         if let Some(xid) = xid {
             response.push(Value::kv("_x", Value::Int(xid)));
@@ -202,27 +234,38 @@ impl CompanionSession {
 
     pub(crate) async fn handle_frame(
         &mut self,
-        frame: FrameType,
+        frame_id: u8,
         payload: &[u8],
         header: &[u8],
     ) -> Result<()> {
-        if frame == FrameType::EOpack {
-            let cipher = self
-                .cipher
-                .as_mut()
-                .ok_or_else(|| Error::Protocol("verify before sending input".into()))?;
+        let frame = FrameType::from_u8(frame_id);
+        if let Some(cipher) = self.cipher.as_mut() {
+            if payload.is_empty() {
+                return Ok(());
+            }
             let payload = cipher.decrypt(payload, Some(header), None)?;
-            let (message, _) = opack::unpack(&payload)?;
-            return self.handle_control(&message).await;
+            // Non-control frames still use a nonce on the encrypted transport.
+            if frame == Some(FrameType::EOpack) {
+                match opack::unpack(&payload) {
+                    Ok((message, _)) => self.handle_control(&message).await?,
+                    Err(error) => {
+                        debug!("Skipping undecodable encrypted Companion message: {error}")
+                    }
+                }
+            } else {
+                debug!("Ignoring encrypted Companion frame {frame_id:#04x}");
+            }
+            return Ok(());
+        }
+        let frame = frame.ok_or_else(|| Error::Protocol("unknown Companion frame type".into()))?;
+        if frame == FrameType::EOpack {
+            return Err(Error::Protocol("verify before sending input".into()));
         }
         if !matches!(
             frame,
             FrameType::PsStart | FrameType::PsNext | FrameType::PvStart | FrameType::PvNext
         ) {
             return Ok(());
-        }
-        if self.is_verified() {
-            return Err(Error::Protocol("authorization is already complete".into()));
         }
         let (message, _) = opack::unpack(payload)?;
         let pairing = tlv::read(field(&message, "_pd")?);
@@ -438,11 +481,6 @@ impl CompanionSession {
                 )
                 .await;
         }
-        let session_id = Sha256::new()
-            .chain_update(self.pairing.identifier.as_bytes())
-            .chain_update(id)
-            .finalize();
-        self.remote_session_id = u32::from_le_bytes(session_id[..4].try_into().unwrap());
         self.auth_reply(FrameType::PvNext, &[(tags::SEQ_NO, &[4])])
             .await?;
         self.cipher = Some(CompanionCipher::new(
@@ -450,15 +488,16 @@ impl CompanionSession {
             &hkdf_expand("", "ClientEncrypt-main", &pending.shared),
             12,
         )?);
-        self.pairing.set_connection_status("iPhone verified");
+        self.pairing
+            .set_connection_status("iPhone verified · waiting for Remote session");
         Ok(())
     }
 
     async fn handle_control(&mut self, data: &Value) -> Result<()> {
         self.current_identifier = data
             .get("_i")
-            .or_else(|| data.get("model"))
             .and_then(Value::as_str)
+            .or_else(|| data.get("model").and_then(Value::as_str))
             .map(str::to_owned);
         let xid = data.get("_x").and_then(Value::as_int);
         let is_event = data.get("_t").and_then(Value::as_int) == Some(1);
@@ -466,9 +505,6 @@ impl CompanionSession {
 
         match self.current_identifier.as_deref() {
             Some("_sessionStart") => {
-                self.remote_started = true;
-                self.pairing
-                    .set_connection_status("iPhone connected successfully");
                 self.send_response(
                     xid,
                     Some(Value::dict(vec![Value::kv(
@@ -478,11 +514,9 @@ impl CompanionSession {
                     0,
                 )
                 .await?;
+                self.start_remote();
             }
             Some("TVRCSessionStart") => {
-                self.remote_started = true;
-                self.pairing
-                    .set_connection_status("iPhone connected successfully");
                 let version = content
                     .get("ProtocolVersionKey")
                     .and_then(Value::as_str)
@@ -497,10 +531,12 @@ impl CompanionSession {
                 )
                 .await?;
                 self.send_media_state(xid).await?;
+                self.start_remote();
             }
             Some("_sessionStop" | "_touchStop" | "HIDTouchStop" | "_tiStop") => {
                 if self.current_identifier.as_deref() == Some("_sessionStop") {
-                    self.remote_started = false;
+                    self.stop_remote();
+                    self.pairing.set_connection_status("iPhone remote closed");
                 }
                 self.touch_origin = None;
                 self.touch_last = None;
@@ -551,7 +587,10 @@ impl CompanionSession {
                 }
             }
             Some("_systemInfo" | "SystemInfo") => {
-                self.send_response(xid, None, 0).await?;
+                // Rapport uses the high XID bit for background system-info probes.
+                self.background_probe = self.remote == RemoteState::Waiting
+                    && xid.is_some_and(|xid| xid & 0x8000_0000 != 0);
+                self.send_response(xid, Some(self.system_info()), 0).await?;
                 self.send_event("SystemStatus", None, Some(awake())).await?;
                 self.send_event("TVSystemStatus", None, Some(awake()))
                     .await?;
@@ -569,11 +608,36 @@ impl CompanionSession {
                 )
                 .await?;
             }
-            Some("FetchLaunchableApplicationsEvent") => self.send_response(xid, None, 2).await?,
+            Some("FetchLaunchableApplicationsEvent") => {
+                self.send_response(
+                    xid,
+                    Some(Value::dict(vec![
+                        Value::kv("AppCountKey", Value::Int(0)),
+                        Value::kv("AppInfos", Value::dict(vec![])),
+                    ])),
+                    2,
+                )
+                .await?;
+            }
             _ if xid.is_some() && !is_event => self.send_response(xid, None, 0).await?,
             _ => {}
         }
         Ok(())
+    }
+
+    fn system_info(&self) -> Value {
+        let mac = self.pairing.mac.map(|byte| format!("{byte:02X}")).join(":");
+        Value::dict(vec![
+            Value::kv("_sf", Value::Int(65536)),
+            Value::kv("_cf", Value::Int(512)),
+            Value::kv("_i", Value::str(&hex::encode_upper(self.pairing.mac))),
+            Value::kv("_pubID", Value::str(&mac)),
+            Value::kv("_spID", Value::str(&self.pairing.identifier)),
+            Value::kv("_stA", Value::Array(vec![Value::str(REMOTE_SERVICE)])),
+            Value::kv("_sv", Value::str(SOURCE_VERSION)),
+            Value::kv("model", Value::str(DEVICE_MODEL)),
+            Value::kv("name", Value::str(&self.device_name)),
+        ])
     }
 
     async fn handle_hid_command(&mut self, content: &Value, xid: Option<u64>) -> Result<()> {
@@ -678,8 +742,26 @@ impl CompanionSession {
     }
 
     fn record_input(&mut self) {
-        self.remote_started = true;
-        self.pairing.set_connection_status("iPhone input received");
+        self.start_remote();
+        if self.remote == RemoteState::Connected {
+            self.pairing.remote_received_input();
+            self.remote = RemoteState::ReceivingInput;
+        }
+    }
+
+    fn start_remote(&mut self) {
+        if !self.remote_started() {
+            self.pairing.remote_started();
+            self.remote = RemoteState::Connected;
+        }
+    }
+
+    fn stop_remote(&mut self) {
+        if self.remote_started() {
+            self.pairing
+                .remote_stopped(self.remote == RemoteState::ReceivingInput);
+            self.remote = RemoteState::Closed;
+        }
     }
 
     fn select(&mut self, from_touch: bool) {
@@ -775,6 +857,12 @@ impl CompanionSession {
             }
             TouchPhase::Cancelled => unreachable!(),
         }
+    }
+}
+
+impl Drop for CompanionSession {
+    fn drop(&mut self) {
+        self.stop_remote();
     }
 }
 

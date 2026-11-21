@@ -23,7 +23,7 @@ myRemote asks for mouse and keyboard access when it opens if macOS reports that 
 
 If your iPhone cannot see myRemote, check the status at the top of the Mac menu. Use **Local Network Settings…** if macOS blocked discovery. Connect the iPhone and the computer to the same LAN when using local discovery.
 
-If your iPhone connects but the controls do nothing, press Back on the iPhone and check the myRemote menu. **iPhone input received** confirms that the button reached myRemote. If **Allow Accessibility…** appears, open it and grant this copy of myRemote access.
+If your iPhone connects but the controls do nothing, press Back on the iPhone and check the myRemote menu. **iPhone input received** confirms that the button reached myRemote. **iPhone verified · waiting for Remote session** means the phone proved its identity and has yet to open the controls. If **Allow Accessibility…** appears, open it and grant this copy of myRemote access.
 
 ### Updates
 

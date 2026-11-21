@@ -8,18 +8,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, Socket, Type};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{tcp::OwnedReadHalf, TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{debug, warn};
 
 use crate::pairing::PAIRING_WINDOW;
-use crate::session::{CompanionSession, DEVICE_MODEL};
-use crate::{Error, FrameType, PairingState, RemoteInput, Result, TrackpadMode};
+use crate::session::{CompanionSession, DEVICE_MODEL, SOURCE_VERSION};
+use crate::{Error, PairingState, RemoteInput, Result, TrackpadMode};
 
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 32;
-const SOURCE_VERSION: &str = "715.2";
 pub const TAILNET_PORTS: [u16; 3] = [49152, 49153, 49154];
 
 pub struct Receiver {
@@ -424,6 +423,14 @@ async fn run_session(
     stream.set_nodelay(true)?;
     let (mut reader, writer) = stream.into_split();
     let mut session = CompanionSession::new(writer, input, pairing, name, mode);
+    let result = read_session(&mut reader, &mut session).await;
+    if let Err(error) = &result {
+        session.report_disconnect(error);
+    }
+    result
+}
+
+async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession) -> Result<()> {
     let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);
     loop {
         let header_deadline = if session.remote_started() {
@@ -436,9 +443,7 @@ async fn run_session(
         let mut header = [0; 4];
         timeout_at(header_deadline, reader.read_exact(&mut header))
             .await
-            .map_err(io::Error::other)??;
-        let frame = FrameType::from_u8(header[0])
-            .ok_or_else(|| Error::Protocol("unknown frame type".into()))?;
+            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
         let size = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
         if size > MAX_FRAME_SIZE {
             return Err(Error::Protocol("Companion frame too large".into()));
@@ -447,10 +452,10 @@ async fn run_session(
         let frame_deadline = header_deadline.min(Instant::now() + Duration::from_secs(5));
         timeout_at(frame_deadline, async {
             reader.read_exact(&mut data).await?;
-            session.handle_frame(frame, &data, &header).await
+            session.handle_frame(header[0], &data, &header).await
         })
         .await
-        .map_err(io::Error::other)??;
+        .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
     }
 }
 
@@ -459,6 +464,7 @@ mod tests {
     use super::*;
     use crate::opack::{self, Value};
     use crate::tlv::{self, tags};
+    use crate::FrameType;
 
     struct NoInput;
 
