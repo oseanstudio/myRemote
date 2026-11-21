@@ -94,6 +94,7 @@ async def start_remote(client):
     assert reply["_c"]["_stA"] == ["com.apple.tvremoteservices"]
     assert reply["_c"]["model"] == "AppleTV14,1"
     assert reply["_c"]["name"] == "myRemote smoke test"
+    device = reply["_c"]
 
     # Extra frames and keepalives can arrive after verification. Nonempty encrypted
     # frames consume a nonce even when their contents are unused by the Remote.
@@ -104,7 +105,9 @@ async def start_remote(client):
         client, "_sessionStart", {"_srvT": "com.apple.tvremoteservices", "_sid": 456}
     )
     assert set(reply) == {"_t", "_x", "_c"}
-    assert 0 <= reply["_c"]["_sid"] <= 0xFFFFFFFF
+    session_id = reply["_c"]["_sid"]
+    assert 0 < session_id <= 0xFFFFFFFF
+    return (device["_pubID"], device["_spID"], device.get("_mrID")), session_id
 
 
 def touch_event(client, phase, **coordinates):
@@ -160,6 +163,12 @@ async def exercise(binary, state):
         await pair(port, (pin % 9000) + 1000, allowed=False)
         credentials = await pair(port, pin, allowed=True)
         await pair(port, pin, allowed=False)
+        client = protocol(port, credentials)
+        try:
+            await client.start()
+            identity, session_id = await start_remote(client)
+        finally:
+            client.stop()
 
     with receiver(binary, state) as (port, expect):
         plaintext = protocol(port)
@@ -194,8 +203,15 @@ async def exercise(binary, state):
         client = protocol(port, credentials)
         try:
             await client.start()
-            await start_remote(client)
+            assert await start_remote(client) == (identity, session_id)
+            assert identity[1] == identity[2]
             await exercise_tv_remote(client, expect)
+            await command(client, "_sessionStop", {"_sid": (session_id << 32) | 456})
+            # Reopen Remote on the same transport after the former 15-second cutoff.
+            await asyncio.sleep(16)
+            assert await start_remote(client) == (identity, session_id)
+            await command(client, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
+            expect(r"^Received button right$")
         finally:
             client.stop()
 

@@ -433,13 +433,9 @@ async fn run_session(
 async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession) -> Result<()> {
     let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);
     loop {
-        let header_deadline = if session.remote_started() {
-            Instant::now() + Duration::from_secs(30 * 60)
-        } else if session.is_verified() {
-            Instant::now() + Duration::from_secs(15)
-        } else {
-            auth_deadline
-        };
+        let header_deadline = session
+            .idle_limit()
+            .map_or(auth_deadline, |limit| Instant::now() + limit);
         let mut header = [0; 4];
         timeout_at(header_deadline, reader.read_exact(&mut header))
             .await

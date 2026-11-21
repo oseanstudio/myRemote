@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
+use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
 use tracing::{debug, info};
@@ -123,7 +124,7 @@ impl CompanionSession {
             remote: RemoteState::Waiting,
             background_probe: false,
             current_identifier: None,
-            remote_session_id: rand::random(),
+            remote_session_id: 0,
             touch_origin: None,
             touch_last: None,
             touch_distance: 0.0,
@@ -137,11 +138,21 @@ impl CompanionSession {
         self.cipher.is_some()
     }
 
-    pub(crate) fn remote_started(&self) -> bool {
+    fn remote_started(&self) -> bool {
         matches!(
             self.remote,
             RemoteState::Connected | RemoteState::ReceivingInput
         )
+    }
+
+    pub(crate) fn idle_limit(&self) -> Option<Duration> {
+        match self.remote {
+            RemoteState::Connected | RemoteState::ReceivingInput => Some(Duration::from_secs(1800)),
+            // A paired phone may reopen Remote on the same authenticated connection.
+            RemoteState::Closed => Some(Duration::from_secs(5 * 60)),
+            RemoteState::Waiting if self.is_verified() => Some(Duration::from_secs(15)),
+            RemoteState::Waiting => None,
+        }
     }
 
     pub(crate) fn report_disconnect(&self, error: &Error) {
@@ -481,6 +492,13 @@ impl CompanionSession {
                 )
                 .await;
         }
+        let session_id = Sha256::new()
+            .chain_update(self.pairing.identifier.as_bytes())
+            .chain_update(id)
+            .finalize();
+        // Renew the same logical session for this authenticated controller, using fresh
+        // encryption keys for each connection.
+        self.remote_session_id = u32::from_le_bytes(session_id[..4].try_into().unwrap()).max(1);
         self.auth_reply(FrameType::PvNext, &[(tags::SEQ_NO, &[4])])
             .await?;
         self.cipher = Some(CompanionCipher::new(
@@ -536,6 +554,7 @@ impl CompanionSession {
             Some("_sessionStop" | "_touchStop" | "HIDTouchStop" | "_tiStop") => {
                 if self.current_identifier.as_deref() == Some("_sessionStop") {
                     self.stop_remote();
+                    self.last_select = None;
                     self.pairing.set_connection_status("iPhone remote closed");
                 }
                 self.touch_origin = None;
@@ -633,6 +652,8 @@ impl CompanionSession {
             Value::kv("_i", Value::str(&hex::encode_upper(self.pairing.mac))),
             Value::kv("_pubID", Value::str(&mac)),
             Value::kv("_spID", Value::str(&self.pairing.identifier)),
+            // This is the UUID advertised as UniqueIdentifier in the MediaRemote TXT record.
+            Value::kv("_mrID", Value::str(&self.pairing.identifier)),
             Value::kv("_stA", Value::Array(vec![Value::str(REMOTE_SERVICE)])),
             Value::kv("_sv", Value::str(SOURCE_VERSION)),
             Value::kv("model", Value::str(DEVICE_MODEL)),
