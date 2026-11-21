@@ -1,5 +1,4 @@
-use std::cell::{Cell, RefCell};
-use std::path::PathBuf;
+use std::cell::RefCell;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
@@ -12,8 +11,8 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
 use tokio::runtime::Runtime;
 
 use crate::{
-    default_state_dir, input, mac_bonjour, start_receiver, tailnet_menu::MenuNetwork,
-    update::Updater, ActiveReceiver, Options, VERSION,
+    input, mac_bonjour, start_receiver, tailnet_menu::MenuNetwork, update::Updater, ActiveReceiver,
+    Options, VERSION,
 };
 
 const STATUS: isize = 1;
@@ -36,8 +35,6 @@ struct State {
     runtime: Runtime,
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
-    accessibility_requested: Cell<bool>,
-    accessibility_marker: Option<PathBuf>,
     network: RefCell<MenuNetwork>,
     updater: RefCell<Updater>,
 }
@@ -83,7 +80,7 @@ define_class!(
                               else { objc2_foundation::ns_string!("Start Receiver") });
             }
             if let Some(item) = menu.itemWithTag(ACCESSIBILITY) {
-                item.setHidden(self.ivars().options.dry_run || input::accessibility_is_trusted());
+                item.setHidden(!self.needs_accessibility());
             }
             let network = self.ivars().network.borrow();
             if let Some(item) = menu.itemWithTag(LOCAL_NETWORK) {
@@ -133,14 +130,23 @@ define_class!(
                 if let Some(error) = error {
                     self.alert("Unable to start myRemote", &error);
                 } else {
-                    self.request_accessibility(false);
+                    self.request_accessibility_if_needed();
                 }
             }
         }
 
         #[unsafe(method(myRemoteAccessibility:))]
         fn accessibility(&self, _sender: &NSMenuItem) {
-            self.request_accessibility(true);
+            if self.needs_accessibility() {
+                open_settings(
+                    "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+                );
+            }
+        }
+
+        #[unsafe(method(myRemoteCheckAccessibility:))]
+        fn check_accessibility(&self, _timer: &NSTimer) {
+            self.request_accessibility_if_needed();
         }
 
         #[unsafe(method(myRemoteLocalNetwork:))]
@@ -185,9 +191,6 @@ define_class!(
 
         #[unsafe(method(myRemotePollUpdates:))]
         fn poll_updates(&self, _timer: &NSTimer) {
-            if self.ivars().active.borrow().is_some() {
-                self.request_accessibility(false);
-            }
             let pin = self.ivars().active.borrow().as_ref()
                 .and_then(|receiver| receiver.state.take_requested_code());
             if let Some(pin) = pin {
@@ -205,21 +208,11 @@ impl MenuController {
     fn new(mtm: MainThreadMarker, options: Options, runtime: Runtime) -> Retained<Self> {
         let updater = RefCell::new(Updater::new(&options));
         let network = RefCell::new(MenuNetwork::new(&options));
-        let accessibility_marker = options
-            .state_dir
-            .clone()
-            .or_else(default_state_dir)
-            .map(|directory| directory.join("accessibility-requested"));
-        let already_requested = accessibility_marker
-            .as_ref()
-            .is_some_and(|path| path.is_file());
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
-            accessibility_requested: Cell::new(already_requested),
-            accessibility_marker,
             network,
             updater,
         });
@@ -245,27 +238,12 @@ impl MenuController {
         }
     }
 
-    fn request_accessibility(&self, clicked: bool) {
-        let state = self.ivars();
-        if state.options.dry_run || state.accessibility_requested.get() && !clicked {
-            return;
-        }
-        let already_requested = state.accessibility_requested.replace(true);
-        if !already_requested {
-            if let Some(path) = &state.accessibility_marker {
-                if let Err(error) = std::fs::write(path, b"1\n") {
-                    tracing::debug!("Could not save the Accessibility prompt state: {error}");
-                }
-            }
-        }
-        if input::accessibility_is_trusted() {
-            return;
-        }
-        if already_requested {
-            open_settings(
-                "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-            );
-        } else {
+    fn needs_accessibility(&self) -> bool {
+        !self.ivars().options.dry_run && !input::accessibility_is_trusted()
+    }
+
+    fn request_accessibility_if_needed(&self) {
+        if self.needs_accessibility() {
             input::request_accessibility();
         }
     }
@@ -435,18 +413,29 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         if controller.ivars().options.pair {
             controller.show_pairing();
         }
-        // Keeps update downloads and verification off the main thread.
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+        // Wait for AppKit's event loop before asking macOS to show a permission prompt.
+        // Both selectors target the live controller and take one NSTimer argument.
+        let (accessibility_timer, poll_timer) = unsafe {
+            let accessibility =
+                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                    0.0,
+                    &controller,
+                    sel!(myRemoteCheckAccessibility:),
+                    None,
+                    false,
+                );
+            let poll = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.25,
                 &controller,
                 sel!(myRemotePollUpdates:),
                 None,
                 true,
-            )
+            );
+            (accessibility, poll)
         };
         app.run();
-        timer.invalidate();
+        accessibility_timer.invalidate();
+        poll_timer.invalidate();
         controller.stop();
         bar.removeStatusItem(&item);
     });
