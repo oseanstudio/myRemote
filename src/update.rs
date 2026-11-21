@@ -15,7 +15,10 @@ use tempfile::{NamedTempFile, TempDir};
 use crate::{default_state_dir, Options, VERSION};
 pub use install::{clean_helper, run_helper};
 #[cfg(target_os = "macos")]
-pub use install::{destination as app_bundle_path, relaunch_current};
+pub use install::{
+    destination as app_bundle_path, prepare_accessibility_relaunch, run_accessibility_relaunch,
+    ACCESSIBILITY_RELAUNCH_ARG,
+};
 
 const REPO: &str = "oseanstudio/myRemote";
 const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);

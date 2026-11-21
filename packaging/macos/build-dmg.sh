@@ -51,6 +51,14 @@ import subprocess
 import sys
 
 app, result = sys.argv[1:]
+signature = subprocess.run(
+    ["/usr/bin/codesign", "--display", "--verbose=2", app],
+    check=True,
+    capture_output=True,
+    text=True,
+).stderr.splitlines()
+assert {"Identifier=com.oseanstudio.myremote", "Signature=adhoc"} <= set(signature)
+
 Path(result).touch(exist_ok=False)
 subprocess.run(
     ["/usr/bin/open", "-n", "-g", "-j", "-W", "--stdout", result, app,
@@ -58,8 +66,28 @@ subprocess.run(
     check=True,
     timeout=15,
 )
-assert Path(result).read_bytes() in {b"granted\n", b"denied\n"}
+assert Path(result).read_bytes() in {b"granted\n", b"accessibility\n", b"denied\n"}
 Path(result).unlink()
+
+# The helper must wait for its parent to close the pipe before launching another instance.
+with subprocess.Popen(
+    [str(Path(app) / "Contents/MacOS/myremote"), "--relaunch-after-accessibility",
+     "--probe-input-permission"],
+    stdin=subprocess.PIPE,
+) as helper:
+    try:
+        helper.wait(timeout=0.5)
+    except subprocess.TimeoutExpired:
+        pass
+    else:
+        raise AssertionError("Accessibility relaunch helper did not wait for its parent")
+    try:
+        helper.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        helper.kill()
+        helper.communicate()
+        raise
+    assert helper.returncode == 0
 PY
 fi
 ln -s /Applications "$staging/Applications"

@@ -60,6 +60,10 @@ pub fn can_post_input() -> bool {
     unsafe { CGPreflightPostEventAccess() }
 }
 
+pub fn accessibility_is_trusted() -> bool {
+    unsafe { AXIsProcessTrusted() }
+}
+
 pub fn request_accessibility_entry() -> bool {
     // The dictionary refers only to process-lifetime Core Foundation constants.
     unsafe {

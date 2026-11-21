@@ -502,6 +502,19 @@ fn main() -> std::process::ExitCode {
     if let Some(result) = mac_accessibility::run_probe() {
         return result;
     }
+    #[cfg(target_os = "macos")]
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == update::ACCESSIBILITY_RELAUNCH_ARG)
+    {
+        return match update::run_accessibility_relaunch() {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("myRemote relaunch: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     if env::args_os()
         .nth(1)
         .is_some_and(|arg| arg == "--apply-update")

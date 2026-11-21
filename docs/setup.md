@@ -19,9 +19,9 @@ The phone can reconnect after a server restart. Run the receiver on another comp
 | macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. Open the app to start the receiver. Allow Accessibility and Local Network access when macOS asks. |
 | Linux | Make the AppImage executable and launch it. The tray requires a desktop that supports StatusNotifier/AppIndicator. The receiver uses `/dev/uinput` for Wayland and X11. |
 
-myRemote uses the macOS permission prompt when mouse and keyboard access is missing. Choose **Allow Accessibility…** from the menu to request access again. In the system prompt, open System Settings and enable **myRemote**. The app relaunches once after macOS confirms access.
+myRemote uses the macOS permission prompt when mouse and keyboard access is missing. Choose **Allow Accessibility…** from the menu to request access again. In the system prompt, open System Settings and enable **myRemote**. When macOS reports the grant, myRemote quits and reopens automatically.
 
-The macOS build is ad-hoc signed, so an update can require a fresh grant. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it.
+The macOS build is ad-hoc signed. If access is missing at the first launch of a new release, myRemote asks macOS to clear its old Accessibility and mouse and keyboard permissions so the new copy can request them. Approve the new grant in System Settings. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it.
 
 If your iPhone cannot see myRemote, check the status at the top of the Mac menu. Use **Local Network Settings…** if macOS blocked discovery. Connect the iPhone and the computer to the same LAN when using local discovery.
 

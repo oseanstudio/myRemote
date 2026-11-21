@@ -1,19 +1,18 @@
 use std::cell::RefCell;
-use std::path::PathBuf;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSEvent, NSEventModifierFlags,
-    NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar, NSWorkspace,
+    NSAlert, NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSStatusBar, NSWorkspace,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSString, NSTimer, NSURL};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
 use tokio::runtime::Runtime;
 
 use crate::{
     input,
-    mac_accessibility::{ApprovalWatch, RELAUNCHED_ENV},
+    mac_accessibility::{refresh_updated_permissions, ApprovalWatch, RELAUNCHED_ENV},
     mac_bonjour, start_receiver,
     tailnet_menu::MenuNetwork,
     update::{self, Updater},
@@ -41,7 +40,6 @@ struct State {
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     accessibility_approval: RefCell<Option<ApprovalWatch>>,
-    relaunch_target: RefCell<Option<PathBuf>>,
     network: RefCell<MenuNetwork>,
     updater: RefCell<Updater>,
 }
@@ -197,8 +195,7 @@ define_class!(
 
         #[unsafe(method(myRemotePollUpdates:))]
         fn poll_updates(&self, _timer: &NSTimer) {
-            let relaunching = self.ivars().relaunch_target.borrow().is_some();
-            if relaunching || self.poll_accessibility_setup() {
+            if self.poll_accessibility_setup() {
                 return;
             }
             let pin = self.ivars().active.borrow().as_ref()
@@ -224,7 +221,6 @@ impl MenuController {
             active: RefCell::new(None),
             error: RefCell::new(None),
             accessibility_approval: RefCell::new(None),
-            relaunch_target: RefCell::new(None),
             network,
             updater,
         });
@@ -272,22 +268,6 @@ impl MenuController {
         }
     }
 
-    fn schedule_relaunch(&self, path: PathBuf) {
-        self.ivars().relaunch_target.replace(Some(path));
-        let app = NSApplication::sharedApplication(self.mtm());
-        app.stop(None);
-        // AppKit only honors stop after an event; a permission timer may fire with none pending.
-        let wake = NSEvent::otherEventWithType_location_modifierFlags_timestamp_windowNumber_context_subtype_data1_data2(
-            NSEventType::ApplicationDefined,
-            NSPoint::new(0.0, 0.0),
-            NSEventModifierFlags::empty(),
-            0.0, 0, None, 0, 0, 0,
-        );
-        if let Some(wake) = wake {
-            app.postEvent_atStart(&wake, true);
-        }
-    }
-
     fn poll_accessibility_setup(&self) -> bool {
         let mut approval = self.ivars().accessibility_approval.borrow_mut();
         let Some(watch) = approval.as_mut() else {
@@ -296,11 +276,16 @@ impl MenuController {
         if watch.expired() {
             approval.take();
         } else if watch.granted() {
-            let bundle = watch.bundle.clone();
             approval.take();
             drop(approval);
-            self.schedule_relaunch(bundle);
-            return true;
+            match update::prepare_accessibility_relaunch() {
+                Ok(()) => {
+                    self.stop();
+                    NSApplication::sharedApplication(self.mtm()).terminate(None);
+                    return true;
+                }
+                Err(error) => tracing::warn!("Unable to relaunch myRemote: {error}"),
+            }
         }
         false
     }
@@ -372,7 +357,16 @@ fn open_settings(location: &str) {
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
     let mtm = MainThreadMarker::new().ok_or("macOS menu must run on the main thread")?;
-    let relaunch_target = autoreleasepool(|_| {
+    if !options.dry_run {
+        if let (Ok(bundle), Some(directory)) =
+            (update::app_bundle_path(), crate::default_state_dir())
+        {
+            if let Err(error) = runtime.block_on(refresh_updated_permissions(&bundle, &directory)) {
+                tracing::warn!("Unable to refresh macOS permissions for this release: {error}");
+            }
+        }
+    }
+    autoreleasepool(|_| {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
         let controller = MenuController::new(mtm, options, runtime);
@@ -496,10 +490,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.stop();
         controller.ivars().accessibility_approval.take();
         bar.removeStatusItem(&item);
-        controller.ivars().relaunch_target.take()
     });
-    if let Some(target) = relaunch_target {
-        update::relaunch_current(&target)?;
-    }
     Ok(())
 }

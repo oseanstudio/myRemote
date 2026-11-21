@@ -2,7 +2,6 @@ use std::env;
 use std::fs::{self, File, OpenOptions};
 #[cfg(target_os = "macos")]
 use std::io;
-#[cfg(not(target_os = "macos"))]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,6 +32,10 @@ const HELPER: &str = "myremote-update.exe";
 #[cfg(unix)]
 const HELPER: &str = "myremote-update";
 static EXIT_LOCK: OnceLock<File> = OnceLock::new();
+#[cfg(target_os = "macos")]
+pub const ACCESSIBILITY_RELAUNCH_ARG: &str = "--relaunch-after-accessibility";
+#[cfg(target_os = "macos")]
+static ACCESSIBILITY_HELPER: OnceLock<std::process::Child> = OnceLock::new();
 
 pub struct Ready {
     pub stage: TempDir,
@@ -313,9 +316,32 @@ fn replace_with_retry(candidate: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn relaunch_current(target: &Path) -> Result<()> {
-    let arguments: Vec<_> = env::args_os().skip(1).collect();
-    relaunch_mac(target, &arguments, true)
+pub fn prepare_accessibility_relaunch() -> Result<()> {
+    destination()?;
+    let helper = Command::new(env::current_exe()?)
+        .arg(ACCESSIBILITY_RELAUNCH_ARG)
+        .args(env::args_os().skip(1))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    // Hold the helper’s stdin writer until the operating system exits this process.
+    ACCESSIBILITY_HELPER.set(helper).map_err(|mut helper| {
+        let _ = helper.kill();
+        let _ = helper.wait();
+        "A relaunch is already pending"
+    })?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+pub fn run_accessibility_relaunch() -> Result<()> {
+    let mut signal = [0];
+    if io::stdin().read(&mut signal)? != 0 {
+        return Err("Invalid relaunch signal".into());
+    }
+    let arguments: Vec<_> = env::args_os().skip(2).collect();
+    relaunch_mac(&destination()?, &arguments, true)
 }
 
 #[cfg(target_os = "macos")]
