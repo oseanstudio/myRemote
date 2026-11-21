@@ -40,6 +40,7 @@ unsafe extern "C" {
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> Event;
     fn CGEventCreateMouseEvent(source: *mut c_void, kind: u32, point: Point, button: u32) -> Event;
     fn CGEventPost(tap: u32, event: Event);
+    fn CGPreflightPostEventAccess() -> bool;
 }
 
 #[link(name = "AppKit", kind = "framework")]
@@ -55,7 +56,7 @@ unsafe extern "C" {
 pub struct Desktop;
 
 pub fn accessibility_is_trusted() -> bool {
-    unsafe { AXIsProcessTrusted() }
+    unsafe { AXIsProcessTrusted() || CGPreflightPostEventAccess() }
 }
 
 pub fn request_accessibility() {

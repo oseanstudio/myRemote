@@ -14,6 +14,7 @@ mod mac_bonjour;
 #[cfg(target_os = "macos")]
 mod mac_menu;
 mod tailnet;
+mod tailnet_menu;
 #[cfg(any(windows, target_os = "linux"))]
 mod tray_menu;
 mod update;
@@ -228,6 +229,7 @@ fn show_pairing(state: &PairingState) {
 
 struct ActiveReceiver {
     state: Arc<PairingState>,
+    input: Arc<dyn RemoteInput>,
     receiver: Receiver,
     ip: IpAddr,
     #[cfg(target_os = "macos")]
@@ -260,10 +262,18 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
         Arc::new(input::Desktop::open(options.speed)?)
     };
     let state = open_state(options)?;
+    if options.menu {
+        state.enable_pairing_on_request();
+    }
     if let Some(ip) = options.tailnet_host {
-        let (receiver, records) =
-            Receiver::listen_tailnet(options.name.clone(), ip, state.clone(), options.mode, input)
-                .await?;
+        let (receiver, records) = Receiver::listen_tailnet(
+            options.name.clone(),
+            ip,
+            state.clone(),
+            options.mode,
+            input.clone(),
+        )
+        .await?;
         let catalog = tailnet::Catalog {
             name: options.name.clone(),
             records,
@@ -271,6 +281,7 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
         return match tailnet::Host::start(ip, catalog).await {
             Ok(tailnet) => Ok(ActiveReceiver {
                 state,
+                input,
                 receiver,
                 ip: ip.into(),
                 #[cfg(target_os = "macos")]
@@ -289,11 +300,18 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
             .ip
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-        let (receiver, records) =
-            Receiver::listen(options.name.clone(), ip, state.clone(), options.mode, input).await?;
+        let (receiver, records) = Receiver::listen(
+            options.name.clone(),
+            ip,
+            state.clone(),
+            options.mode,
+            input.clone(),
+        )
+        .await?;
         match mac_bonjour::Bonjour::start(&options.name, options.ip, records) {
             Ok(bonjour) => Ok(ActiveReceiver {
                 state,
+                input,
                 receiver,
                 ip,
                 bonjour: Some(bonjour),
@@ -311,10 +329,17 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
             Some(ip) => ip,
             None => detect_local_ip()?,
         };
-        let receiver =
-            Receiver::start(options.name.clone(), ip, state.clone(), options.mode, input).await?;
+        let receiver = Receiver::start(
+            options.name.clone(),
+            ip,
+            state.clone(),
+            options.mode,
+            input.clone(),
+        )
+        .await?;
         Ok(ActiveReceiver {
             state,
+            input,
             receiver,
             ip: ip.into(),
             tailnet: None,
@@ -324,7 +349,9 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
 
 async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(remote) = options.tailnet_bridge {
-        return run_bridge(&options, remote).await;
+        return run_bridge(&options, remote)
+            .await
+            .map_err(|error| error as Box<dyn std::error::Error>);
     }
     if options.forget {
         let count = open_state(&options)?.forget_phones()?;
@@ -372,58 +399,87 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn run_bridge(options: &Options, remote: Ipv4Addr) -> Result<(), Box<dyn std::error::Error>> {
-    let mut catalog = tailnet::fetch(remote).await?;
-    #[cfg(target_os = "macos")]
-    let listen_ip = options
-        .ip
-        .map(IpAddr::V4)
-        .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-    #[cfg(not(target_os = "macos"))]
-    let local_ip = match options.ip {
-        Some(ip) => ip,
-        None => detect_local_ip()?,
-    };
-    #[cfg(not(target_os = "macos"))]
-    let listen_ip = local_ip.into();
-    let receiver = Receiver::relay(listen_ip, remote, &mut catalog.records).await?;
-    let port = catalog
-        .records
-        .iter()
-        .find(|record| record.service_type == "_companion-link._tcp")
-        .unwrap()
-        .port;
-    #[cfg(target_os = "macos")]
-    let bonjour = match mac_bonjour::Bonjour::start(&catalog.name, options.ip, catalog.records) {
-        Ok(bonjour) => bonjour,
-        Err(error) => {
-            receiver.stop().await;
-            return Err(error.into());
-        }
-    };
-    #[cfg(not(target_os = "macos"))]
-    let receiver = {
-        let mut receiver = receiver;
-        let host = format!(
-            "myremote-bridge-{}.local.",
-            remote.to_string().replace('.', "-")
-        );
-        if let Err(error) = receiver.advertise(&catalog.name, &host, local_ip, &catalog.records) {
-            receiver.stop().await;
-            return Err(error.into());
-        }
-        receiver
-    };
+async fn run_bridge(options: &Options, remote: Ipv4Addr) -> tailnet::Result<()> {
+    let catalog = tailnet::fetch(remote).await?;
+    let name = catalog.name.clone();
+    let bridge = Bridge::start(options.ip, remote, catalog).await?;
     println!(
-        "Bridging {} on the local network. Companion port {port}.",
-        catalog.name
+        "Bridging {name} on the local network. Companion port {}.",
+        bridge.port
     );
     let result = shutdown_signal().await;
-    #[cfg(target_os = "macos")]
-    drop(bonjour);
-    receiver.stop().await;
+    bridge.stop().await;
     result?;
     Ok(())
+}
+
+struct Bridge {
+    #[cfg(target_os = "macos")]
+    bonjour: mac_bonjour::Bonjour,
+    #[cfg(not(target_os = "macos"))]
+    lan_ip: Ipv4Addr,
+    receiver: Receiver,
+    port: u16,
+}
+
+impl Bridge {
+    async fn start(
+        ip: Option<Ipv4Addr>,
+        remote: Ipv4Addr,
+        mut catalog: tailnet::Catalog,
+    ) -> tailnet::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let listen_ip = ip
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+        #[cfg(not(target_os = "macos"))]
+        let local_ip = match ip {
+            Some(ip) => ip,
+            None => detect_local_ip()?,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let listen_ip = local_ip.into();
+        let receiver = Receiver::relay(listen_ip, remote, &mut catalog.records).await?;
+        let port = catalog
+            .records
+            .iter()
+            .find(|record| record.service_type == "_companion-link._tcp")
+            .unwrap()
+            .port;
+        #[cfg(target_os = "macos")]
+        let bonjour = match mac_bonjour::Bonjour::start(&catalog.name, ip, catalog.records) {
+            Ok(bonjour) => bonjour,
+            Err(error) => {
+                receiver.stop().await;
+                return Err(error.into());
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let receiver = {
+            let mut receiver = receiver;
+            let host = format!("myremote-bridge-{:016x}.local.", rand::random::<u64>());
+            if let Err(error) = receiver.advertise(&catalog.name, &host, local_ip, &catalog.records)
+            {
+                receiver.stop().await;
+                return Err(error.into());
+            }
+            receiver
+        };
+        Ok(Self {
+            #[cfg(target_os = "macos")]
+            bonjour,
+            #[cfg(not(target_os = "macos"))]
+            lan_ip: local_ip,
+            receiver,
+            port,
+        })
+    }
+
+    async fn stop(self) {
+        #[cfg(target_os = "macos")]
+        drop(self.bonjour);
+        self.receiver.stop().await;
+    }
 }
 async fn shutdown_signal() -> io::Result<()> {
     #[cfg(unix)]

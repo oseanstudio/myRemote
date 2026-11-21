@@ -7,11 +7,14 @@ use std::time::Duration;
 
 use tokio::runtime::Runtime;
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu},
     Icon, TrayIconBuilder,
 };
 
-use crate::{shutdown_signal, start_receiver, update::Updater, ActiveReceiver, Options, VERSION};
+use crate::{
+    shutdown_signal, start_receiver, tailnet_menu::MenuNetwork, update::Updater, ActiveReceiver,
+    Options, VERSION,
+};
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
@@ -23,6 +26,17 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let pair = MenuItem::new("Pair iPhone…", false, None);
     let code = MenuItem::new("Pairing closed", false, None);
     let toggle = MenuItem::new("Start Receiver", true, None);
+    let mut network = MenuNetwork::new(&options);
+    let tailscale = Submenu::new("Tailscale", true);
+    let tailscale_status = MenuItem::new(network.status(), false, None);
+    let tailnet_share = CheckMenuItem::new("Share This Computer", true, network.sharing(), None);
+    let tailnet_bridge = CheckMenuItem::new(
+        "Bridge Remote Computers to This Wi-Fi",
+        true,
+        network.bridging(),
+        None,
+    );
+    tailscale.append_items(&[&tailscale_status, &tailnet_share, &tailnet_bridge])?;
     let mut updater = Updater::new(&options);
     let update_status = MenuItem::new(updater.status(), false, None);
     let update_now = MenuItem::new("Update Now", true, None);
@@ -46,6 +60,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         &pair,
         &code,
         &toggle,
+        &PredefinedMenuItem::separator(),
+        &tailscale,
         &PredefinedMenuItem::separator(),
         &update_status,
         &update_now,
@@ -71,6 +87,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
     });
     let mut active = start(&options, &runtime, &status, &pair, &toggle);
+    network.sync_receiver(&runtime, &options, active.as_ref());
+    network.start_bridge(&runtime, &options);
     if options.pair {
         if let Some(active) = active.as_ref() {
             active.state.enable_pairing();
@@ -81,6 +99,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let message_loop = windows_loop::MessageLoop::new()?;
     let mut displayed_code = None;
     let mut displayed_update = updater.status().to_owned();
+    let mut displayed_network = network.status();
     let mut update_busy = false;
     let mut pending_event = None;
     let events = MenuEvent::receiver();
@@ -92,18 +111,28 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             }
             if event.id == *toggle.id() {
                 if let Some(receiver) = active.take() {
+                    network.sync_receiver(&runtime, &options, None);
                     runtime.block_on(receiver.stop());
                     status.set_text("Receiver stopped");
                     pair.set_enabled(false);
                     toggle.set_text("Start Receiver");
                 } else {
                     active = start(&options, &runtime, &status, &pair, &toggle);
+                    network.sync_receiver(&runtime, &options, active.as_ref());
                 }
             }
             if event.id == *pair.id() {
                 if let Some(receiver) = active.as_ref() {
                     receiver.state.enable_pairing();
                 }
+            }
+            if event.id == *tailnet_share.id() {
+                network.toggle_share(&runtime, &options, active.as_ref());
+                tailnet_share.set_checked(network.sharing());
+            }
+            if event.id == *tailnet_bridge.id() {
+                network.toggle_bridge(&runtime, &options);
+                tailnet_bridge.set_checked(network.bridging());
             }
             if event.id == *update_now.id() {
                 updater.update_now();
@@ -143,6 +172,11 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             displayed_update = updater.status().to_owned();
             update_status.set_text(&displayed_update);
         }
+        let network_status = network.status();
+        if displayed_network != network_status {
+            displayed_network = network_status;
+            tailscale_status.set_text(&displayed_network);
+        }
         if update_busy != updater.busy() {
             update_busy = updater.busy();
             update_now.set_enabled(!update_busy);
@@ -157,6 +191,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
     }
     if let Some(active) = active {
+        network.sync_receiver(&runtime, &options, None);
         runtime.block_on(active.stop());
     }
     Ok(())

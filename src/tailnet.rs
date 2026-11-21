@@ -2,7 +2,7 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use myremote::DiscoveryRecord;
+use myremote::{DiscoveryRecord, TAILNET_PORTS};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,9 +11,9 @@ use tokio::time::timeout;
 
 const PORT: u16 = 49151;
 const LIMIT: usize = 8192;
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Catalog {
     pub name: String,
     pub records: Vec<DiscoveryRecord>,
@@ -84,21 +84,19 @@ fn validate(catalog: &Catalog) -> Result<()> {
         return Err("The remote host sent an invalid receiver name.".into());
     }
     let expected = [
-        "_airplay._tcp",
-        "_companion-link._tcp",
-        "_mediaremotetv._tcp",
+        ("_airplay._tcp", TAILNET_PORTS[2]),
+        ("_companion-link._tcp", TAILNET_PORTS[1]),
+        ("_mediaremotetv._tcp", TAILNET_PORTS[0]),
     ];
     let mut types: Vec<_> = catalog
         .records
         .iter()
-        .map(|record| record.service_type.as_str())
+        .map(|record| (record.service_type.as_str(), record.port))
         .collect();
     types.sort_unstable();
     if types != expected
         || catalog.records.iter().any(|record| {
-            record.port == 0
-                || record.port == PORT
-                || record.txt.len() > 16
+            record.txt.len() > 16
                 || record.txt.iter().any(|(key, value)| {
                     key.is_empty()
                         || !key.bytes().all(|byte| byte.is_ascii_alphanumeric())

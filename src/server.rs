@@ -13,12 +13,14 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{debug, warn};
 
+use crate::pairing::PAIRING_WINDOW;
 use crate::session::{CompanionSession, DEVICE_MODEL};
 use crate::{Error, FrameType, PairingState, RemoteInput, Result, TrackpadMode};
 
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 const SOURCE_VERSION: &str = "715.2";
+pub const TAILNET_PORTS: [u16; 3] = [49152, 49153, 49154];
 
 pub struct Receiver {
     mdns: Option<(ServiceDaemon, Vec<String>)>,
@@ -26,7 +28,7 @@ pub struct Receiver {
     pub ports: [u16; 3],
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct DiscoveryRecord {
     pub service_type: String,
     pub port: u16,
@@ -158,15 +160,16 @@ impl Receiver {
     ) -> Result<(Self, Vec<DiscoveryRecord>)> {
         let (mrp, companion, airplay) = if fixed_ports {
             (
-                TcpListener::bind((ip, 49152)).await?,
-                TcpListener::bind((ip, 49153)).await?,
-                TcpListener::bind((ip, 49154)).await?,
+                TcpListener::bind((ip, TAILNET_PORTS[0])).await?,
+                TcpListener::bind((ip, TAILNET_PORTS[1])).await?,
+                TcpListener::bind((ip, TAILNET_PORTS[2])).await?,
             )
         } else {
+            // Keep the dedicated Tailscale ports available when listening on all interfaces.
             (
-                bind(ip, 49152).await?,
-                bind(ip, 49153).await?,
-                bind(ip, 0).await?,
+                bind(ip, 49052).await?,
+                bind(ip, 49053).await?,
+                bind(ip, 49054).await?,
             )
         };
         let ports = [
@@ -196,21 +199,37 @@ impl Receiver {
         ))
     }
 
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         for listener in &self.listeners {
             listener.abort();
         }
-        for listener in self.listeners {
+        for listener in self.listeners.drain(..) {
             let _ = listener.await;
         }
-        if let Some((mdns, services)) = self.mdns {
-            for service in services {
-                let _ = mdns.unregister(&service);
-            }
+        if let Some((mdns, services)) = self.mdns.take() {
+            unregister(&mdns, services);
             if let Ok(done) = mdns.shutdown() {
                 let _ = timeout(Duration::from_secs(2), done.recv_async()).await;
             }
         }
+    }
+}
+
+impl Drop for Receiver {
+    fn drop(&mut self) {
+        for listener in &self.listeners {
+            listener.abort();
+        }
+        if let Some((mdns, services)) = self.mdns.take() {
+            unregister(&mdns, services);
+            let _ = mdns.shutdown();
+        }
+    }
+}
+
+fn unregister(mdns: &ServiceDaemon, services: Vec<String>) {
+    for service in services {
+        let _ = mdns.unregister(&service);
     }
 }
 
@@ -405,10 +424,12 @@ async fn run_session(
     stream.set_nodelay(true)?;
     let (mut reader, writer) = stream.into_split();
     let mut session = CompanionSession::new(writer, input, pairing, name, mode);
-    let auth_deadline = Instant::now() + Duration::from_secs(90);
+    let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);
     loop {
-        let header_deadline = if session.is_verified() {
+        let header_deadline = if session.remote_started() {
             Instant::now() + Duration::from_secs(30 * 60)
+        } else if session.is_verified() {
+            Instant::now() + Duration::from_secs(15)
         } else {
             auth_deadline
         };
@@ -430,5 +451,86 @@ async fn run_session(
         })
         .await
         .map_err(io::Error::other)??;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::opack::{self, Value};
+    use crate::tlv::{self, tags};
+
+    struct NoInput;
+
+    impl RemoteInput for NoInput {
+        fn button(&self, _: &str) {
+            panic!("input must require verification");
+        }
+
+        fn move_pointer(&self, _: f64, _: f64) {
+            panic!("input must require verification");
+        }
+
+        fn click(&self) {
+            panic!("input must require verification");
+        }
+    }
+
+    #[tokio::test]
+    async fn first_pairing_connection_shows_a_local_code_only_with_the_menu_enabled() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = Arc::new(PairingState::open(directory.path()).unwrap());
+        let (receiver, _) = Receiver::listen(
+            "myRemote test".to_owned(),
+            Ipv4Addr::LOCALHOST.into(),
+            state.clone(),
+            TrackpadMode::Mouse,
+            Arc::new(NoInput),
+        )
+        .await
+        .unwrap();
+
+        let request = opack::pack(&Value::dict(vec![Value::kv(
+            "_pd",
+            Value::Bytes(tlv::write(&[(tags::SEQ_NO, &[1])])),
+        )]));
+        let mut packet = vec![FrameType::PsStart as u8, 0, 0, request.len() as u8];
+        packet.extend(request);
+
+        for menu_enabled in [false, true] {
+            if menu_enabled {
+                state.enable_pairing_on_request();
+            }
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, receiver.ports[1]))
+                .await
+                .unwrap();
+            stream.write_all(&packet).await.unwrap();
+            let mut header = [0; 4];
+            timeout(Duration::from_secs(3), stream.read_exact(&mut header))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(header[0], FrameType::PsNext as u8);
+            let mut bytes =
+                vec![0; u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize];
+            stream.read_exact(&mut bytes).await.unwrap();
+            let (reply, _) = opack::unpack(&bytes).unwrap();
+            let reply = tlv::read(reply.get("_pd").and_then(Value::as_bytes).unwrap());
+            assert_eq!(reply[&tags::SEQ_NO], [2]);
+            if menu_enabled {
+                assert!(reply.contains_key(&tags::SALT));
+                assert!(reply.contains_key(&tags::PUBLIC_KEY));
+                assert!(!reply.contains_key(&tags::ERROR));
+                let pin = state.take_requested_code().unwrap();
+                assert!((1000..=9999).contains(&pin));
+                assert_eq!(state.take_requested_code(), None);
+                assert_eq!(state.enable_pairing(), pin);
+            } else {
+                assert_eq!(reply[&tags::ERROR], [6]);
+                assert_eq!(state.take_requested_code(), None);
+            }
+        }
+
+        receiver.stop().await;
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "myremote"
-version = "0.2.3"
+version = "0.2.4"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -24,7 +24,7 @@ socket2 = "0.6"
 subtle = "2"
 tempfile = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "sync", "signal", "process"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt"] }
 uuid = "1"

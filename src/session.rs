@@ -72,6 +72,7 @@ pub(crate) struct CompanionSession {
     setup_proved: bool,
     pending_verify: Option<PendingVerification>,
     cipher: Option<CompanionCipher>,
+    remote_started: bool,
     current_identifier: Option<String>,
     remote_session_id: u32,
     touch_origin: Option<(f64, f64)>,
@@ -101,6 +102,7 @@ impl CompanionSession {
             setup_proved: false,
             pending_verify: None,
             cipher: None,
+            remote_started: false,
             current_identifier: None,
             remote_session_id: rand::random(),
             touch_origin: None,
@@ -114,6 +116,10 @@ impl CompanionSession {
 
     pub(crate) fn is_verified(&self) -> bool {
         self.cipher.is_some()
+    }
+
+    pub(crate) fn remote_started(&self) -> bool {
+        self.remote_started
     }
 
     async fn write_raw(&mut self, bytes: &[u8]) -> Result<()> {
@@ -271,6 +277,7 @@ impl CompanionSession {
         }
         srp.process(public_key)?;
         if !srp.verify_proof(tlv_field(data, tags::PROOF)?) {
+            self.pairing.set_connection_status("Pairing code rejected");
             return self
                 .auth_reply(
                     FrameType::PsNext,
@@ -414,6 +421,8 @@ impl CompanionSession {
             )
         });
         if verified.is_err() {
+            self.pairing
+                .set_connection_status("iPhone credentials were rejected · pair again");
             return self
                 .auth_reply(
                     FrameType::PvNext,
@@ -433,6 +442,7 @@ impl CompanionSession {
             &hkdf_expand("", "ClientEncrypt-main", &pending.shared),
             12,
         )?);
+        self.pairing.set_connection_status("iPhone verified");
         Ok(())
     }
 
@@ -447,6 +457,9 @@ impl CompanionSession {
 
         match self.current_identifier.as_deref() {
             Some("_sessionStart") => {
+                self.remote_started = true;
+                self.pairing
+                    .set_connection_status("iPhone connected successfully");
                 self.send_response(
                     xid,
                     Some(Value::dict(vec![Value::kv(
@@ -458,6 +471,9 @@ impl CompanionSession {
                 .await?;
             }
             Some("TVRCSessionStart") => {
+                self.remote_started = true;
+                self.pairing
+                    .set_connection_status("iPhone connected successfully");
                 let version = content
                     .get("ProtocolVersionKey")
                     .and_then(Value::as_str)
@@ -474,6 +490,9 @@ impl CompanionSession {
                 self.send_media_state(xid).await?;
             }
             Some("_sessionStop" | "_touchStop" | "_tiStop") => {
+                if self.current_identifier.as_deref() == Some("_sessionStop") {
+                    self.remote_started = false;
+                }
                 self.touch_origin = None;
                 self.touch_last = None;
                 self.send_response(xid, None, 0).await?;

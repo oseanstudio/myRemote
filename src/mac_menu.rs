@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::path::PathBuf;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
@@ -11,7 +12,8 @@ use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
 use tokio::runtime::Runtime;
 
 use crate::{
-    input, mac_bonjour, start_receiver, update::Updater, ActiveReceiver, Options, VERSION,
+    default_state_dir, input, mac_bonjour, start_receiver, tailnet_menu::MenuNetwork,
+    update::Updater, ActiveReceiver, Options, VERSION,
 };
 
 const STATUS: isize = 1;
@@ -23,6 +25,11 @@ const AUTO_CHECK: isize = 6;
 const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
 const LOCAL_NETWORK: isize = 9;
+const TAILSCALE: isize = 10;
+const TAILSCALE_STATUS: isize = 11;
+const TAILSCALE_SHARE: isize = 12;
+const TAILSCALE_BRIDGE: isize = 13;
+const CONNECTION: isize = 14;
 
 struct State {
     options: Options,
@@ -30,6 +37,8 @@ struct State {
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     accessibility_requested: Cell<bool>,
+    accessibility_marker: Option<PathBuf>,
+    network: RefCell<MenuNetwork>,
     updater: RefCell<Updater>,
 }
 
@@ -60,6 +69,12 @@ define_class!(
             if let Some(item) = menu.itemWithTag(STATUS) {
                 item.setTitle(&NSString::from_str(status));
             }
+            if let Some(item) = menu.itemWithTag(CONNECTION) {
+                item.setHidden(active.is_none());
+                if let Some(receiver) = active.as_ref() {
+                    item.setTitle(&NSString::from_str(receiver.state.connection_status()));
+                }
+            }
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
             }
@@ -70,8 +85,21 @@ define_class!(
             if let Some(item) = menu.itemWithTag(ACCESSIBILITY) {
                 item.setHidden(self.ivars().options.dry_run || input::accessibility_is_trusted());
             }
+            let network = self.ivars().network.borrow();
             if let Some(item) = menu.itemWithTag(LOCAL_NETWORK) {
-                item.setHidden(discovery.is_none() || discovery == Some(mac_bonjour::Status::Ready));
+                item.setHidden((discovery.is_none() && !network.bridging())
+                    || discovery == Some(mac_bonjour::Status::Ready));
+            }
+            let submenu = menu.itemWithTag(TAILSCALE).and_then(|item| item.submenu());
+            let tailscale_menu = submenu.as_deref().unwrap_or(menu);
+            if let Some(item) = tailscale_menu.itemWithTag(TAILSCALE_STATUS) {
+                item.setTitle(&NSString::from_str(&network.status()));
+            }
+            if let Some(item) = tailscale_menu.itemWithTag(TAILSCALE_SHARE) {
+                item.setState(isize::from(network.sharing()));
+            }
+            if let Some(item) = tailscale_menu.itemWithTag(TAILSCALE_BRIDGE) {
+                item.setState(isize::from(network.bridging()));
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
@@ -120,6 +148,20 @@ define_class!(
             open_settings("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork");
         }
 
+        #[unsafe(method(myRemoteTailscaleShare:))]
+        fn tailscale_share(&self, _sender: &NSMenuItem) {
+            let state = self.ivars();
+            state.network.borrow_mut().toggle_share(
+                &state.runtime, &state.options, state.active.borrow().as_ref(),
+            );
+        }
+
+        #[unsafe(method(myRemoteTailscaleBridge:))]
+        fn tailscale_bridge(&self, _sender: &NSMenuItem) {
+            let state = self.ivars();
+            state.network.borrow_mut().toggle_bridge(&state.runtime, &state.options);
+        }
+
         #[unsafe(method(myRemoteQuit:))]
         fn quit(&self, _sender: &NSMenuItem) {
             self.stop();
@@ -146,6 +188,11 @@ define_class!(
             if self.ivars().active.borrow().is_some() {
                 self.request_accessibility(false);
             }
+            let pin = self.ivars().active.borrow().as_ref()
+                .and_then(|receiver| receiver.state.take_requested_code());
+            if let Some(pin) = pin {
+                self.show_code(pin);
+            }
             if self.ivars().updater.borrow_mut().poll() {
                 self.stop();
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
@@ -157,12 +204,23 @@ define_class!(
 impl MenuController {
     fn new(mtm: MainThreadMarker, options: Options, runtime: Runtime) -> Retained<Self> {
         let updater = RefCell::new(Updater::new(&options));
+        let network = RefCell::new(MenuNetwork::new(&options));
+        let accessibility_marker = options
+            .state_dir
+            .clone()
+            .or_else(default_state_dir)
+            .map(|directory| directory.join("accessibility-requested"));
+        let already_requested = accessibility_marker
+            .as_ref()
+            .is_some_and(|path| path.is_file());
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
-            accessibility_requested: Cell::new(false),
+            accessibility_requested: Cell::new(already_requested),
+            accessibility_marker,
+            network,
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -173,6 +231,11 @@ impl MenuController {
         let state = self.ivars();
         match state.runtime.block_on(start_receiver(&state.options)) {
             Ok(receiver) => {
+                state.network.borrow_mut().sync_receiver(
+                    &state.runtime,
+                    &state.options,
+                    Some(&receiver),
+                );
                 state.active.replace(Some(receiver));
                 state.error.replace(None);
             }
@@ -187,9 +250,18 @@ impl MenuController {
         if state.options.dry_run || state.accessibility_requested.get() && !clicked {
             return;
         }
+        let already_requested = state.accessibility_requested.replace(true);
+        if !already_requested {
+            if let Some(path) = &state.accessibility_marker {
+                if let Err(error) = std::fs::write(path, b"1\n") {
+                    tracing::debug!("Could not save the Accessibility prompt state: {error}");
+                }
+            }
+        }
         if input::accessibility_is_trusted() {
-            state.accessibility_requested.set(true);
-        } else if state.accessibility_requested.replace(true) && clicked {
+            return;
+        }
+        if already_requested {
             open_settings(
                 "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
             );
@@ -200,6 +272,10 @@ impl MenuController {
 
     fn stop(&self) {
         let state = self.ivars();
+        state
+            .network
+            .borrow_mut()
+            .sync_receiver(&state.runtime, &state.options, None);
         if let Some(active) = state.active.take() {
             state.runtime.block_on(active.stop());
         }
@@ -213,11 +289,15 @@ impl MenuController {
             .as_ref()
             .map(|active| active.state.enable_pairing());
         if let Some(pin) = pin {
-            self.alert(&format!("Pairing code {pin:04}"), &format!(
-                "On your iPhone, open Control Center → Apple TV Remote and choose {}. Enter this code within two minutes.",
-                self.ivars().options.name
-            ));
+            self.show_code(pin);
         }
+    }
+
+    fn show_code(&self, pin: u32) {
+        self.alert(&format!("Pairing code {pin:04}"), &format!(
+            "On your iPhone, open Control Center → Apple TV Remote and choose {}. Enter this code within two minutes.",
+            self.ivars().options.name
+        ));
     }
 
     fn alert(&self, title: &str, text: &str) {
@@ -266,6 +346,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         controller.add_item(&menu, &format!("myRemote {VERSION}"), None, 0);
         controller.add_item(&menu, "Receiver stopped", None, STATUS);
+        controller.add_item(&menu, "Waiting for iPhone", None, CONNECTION);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
         controller.add_item(&menu, "Start Receiver", Some(sel!(myRemoteToggle:)), TOGGLE);
@@ -281,6 +362,28 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             Some(sel!(myRemoteLocalNetwork:)),
             LOCAL_NETWORK,
         );
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+        controller.add_item(&menu, "Tailscale", None, TAILSCALE);
+        if let Some(item) = menu.itemWithTag(TAILSCALE) {
+            let submenu = NSMenu::new(mtm);
+            submenu.setAutoenablesItems(false);
+            submenu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
+            controller.add_item(&submenu, "Tailscale is off", None, TAILSCALE_STATUS);
+            controller.add_item(
+                &submenu,
+                "Share This Computer",
+                Some(sel!(myRemoteTailscaleShare:)),
+                TAILSCALE_SHARE,
+            );
+            controller.add_item(
+                &submenu,
+                "Bridge Remote Computers to This Wi-Fi",
+                Some(sel!(myRemoteTailscaleBridge:)),
+                TAILSCALE_BRIDGE,
+            );
+            item.setSubmenu(Some(&submenu));
+            item.setEnabled(true);
+        }
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Updates", None, UPDATE_STATUS);
         controller.add_item(
@@ -322,6 +425,13 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
         item.setMenu(Some(&menu));
         controller.start();
+        {
+            let state = controller.ivars();
+            state
+                .network
+                .borrow_mut()
+                .start_bridge(&state.runtime, &state.options);
+        }
         if controller.ivars().options.pair {
             controller.show_pairing();
         }

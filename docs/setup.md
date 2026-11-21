@@ -6,8 +6,8 @@ myRemote is an MIT-licensed desktop receiver for the **Apple TV Remote** already
 
 1. Connect your computer and iPhone to the same local network. Ethernet on the computer works if it shares the Wi‑Fi network’s LAN.
 2. Install or open the [latest download](https://github.com/oseanstudio/myRemote/releases/latest) using the steps below.
-3. Click the myRemote icon in your menu bar or system tray and choose **Pair iPhone…**. On Linux, reopen the menu to see the code. You can also run `myremote --pair` from a terminal to show the code there.
-4. Open **Control Center → Apple TV Remote** on the iPhone. If it’s missing, edit Control Center and add **Remote**. Select **myRemote · COMPUTERNAME** in the picker and enter the code from the computer.
+3. Open **Control Center → Apple TV Remote** on the iPhone. If it’s missing, edit Control Center and add **Remote**. Select **myRemote · COMPUTERNAME** in the picker and enter the code shown on the computer. On Linux, open the tray menu to see the code.
+4. To retry pairing, choose **Pair iPhone…** from myRemote’s menu and select the computer again on your iPhone.
 
 The phone can reconnect after a server restart. Run the receiver on another computer and repeat the pairing steps to add it to the same picker. Use **Stop Receiver** to pause the service or **Quit myRemote** to close the app. From a terminal, press **Ctrl+C**.
 
@@ -16,10 +16,10 @@ The phone can reconnect after a server restart. Run the receiver on another comp
 | OS | Setup |
 | --- | --- |
 | Windows | Extract the ZIP and open `myremote.exe`. If Windows Firewall asks, allow access on your private network. Windows limits synthetic input into elevated apps and secure screens. |
-| macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. Open the app to start the receiver. macOS prompts for Accessibility and Local Network access as needed. Allow both, then choose **Pair iPhone…** from the menu bar. |
+| macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. Open the app to start the receiver. Allow Accessibility and Local Network access when macOS asks. |
 | Linux | Make the AppImage executable and launch it. The tray requires a desktop that supports StatusNotifier/AppIndicator. The receiver uses `/dev/uinput` for Wayland and X11. |
 
-The macOS build is ad-hoc signed. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it. Grant Accessibility again after an update if macOS prompts.
+The macOS build is ad-hoc signed. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it. If macOS needs you to renew Accessibility permission after replacing the app, choose **Allow Accessibility…** from the menu.
 
 If your iPhone cannot see myRemote, check the status at the top of the Mac menu. Use **Local Network Settings…** if macOS blocked discovery. Connect the iPhone and the computer to the same LAN when using local discovery.
 
@@ -65,17 +65,15 @@ The current release covers pointer movement, left-click, navigation, and media c
 
 The receiver uses Bonjour for discovery. On macOS, it advertises through the system Bonjour service and listens on IPv4 and IPv6 by default. On Windows and Linux, use `--ip` to select a LAN adapter if needed. Guest Wi‑Fi and client isolation can block discovery.
 
-Pairing opens only when you request it, and closes after a successful pairing or after two minutes. The server verifies each paired controller and encrypts the input session. To revoke access, stop myRemote and run `myremote --forget-phones` with the same `--state-dir` override, if used. If the iPhone still shows outdated credentials, remove the old device from the picker if available, reopen Control Center, and pair again.
+The menu app opens a two-minute pairing window when a phone requests a code. The code is shown only on the target computer, and pairing closes once the phone is enrolled. The server verifies each paired controller and encrypts the input session. To revoke access, stop myRemote and run `myremote --forget-phones` with the same `--state-dir` override, if used. If the iPhone still shows outdated credentials, remove the old device from the picker if available, reopen Control Center, and pair again.
 
 ## Tailscale
 
 If the iPhone and computer share a LAN, use normal Bonjour discovery even while Tailscale is connected. For different networks, run a myRemote bridge on a computer that shares the iPhone's Wi‑Fi and can reach the target over Tailscale. Tailscale carries the connection between the bridge and the target. The Apple TV Remote still discovers the bridge on local Wi‑Fi.
 
-1. Quit myRemote on the target, then start it with `myremote --menu --tailscale-host TARGET_IP`. On a Mac, use `open -a myRemote --args --menu --tailscale-host TARGET_IP`. Replace `TARGET_IP` with the target's Tailscale IPv4 address.
-2. On the bridge computer, run `myremote --tailscale-bridge TARGET_IP`. If needed, pass `--ip BRIDGE_LAN_IP` to pick its Wi‑Fi-facing adapter. Allow the bridge to use its local network if prompted.
-3. On the target, choose **Pair iPhone…**. On the iPhone, open Apple TV Remote and pick the target's name. Enter the code shown on the target.
-
-On a Mac bridge, the executable is `/Applications/myRemote.app/Contents/MacOS/myremote`. On Linux, pass the same arguments to the downloaded AppImage. On Windows, use `.\myremote.exe` from the extracted folder.
+1. Open and connect Tailscale on both computers. On the computer you want to control, enable **Tailscale → Share This Computer** in myRemote.
+2. On a computer connected to the iPhone’s Wi-Fi network, enable **Tailscale → Bridge Remote Computers to This Wi-Fi** in myRemote. The bridge finds computers sharing myRemote automatically. Both settings are remembered.
+3. On the iPhone, open Apple TV Remote and pick the target’s name. If the phone needs to pair, enter the code shown on the target computer. You can pair on the target’s local network before traveling.
 
 Allow the bridge to reach the target on TCP ports 49151–49154 in your tailnet policy. Pairing and encryption still terminate at the target. The bridge forwards encrypted input without handling the pairing keys.
 

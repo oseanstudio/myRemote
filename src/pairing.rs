@@ -12,12 +12,20 @@ use uuid::Uuid;
 use crate::{Error, Result};
 
 pub const PAIRING_WINDOW: Duration = Duration::from_secs(120);
+const AUTOMATIC_PAIRING_COOLDOWN: Duration = Duration::from_secs(300);
 
 struct PairingWindow {
     generation: u64,
     pin: u32,
     expires: Instant,
     attempts: u8,
+    show_code: bool,
+}
+
+struct Pairing {
+    window: Option<PairingWindow>,
+    next_automatic: Option<Instant>,
+    status: &'static str,
 }
 
 pub struct PairingState {
@@ -26,7 +34,7 @@ pub struct PairingState {
     pub(crate) private_key: [u8; 32],
     pub(crate) identifier: String,
     pub(crate) mac: [u8; 6],
-    window: Mutex<Option<PairingWindow>>,
+    pairing: Mutex<Pairing>,
 }
 
 impl PairingState {
@@ -68,34 +76,76 @@ impl PairingState {
             private_key,
             identifier,
             mac,
-            window: Mutex::new(None),
+            pairing: Mutex::new(Pairing {
+                window: None,
+                next_automatic: None,
+                status: "Waiting for iPhone",
+            }),
         })
     }
 
+    pub fn enable_pairing_on_request(&self) {
+        self.pairing.lock().unwrap().next_automatic = Some(Instant::now());
+    }
+
     pub fn enable_pairing(&self) -> u32 {
-        let pin = OsRng.gen_range(1000..=9999);
-        *self.window.lock().unwrap() = Some(PairingWindow {
-            generation: OsRng.next_u64(),
-            pin,
-            expires: Instant::now() + PAIRING_WINDOW,
-            attempts: 8,
-        });
-        pin
+        let mut pairing = self.pairing.lock().unwrap();
+        let now = Instant::now();
+        if let Some(window) = pairing
+            .window
+            .as_mut()
+            .filter(|window| now < window.expires && window.attempts > 0)
+        {
+            window.show_code = false;
+            return window.pin;
+        }
+        pairing.open(now, false)
     }
 
     pub fn pairing_code(&self) -> Option<u32> {
-        self.window
+        self.pairing
             .lock()
             .unwrap()
+            .window
             .as_ref()
             .filter(|window| Instant::now() < window.expires)
             .map(|window| window.pin)
     }
 
+    pub fn take_requested_code(&self) -> Option<u32> {
+        let mut pairing = self.pairing.lock().unwrap();
+        let window = pairing.window.as_mut()?;
+        if Instant::now() < window.expires && std::mem::take(&mut window.show_code) {
+            return Some(window.pin);
+        }
+        None
+    }
+
+    pub fn connection_status(&self) -> &'static str {
+        self.pairing.lock().unwrap().status
+    }
+
+    pub(crate) fn set_connection_status(&self, status: &'static str) {
+        self.pairing.lock().unwrap().status = status;
+    }
+
     pub(crate) fn begin_pairing(&self) -> Option<(u32, u64)> {
-        let mut window = self.window.lock().unwrap();
-        let window = window.as_mut()?;
-        if Instant::now() >= window.expires || window.attempts == 0 {
+        let mut pairing = self.pairing.lock().unwrap();
+        let now = Instant::now();
+        if pairing
+            .window
+            .as_ref()
+            .is_none_or(|window| now >= window.expires)
+        {
+            if !pairing.next_automatic.is_some_and(|next| now >= next) {
+                pairing.status = "iPhone requested pairing · choose Pair iPhone";
+                return None;
+            }
+            pairing.open(now, true);
+        }
+        let window = pairing.window.as_mut().unwrap();
+        if window.attempts == 0 {
+            pairing.status = "Pairing attempts used · choose Pair iPhone";
             return None;
         }
         window.attempts -= 1;
@@ -103,14 +153,15 @@ impl PairingState {
     }
 
     pub(crate) fn trust(&self, generation: u64, id: &[u8], key: [u8; 32]) -> Result<()> {
-        let mut window = self.window.lock().unwrap();
-        if !window.as_ref().is_some_and(|window| {
+        let mut pairing = self.pairing.lock().unwrap();
+        if !pairing.window.as_ref().is_some_and(|window| {
             window.generation == generation && Instant::now() < window.expires
         }) {
             return Err(Error::Protocol("pairing window closed".into()));
         }
         write_private(&self.controller_file(id), &key)?;
-        *window = None;
+        pairing.window = None;
+        pairing.status = "iPhone paired";
         Ok(())
     }
 
@@ -139,6 +190,24 @@ impl PairingState {
     fn controller_file(&self, id: &[u8]) -> PathBuf {
         self.path
             .join(format!("phone-{}.pub", hex::encode(Sha256::digest(id))))
+    }
+}
+
+impl Pairing {
+    fn open(&mut self, now: Instant, show_code: bool) -> u32 {
+        let pin = OsRng.gen_range(1000..=9999);
+        self.window = Some(PairingWindow {
+            generation: OsRng.next_u64(),
+            pin,
+            expires: now + PAIRING_WINDOW,
+            attempts: if show_code { 3 } else { 8 },
+            show_code,
+        });
+        if self.next_automatic.is_some() {
+            self.next_automatic = Some(now + AUTOMATIC_PAIRING_COOLDOWN);
+        }
+        self.status = "Waiting for the pairing code";
+        pin
     }
 }
 

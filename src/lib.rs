@@ -14,7 +14,7 @@ mod tlv;
 pub use delegate::{RemoteInput, TrackpadMode};
 pub use error::{Error, Result};
 pub use pairing::PairingState;
-pub use server::{detect_local_ip, DiscoveryRecord, Receiver};
+pub use server::{detect_local_ip, DiscoveryRecord, Receiver, TAILNET_PORTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
