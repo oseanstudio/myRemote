@@ -43,7 +43,10 @@ impl Desktop {
             .build()?;
         let mouse = VirtualDevice::builder()?
             .name("myRemote pointer")
-            .with_keys(&AttributeSet::from_iter([KeyCode::BTN_LEFT]))?
+            .with_keys(&AttributeSet::from_iter([
+                KeyCode::BTN_LEFT,
+                KeyCode::BTN_RIGHT,
+            ]))?
             .with_relative_axes(&AttributeSet::from_iter([
                 RelativeAxisCode::REL_X,
                 RelativeAxisCode::REL_Y,
@@ -58,11 +61,30 @@ impl Desktop {
         }
     }
 
-    pub fn click(&mut self) {
+    pub fn click(&mut self, _count: i64) {
         press(&mut self.mouse, KeyCode::BTN_LEFT);
     }
 
-    pub fn move_pointer(&mut self, dx: i32, dy: i32) {
+    pub fn right_click(&mut self) {
+        press(&mut self.mouse, KeyCode::BTN_RIGHT);
+    }
+
+    pub fn start_drag(&mut self) -> bool {
+        emit(
+            &mut self.mouse,
+            &[InputEvent::new(1, KeyCode::BTN_LEFT.code(), 1)],
+        );
+        true
+    }
+
+    pub fn end_drag(&mut self) {
+        emit(
+            &mut self.mouse,
+            &[InputEvent::new(1, KeyCode::BTN_LEFT.code(), 0)],
+        );
+    }
+
+    pub fn move_pointer(&mut self, dx: i32, dy: i32, _dragging: bool) {
         emit(
             &mut self.mouse,
             &[

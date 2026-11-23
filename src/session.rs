@@ -2,13 +2,14 @@
 //! channel, including legacy Rapport and TVRemoteCore input messages.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::time::Instant;
 use tracing::{debug, info};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
 
@@ -29,6 +30,11 @@ pub const MEDIA_CONTROL_VOLUME: u64 = 0x0100;
 
 const SWIPE_MIN_DISTANCE: f64 = 150.0; // touchpad units; the surface is 1000x1000
 const TAP_MAX_DISTANCE: f64 = 60.0; // below this a touch sequence counts as a tap
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(350);
+const RIGHT_CLICK_HOLD: Duration = Duration::from_millis(500);
+const DRAG_HOLD: Duration = Duration::from_millis(200);
+const DRAG_IDLE_LIMIT: Duration = Duration::from_secs(10);
+const DRAG_MOVE_DISTANCE: f64 = 24.0;
 
 struct PendingVerification {
     shared: [u8; 32],
@@ -71,6 +77,18 @@ enum TouchPhase {
     Cancelled,
 }
 
+struct ActiveTouch {
+    origin: (f64, f64),
+    last: (f64, f64),
+    started: Instant,
+    updated: Instant,
+    distance: f64,
+    second_tap: bool,
+    drag_attempted: bool,
+    dragging: bool,
+    right_clicked: bool,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteState {
     Waiting,
@@ -97,9 +115,8 @@ pub(crate) struct CompanionSession {
     remote_session_id: u32,
     keyboard_subscribed: bool,
     keyboard: Option<KeyboardSession>,
-    touch_origin: Option<(f64, f64)>,
-    touch_last: Option<(f64, f64)>,
-    touch_distance: f64,
+    touch: Option<ActiveTouch>,
+    last_tap: Option<Instant>,
     last_select: Option<(Instant, bool)>,
     volume: f64,
     muted: bool,
@@ -130,9 +147,8 @@ impl CompanionSession {
             remote_session_id: 0,
             keyboard_subscribed: false,
             keyboard: None,
-            touch_origin: None,
-            touch_last: None,
-            touch_distance: 0.0,
+            touch: None,
+            last_tap: None,
             last_select: None,
             volume: 0.5,
             muted: false,
@@ -557,6 +573,7 @@ impl CompanionSession {
                 self.start_remote();
             }
             Some("_sessionStop" | "_touchStop" | "HIDTouchStop") => {
+                self.clear_touch();
                 if self.current_identifier.as_deref() == Some("_sessionStop") {
                     self.keyboard_subscribed = false;
                     if self.keyboard.take().is_some() {
@@ -566,8 +583,6 @@ impl CompanionSession {
                     self.last_select = None;
                     self.pairing.set_connection_status("iPhone remote closed");
                 }
-                self.touch_origin = None;
-                self.touch_last = None;
                 self.send_response(xid, None, 0).await?;
             }
             Some("_touchStart" | "HIDTouchStart") => {
@@ -576,8 +591,7 @@ impl CompanionSession {
                 } else {
                     "_i"
                 };
-                self.touch_origin = None;
-                self.touch_last = None;
+                self.clear_touch();
                 self.send_response(
                     xid,
                     Some(Value::dict(vec![Value::kv(key, Value::Int(1))])),
@@ -748,7 +762,12 @@ impl CompanionSession {
         };
         self.record_input();
         if button == "select" {
-            self.select(false);
+            if self.mode == TrackpadMode::Direction || self.touch.is_none() {
+                self.select(false, false);
+            }
+        } else if matches!(button, "play_pause" | "home" | "menu") {
+            let input = self.input.clone();
+            let _ = tokio::task::spawn_blocking(move || input.button(button)).await;
         } else {
             self.input.button(button);
         }
@@ -854,20 +873,60 @@ impl CompanionSession {
         }
     }
 
-    fn select(&mut self, from_touch: bool) {
+    fn select(&mut self, from_touch: bool, double: bool) -> bool {
         // A touch tap can also generate a HID Select. Suppress the second event
         // from the other source while allowing consecutive taps from one source.
         let now = Instant::now();
         if self.last_select.is_some_and(|(time, touch)| {
             touch != from_touch && now - time < Duration::from_millis(120)
         }) {
-            return;
+            return false;
         }
         self.last_select = Some((now, from_touch));
         match self.mode {
+            TrackpadMode::Mouse if double => self.input.double_click(),
             TrackpadMode::Mouse => self.input.click(),
             TrackpadMode::Direction => self.input.button("select"),
         }
+        true
+    }
+
+    pub(crate) fn touch_deadline(&self) -> Option<Instant> {
+        let touch = self.touch.as_ref()?;
+        if touch.dragging {
+            Some(touch.updated + DRAG_IDLE_LIMIT)
+        } else if touch.second_tap && !touch.drag_attempted {
+            Some(touch.started + DRAG_HOLD)
+        } else if self.mode == TrackpadMode::Mouse
+            && !touch.second_tap
+            && !touch.right_clicked
+            && touch.distance < DRAG_MOVE_DISTANCE
+        {
+            Some(touch.started + RIGHT_CLICK_HOLD)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn touch_timer(&mut self) {
+        if self.touch.as_ref().is_some_and(|touch| touch.dragging) {
+            self.clear_touch();
+        } else if let Some(touch) = &mut self.touch {
+            if touch.second_tap {
+                touch.drag_attempted = true;
+                touch.dragging = self.input.start_drag();
+            } else {
+                touch.right_clicked = true;
+                self.input.right_click();
+            }
+        }
+    }
+
+    fn clear_touch(&mut self) {
+        if self.touch.take().is_some_and(|touch| touch.dragging) {
+            self.input.end_drag();
+        }
+        self.last_tap = None;
     }
 
     fn handle_touch(&mut self, content: &Value, modern: bool) {
@@ -878,14 +937,13 @@ impl CompanionSession {
         };
         let phase = match (modern, content.get(phase_key).and_then(Value::as_int)) {
             (_, Some(1)) => TouchPhase::Began,
-            (true, Some(2)) | (false, Some(2 | 3)) => TouchPhase::Moved,
+            (true, Some(2 | 5)) | (false, Some(2 | 3)) => TouchPhase::Moved,
             (true, Some(3)) | (false, Some(4)) => TouchPhase::Ended,
             (true, Some(4)) => TouchPhase::Cancelled,
             _ => return,
         };
         if phase == TouchPhase::Cancelled {
-            self.touch_origin = None;
-            self.touch_last = None;
+            self.clear_touch();
             return;
         }
         let coordinate = |key| {
@@ -896,40 +954,89 @@ impl CompanionSession {
         };
         let (Some(x), Some(y)) = (coordinate(x_key), coordinate(y_key)) else {
             if phase == TouchPhase::Ended {
-                self.touch_origin = None;
-                self.touch_last = None;
+                self.clear_touch();
             }
             return;
         };
         self.record_input();
         let point = (x, y);
+        let now = Instant::now();
         match phase {
             TouchPhase::Began => {
-                self.touch_origin = Some(point);
-                self.touch_last = Some(point);
-                self.touch_distance = 0.0;
+                if self.touch.is_some() {
+                    self.clear_touch();
+                }
+                let second_tap = self.mode == TrackpadMode::Mouse
+                    && self
+                        .last_tap
+                        .take()
+                        .is_some_and(|time| now - time < DOUBLE_TAP_WINDOW);
+                self.touch = Some(ActiveTouch {
+                    origin: point,
+                    last: point,
+                    started: now,
+                    updated: now,
+                    distance: 0.0,
+                    second_tap,
+                    drag_attempted: false,
+                    dragging: false,
+                    right_clicked: false,
+                });
             }
             TouchPhase::Moved | TouchPhase::Ended => {
-                let (Some(origin), Some(last)) = (self.touch_origin, self.touch_last) else {
+                let Some(touch) = &mut self.touch else {
                     return;
                 };
-                let dx = x - origin.0;
-                let dy = y - origin.1;
+                let dx = x - touch.origin.0;
+                let dy = y - touch.origin.1;
                 let distance = dx.abs().max(dy.abs());
-                self.touch_distance = self.touch_distance.max(distance);
-                if self.mode == TrackpadMode::Mouse
-                    && (phase == TouchPhase::Moved || self.touch_distance >= TAP_MAX_DISTANCE)
+                touch.distance = touch.distance.max(distance);
+                touch.updated = now;
+                if touch.second_tap && !touch.drag_attempted {
+                    if phase == TouchPhase::Moved && now - touch.started >= DRAG_HOLD {
+                        touch.drag_attempted = true;
+                        touch.dragging = self.input.start_drag();
+                    } else if touch.distance >= DRAG_MOVE_DISTANCE {
+                        // A quick swipe after a tap is still pointer movement.
+                        touch.drag_attempted = true;
+                    }
+                }
+                if touch.dragging {
+                    self.input.move_drag(x - touch.last.0, y - touch.last.1);
+                } else if self.mode == TrackpadMode::Mouse
+                    && !touch.right_clicked
+                    && (phase == TouchPhase::Moved || touch.distance >= TAP_MAX_DISTANCE)
                 {
-                    self.input.move_pointer(x - last.0, y - last.1);
+                    self.input.move_pointer(x - touch.last.0, y - touch.last.1);
                 }
                 if phase == TouchPhase::Moved {
-                    self.touch_last = Some(point);
+                    touch.last = point;
                     return;
                 }
-                self.touch_origin = None;
-                self.touch_last = None;
-                if self.touch_distance < TAP_MAX_DISTANCE {
-                    self.select(true);
+                let touch = self.touch.take().unwrap();
+                if touch.dragging {
+                    self.input.end_drag();
+                    self.last_select = Some((now, true));
+                } else if touch.right_clicked {
+                    self.last_select = Some((now, true));
+                } else if self.mode == TrackpadMode::Mouse
+                    && !touch.second_tap
+                    && touch.distance < DRAG_MOVE_DISTANCE
+                    && now - touch.started >= RIGHT_CLICK_HOLD
+                {
+                    self.input.right_click();
+                    self.last_select = Some((now, true));
+                } else if touch.distance < TAP_MAX_DISTANCE
+                    && !touch.drag_attempted
+                    && (self.mode == TrackpadMode::Direction
+                        || now - touch.started < RIGHT_CLICK_HOLD)
+                {
+                    if self.select(true, touch.second_tap)
+                        && !touch.second_tap
+                        && self.mode == TrackpadMode::Mouse
+                    {
+                        self.last_tap = Some(now);
+                    }
                 } else if self.mode == TrackpadMode::Direction && distance >= SWIPE_MIN_DISTANCE {
                     let button = if dx.abs() > dy.abs() {
                         if dx > 0.0 {
@@ -952,6 +1059,7 @@ impl CompanionSession {
 
 impl Drop for CompanionSession {
     fn drop(&mut self) {
+        self.clear_touch();
         self.stop_remote();
     }
 }

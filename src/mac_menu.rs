@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::atomic::Ordering;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
@@ -33,6 +34,7 @@ const TAILSCALE_STATUS: isize = 11;
 const TAILSCALE_SHARE: isize = 12;
 const TAILSCALE_BRIDGE: isize = 13;
 const CONNECTION: isize = 14;
+const MEDIA_CONTROLS: isize = 15;
 
 struct State {
     options: Options,
@@ -77,6 +79,9 @@ define_class!(
                 if let Some(receiver) = active.as_ref() {
                     item.setTitle(&NSString::from_str(receiver.state.connection_status()));
                 }
+            }
+            if let Some(item) = menu.itemWithTag(MEDIA_CONTROLS) {
+                item.setState(isize::from(self.ivars().options.media_controls.load(Ordering::Relaxed)));
             }
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
@@ -123,6 +128,15 @@ define_class!(
     }
 
     impl MenuController {
+        #[unsafe(method(myRemoteToggleMediaControls:))]
+        fn toggle_media_controls(&self, _sender: &NSMenuItem) {
+            let options = &self.ivars().options;
+            let enabled = !options.media_controls.load(Ordering::Relaxed);
+            if let Err(error) = options.set_media_controls(enabled) {
+                self.alert("Could not save media controls", &error.to_string());
+            }
+        }
+
         #[unsafe(method(myRemotePair:))]
         fn pair(&self, _sender: &NSMenuItem) {
             self.show_pairing();
@@ -379,6 +393,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
         controller.add_item(&menu, "Start Receiver", Some(sel!(myRemoteToggle:)), TOGGLE);
+        controller.add_item(
+            &menu,
+            "Foreground Media Controls",
+            Some(sel!(myRemoteToggleMediaControls:)),
+            MEDIA_CONTROLS,
+        );
         controller.add_item(
             &menu,
             "Allow Accessibility…",

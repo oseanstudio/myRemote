@@ -52,7 +52,7 @@ Sign out and back in, then run the AppImage as your desktop user. If FUSE is una
 
 | iPhone Remote | Desktop |
 | --- | --- |
-| Touch surface | Move the mouse pointer. Tap or press Select to click. |
+| Touch surface | Move the mouse pointer. Tap to click, double-tap to double-click, and hold for a right-click. Tap once, then hold the second tap and move to drag. |
 | Direction buttons | Arrow keys. Start with `--mode dpad` to also map touch swipes to arrows and taps to Enter. |
 | Back | Escape |
 | TV button | Home key |
@@ -61,6 +61,8 @@ Sign out and back in, then run the AppImage as your desktop user. If FUSE is una
 | Keyboard, on macOS | Type in the focused editable field using the Apple TV Remote keyboard. |
 
 On macOS, connect in Control Center and click an editable field, including a password field in an app. myRemote signals the iPhone to show its keyboard and forwards text, including completed swipe-typed words when the iPhone offers QuickPath. This uses the same Accessibility permission as pointer control. myRemote leaves the clipboard alone, and the contents of the Mac's text field stay on the Mac.
+
+On macOS, **Foreground Media Controls** in the myRemote menu maps Play/Pause and TV to the active browser or supported media player. In the browser, Back presses an available **Skip Intro** button or sends the player's forward shortcut. In Jellyfin, set **Settings → Playback → Skip forward length** to **10 seconds**. Other players use their own shortcuts and seek lengths. Turn off **Foreground Media Controls** to restore the usual Remote button mappings.
 
 ## Configuration
 

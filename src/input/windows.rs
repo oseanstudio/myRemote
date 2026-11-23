@@ -54,15 +54,31 @@ impl Desktop {
         send(&[event(flags), event(flags | KEYEVENTF_KEYUP)]);
     }
 
-    pub fn move_pointer(&mut self, dx: i32, dy: i32) {
+    pub fn move_pointer(&mut self, dx: i32, dy: i32, _dragging: bool) {
         send(&[mouse(MOUSEEVENTF_MOVE, dx, dy)]);
     }
 
-    pub fn click(&mut self) {
+    pub fn click(&mut self, _count: i64) {
         send(&[
             mouse(MOUSEEVENTF_LEFTDOWN, 0, 0),
             mouse(MOUSEEVENTF_LEFTUP, 0, 0),
         ]);
+    }
+
+    pub fn right_click(&mut self) {
+        send(&[
+            mouse(MOUSEEVENTF_RIGHTDOWN, 0, 0),
+            mouse(MOUSEEVENTF_RIGHTUP, 0, 0),
+        ]);
+    }
+
+    pub fn start_drag(&mut self) -> bool {
+        send(&[mouse(MOUSEEVENTF_LEFTDOWN, 0, 0)]);
+        true
+    }
+
+    pub fn end_drag(&mut self) {
+        send(&[mouse(MOUSEEVENTF_LEFTUP, 0, 0)]);
     }
 
     pub fn volume(&self) -> Option<f64> {

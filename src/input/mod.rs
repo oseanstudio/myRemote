@@ -1,5 +1,10 @@
 use std::io;
 use std::sync::Mutex;
+#[cfg(target_os = "macos")]
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use myremote::RemoteInput;
 
@@ -12,6 +17,9 @@ pub use platform::{
     accessibility_is_trusted, can_post_input, request_accessibility_entry, request_input_permission,
 };
 #[cfg(target_os = "macos")]
+#[path = "macos_media.rs"]
+mod macos_media;
+#[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 mod platform;
 #[cfg(windows)]
@@ -19,39 +27,103 @@ mod platform;
 mod platform;
 
 pub struct Desktop {
-    device: Mutex<platform::Desktop>,
-    remainder: Mutex<(f64, f64)>,
+    state: Mutex<PointerState>,
     speed: f64,
+    #[cfg(target_os = "macos")]
+    media_controls: Arc<AtomicBool>,
+}
+
+struct PointerState {
+    device: platform::Desktop,
+    remainder: (f64, f64),
+    dragging: bool,
 }
 
 impl Desktop {
-    pub fn open(speed: f64) -> io::Result<Self> {
+    pub fn open(
+        speed: f64,
+        #[cfg(target_os = "macos")] media_controls: Arc<AtomicBool>,
+    ) -> io::Result<Self> {
         Ok(Self {
-            device: Mutex::new(platform::Desktop::open()?),
-            remainder: Mutex::new((0.0, 0.0)),
+            state: Mutex::new(PointerState {
+                device: platform::Desktop::open()?,
+                remainder: (0.0, 0.0),
+                dragging: false,
+            }),
             speed,
+            #[cfg(target_os = "macos")]
+            media_controls,
         })
+    }
+
+    fn pointer_move(&self, dx: f64, dy: f64, dragging: bool) {
+        let mut state = self.state.lock().unwrap();
+        if state.dragging != dragging {
+            return;
+        }
+        let x = state.remainder.0 + dx * self.speed;
+        let y = state.remainder.1 + dy * self.speed;
+        let (dx, dy) = (x.trunc() as i32, y.trunc() as i32);
+        state.remainder = (x.fract(), y.fract());
+        if dx != 0 || dy != 0 {
+            state.device.move_pointer(dx, dy, dragging);
+        }
     }
 }
 
 impl RemoteInput for Desktop {
     fn button(&self, name: &str) {
-        self.device.lock().unwrap().button(name);
+        #[cfg(target_os = "macos")]
+        if self.media_controls.load(Ordering::Relaxed) && macos_media::handle(name) {
+            return;
+        }
+        self.state.lock().unwrap().device.button(name);
     }
 
     fn move_pointer(&self, dx: f64, dy: f64) {
-        let mut remainder = self.remainder.lock().unwrap();
-        let x = remainder.0 + dx * self.speed;
-        let y = remainder.1 + dy * self.speed;
-        let (dx, dy) = (x.trunc() as i32, y.trunc() as i32);
-        *remainder = (x.fract(), y.fract());
-        if dx != 0 || dy != 0 {
-            self.device.lock().unwrap().move_pointer(dx, dy);
-        }
+        self.pointer_move(dx, dy, false);
     }
 
     fn click(&self) {
-        self.device.lock().unwrap().click();
+        let mut state = self.state.lock().unwrap();
+        if !state.dragging {
+            state.device.click(1);
+        }
+    }
+
+    fn double_click(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.dragging {
+            state.device.click(2);
+        }
+    }
+
+    fn right_click(&self) {
+        let mut state = self.state.lock().unwrap();
+        if !state.dragging {
+            state.device.right_click();
+        }
+    }
+
+    fn start_drag(&self) -> bool {
+        let mut state = self.state.lock().unwrap();
+        if state.dragging || !state.device.start_drag() {
+            return false;
+        }
+        state.dragging = true;
+        true
+    }
+
+    fn move_drag(&self, dx: f64, dy: f64) {
+        self.pointer_move(dx, dy, true);
+    }
+
+    fn end_drag(&self) {
+        let mut state = self.state.lock().unwrap();
+        if state.dragging {
+            state.device.end_drag();
+            state.dragging = false;
+        }
     }
 
     #[cfg(target_os = "macos")]
@@ -61,18 +133,19 @@ impl RemoteInput for Desktop {
 
     #[cfg(target_os = "macos")]
     fn type_text(&self, field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
-        self.device
+        self.state
             .lock()
             .unwrap()
+            .device
             .type_text(field, backspaces, deletes, text)
     }
 
     fn volume(&self) -> Option<f64> {
-        self.device.lock().unwrap().volume()
+        self.state.lock().unwrap().device.volume()
     }
 
     fn set_volume(&self, volume: f64) {
-        self.device.lock().unwrap().set_volume(volume);
+        self.state.lock().unwrap().device.set_volume(volume);
     }
 }
 
@@ -98,6 +171,27 @@ impl RemoteInput for DryRun {
         let mut focus = self.text_focus.lock().unwrap();
         *focus = (focus.0 + 1, true);
         println!("Received click");
+    }
+
+    fn double_click(&self) {
+        println!("Received double-click");
+    }
+
+    fn right_click(&self) {
+        println!("Received right-click");
+    }
+
+    fn start_drag(&self) -> bool {
+        println!("Received drag start");
+        true
+    }
+
+    fn move_drag(&self, dx: f64, dy: f64) {
+        println!("Received drag motion ({dx:.1}, {dy:.1})");
+    }
+
+    fn end_drag(&self) {
+        println!("Received drag end");
     }
 
     fn focused_text_field(&self) -> Option<u64> {

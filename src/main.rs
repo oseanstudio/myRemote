@@ -2,6 +2,8 @@ use std::env;
 use std::io::{self, BufRead, IsTerminal};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::PathBuf;
+#[cfg(target_os = "macos")]
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 #[cfg(not(target_os = "macos"))]
@@ -57,6 +59,8 @@ struct Options {
     forget: bool,
     dry_run: bool,
     verbose: bool,
+    #[cfg(target_os = "macos")]
+    media_controls: Arc<AtomicBool>,
 }
 
 impl Options {
@@ -89,6 +93,8 @@ impl Options {
             forget: false,
             dry_run: false,
             verbose: false,
+            #[cfg(target_os = "macos")]
+            media_controls: Arc::new(AtomicBool::new(true)),
         };
         while let Some(arg) = args.next() {
             let arg = arg.to_str().ok_or("option must be valid Unicode")?;
@@ -159,6 +165,13 @@ impl Options {
             );
         }
         options.name = name.to_owned();
+        #[cfg(target_os = "macos")]
+        if options
+            .media_controls_path()
+            .is_some_and(|path| path.is_file())
+        {
+            options.media_controls.store(false, Ordering::Relaxed);
+        }
         if options.forget && (options.pair || options.menu) {
             return Err("--forget-phones must run separately from --pair and --menu".into());
         }
@@ -224,6 +237,34 @@ fn default_state_dir() -> Option<PathBuf> {
         .map(|path| path.join("myremote"));
 }
 
+#[cfg(target_os = "macos")]
+impl Options {
+    fn media_controls_path(&self) -> Option<PathBuf> {
+        self.state_dir
+            .clone()
+            .or_else(default_state_dir)
+            .map(|dir| dir.join("foreground-media-disabled"))
+    }
+
+    fn set_media_controls(&self, enabled: bool) -> io::Result<()> {
+        if let Some(path) = self.media_controls_path() {
+            if enabled {
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    result => result?,
+                }
+            } else {
+                if let Some(directory) = path.parent() {
+                    std::fs::create_dir_all(directory)?;
+                }
+                std::fs::write(path, b"")?;
+            }
+        }
+        self.media_controls.store(enabled, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
 fn show_pairing(state: &PairingState) {
     let pin = state.enable_pairing();
     println!("Pairing code {pin:04}. Open Control Center → Apple TV Remote and select this computer within two minutes.");
@@ -261,7 +302,11 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
     let input: Arc<dyn RemoteInput> = if options.dry_run {
         Arc::new(input::DryRun::default())
     } else {
-        Arc::new(input::Desktop::open(options.speed)?)
+        Arc::new(input::Desktop::open(
+            options.speed,
+            #[cfg(target_os = "macos")]
+            options.media_controls.clone(),
+        )?)
     };
     let state = open_state(options)?;
     if options.menu {

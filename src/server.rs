@@ -445,11 +445,19 @@ async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession
             let read = timeout_at(header_deadline, reader.read_exact(&mut header));
             tokio::pin!(read);
             loop {
+                let touch_deadline = session.touch_deadline();
+                if touch_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                    session.touch_timer();
+                    continue;
+                }
                 tokio::select! {
                     biased;
                     result = &mut read => {
                         result.map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
                         break;
+                    }
+                    _ = tokio::time::sleep_until(touch_deadline.unwrap_or(header_deadline)), if touch_deadline.is_some() => {
+                        session.touch_timer();
                     }
                     _ = focus_poll.tick(), if session.watches_keyboard_focus() => {
                         timeout(Duration::from_secs(5), session.refresh_keyboard())

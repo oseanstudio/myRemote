@@ -275,6 +275,67 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         second.stop()
 
 
+async def exercise_gestures(port, credentials, second_credentials, expect):
+    client = protocol(port, credentials)
+    other = protocol(port, second_credentials)
+
+    def touch(phase, x=120, y=120):
+        touch_event(client, phase, CoordinateX=x, CoordinateY=y)
+
+    def tap():
+        touch(1)
+        touch(3)
+
+    async def flush_input():
+        await command(client, "FetchAttentionState", {})
+
+    try:
+        await asyncio.gather(client.start(), other.start())
+        await start_remote(client)
+        await start_remote(other)
+
+        tap()
+        tap()
+        # Some versions send HID Select as well as the touch sequence.
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        assert expect(r"^Received (.*)$")[1] == "click"
+        assert expect(r"^Received (.*)$")[1] == "double-click"
+
+        touch(1)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "right-click"
+        touch(3)
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+
+        tap()
+        touch(1)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "click"
+        assert expect(r"^Received (.*)$")[1] == "drag start"
+        touch(2, x=162, y=135)
+        touch(3, x=162, y=135)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "drag motion (42.0, 15.0)"
+        expect(r"^Received drag end$")
+
+        tap()
+        touch(1)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "click"
+        expect(r"^Received drag start$")
+        client.stop()
+        await command(other, "FetchAttentionState", {})
+        expect(r"^Received drag end$")
+        await command(other, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        assert expect(r"^Received (.*)$")[1] == "click"
+        for code, button in [(14, "play_pause"), (7, "home"), (5, "menu")]:
+            await command(other, "HIDCommand", {"HIDCommand": code, "HIDButtonState": 2})
+            assert expect(r"^Received (.*)$")[1] == f"button {button}"
+    finally:
+        client.stop()
+        other.stop()
+
+
 async def exercise(binary, state):
     with receiver(binary, state, "--pair") as (port, expect):
         pin = int(expect(r"Pairing code (\d{4})")[1])
@@ -355,10 +416,13 @@ async def exercise(binary, state):
     with receiver(binary, state) as (port, expect):
         await exercise_two_phones(port, credentials, second_credentials, expect)
 
+    with receiver(binary, state) as (port, expect):
+        await exercise_gestures(port, credentials, second_credentials, expect)
+
 
 if __name__ == "__main__":
     executable = Path(sys.argv[1]).resolve(strict=True)
     # Resolve the executable before creating a short-lived pairing directory.
     with TemporaryDirectory(prefix="myremote-smoke-", dir=executable.parent) as directory:
         asyncio.run(exercise(executable, directory))
-    print("Companion pairing, reconnect, simultaneous controllers, and keyboard focus passed.")
+    print("Companion pairing, reconnect, simultaneous controllers, keyboard, and gestures passed.")

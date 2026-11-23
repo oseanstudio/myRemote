@@ -92,4 +92,12 @@ PY
 fi
 ln -s /Applications "$staging/Applications"
 hdiutil create -ov -format UDZO -volname "myRemote $version" -srcfolder "$staging" "dist/myRemote-macOS-Universal.dmg"
-hdiutil verify "dist/myRemote-macOS-Universal.dmg"
+for attempt in 1 2 3; do
+    if hdiutil verify "dist/myRemote-macOS-Universal.dmg"; then
+        exit 0
+    fi
+    if [[ "$attempt" != 3 ]]; then
+        sleep 2
+    fi
+done
+exit 1

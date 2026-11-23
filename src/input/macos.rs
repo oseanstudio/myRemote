@@ -66,6 +66,7 @@ unsafe extern "C" {
     fn CGEventPost(tap: u32, event: Event);
     fn CGEventPostToPid(pid: i32, event: Event);
     fn CGEventSetFlags(event: Event, flags: u64);
+    fn CGEventSetIntegerValueField(event: Event, field: u32, value: i64);
     fn CGPreflightPostEventAccess() -> bool;
     fn CGRequestPostEventAccess() -> bool;
 }
@@ -82,19 +83,19 @@ unsafe extern "C" {
 
 pub struct Desktop;
 
-struct OwnedCf(*const c_void);
+pub(super) struct OwnedCf(pub(super) *const c_void);
 
 impl OwnedCf {
-    fn new(value: *const c_void) -> Option<Self> {
+    pub(super) fn new(value: *const c_void) -> Option<Self> {
         (!value.is_null()).then(|| Self(value))
     }
 
-    fn string(value: &std::ffi::CStr) -> Option<Self> {
+    pub(super) fn string(value: &std::ffi::CStr) -> Option<Self> {
         const UTF8: u32 = 0x0800_0100;
         Self::new(unsafe { CFStringCreateWithCString(null(), value.as_ptr(), UTF8) })
     }
 
-    fn attribute(&self, name: &std::ffi::CStr) -> Result<Self, i32> {
+    pub(super) fn attribute(&self, name: &std::ffi::CStr) -> Result<Self, i32> {
         let name = Self::string(name).ok_or(-1)?;
         let mut value = null();
         let status = unsafe { AXUIElementCopyAttributeValue(self.0, name.0, &mut value) };
@@ -105,7 +106,7 @@ impl OwnedCf {
         value.ok_or(-1)
     }
 
-    fn is(&self, name: &std::ffi::CStr) -> bool {
+    pub(super) fn is(&self, name: &std::ffi::CStr) -> bool {
         Self::string(name).is_some_and(|name| unsafe { CFEqual(self.0, name.0) })
     }
 }
@@ -166,12 +167,12 @@ fn focused_text_field() -> Option<TextField> {
     })
 }
 
-fn send_key_to(pid: i32, key: u16, text: &[u16]) {
+pub(super) fn send_key_to(pid: i32, key: u16, flags: u64, text: &[u16]) {
     for down in [true, false] {
         unsafe {
             let event = CGEventCreateKeyboardEvent(null_mut(), key, down);
             if !event.is_null() {
-                CGEventSetFlags(event, 0);
+                CGEventSetFlags(event, flags);
                 if !text.is_empty() {
                     CGEventKeyboardSetUnicodeString(event, text.len(), text.as_ptr());
                 }
@@ -246,15 +247,15 @@ impl Desktop {
             return false;
         };
         for _ in 0..backspaces {
-            send_key_to(target.pid, 51, &[]);
+            send_key_to(target.pid, 51, 0, &[]);
         }
         for _ in 0..deletes {
-            send_key_to(target.pid, 117, &[]);
+            send_key_to(target.pid, 117, 0, &[]);
         }
         match text {
-            "\n" | "\r" | "\r\n" => send_key_to(target.pid, 36, &[]),
-            "\t" => send_key_to(target.pid, 48, &[]),
-            _ => post_text_graphemes(text, |units| send_key_to(target.pid, 0, units)),
+            "\n" | "\r" | "\r\n" => send_key_to(target.pid, 36, 0, &[]),
+            "\t" => send_key_to(target.pid, 48, 0, &[]),
+            _ => post_text_graphemes(text, |units| send_key_to(target.pid, 0, 0, units)),
         }
         true
     }
@@ -286,7 +287,7 @@ impl Desktop {
         }
     }
 
-    pub fn move_pointer(&mut self, dx: i32, dy: i32) {
+    pub fn move_pointer(&mut self, dx: i32, dy: i32, dragging: bool) {
         if !can_post_input() {
             return;
         }
@@ -295,18 +296,42 @@ impl Desktop {
                 x: point.x + f64::from(dx),
                 y: point.y + f64::from(dy),
             };
-            post_owned(unsafe { CGEventCreateMouseEvent(null_mut(), 5, next, 0) });
+            let kind = if dragging { 6 } else { 5 };
+            post_owned(unsafe { CGEventCreateMouseEvent(null_mut(), kind, next, 0) });
         }
     }
 
-    pub fn click(&mut self) {
+    pub fn click(&mut self, count: i64) {
         if !can_post_input() {
             return;
         }
         if let Some(point) = pointer_location() {
             for kind in [1, 2] {
-                post_owned(unsafe { CGEventCreateMouseEvent(null_mut(), kind, point, 0) });
+                post_click(kind, point, 0, count);
             }
+        }
+    }
+
+    pub fn right_click(&mut self) {
+        if can_post_input() {
+            if let Some(point) = pointer_location() {
+                for kind in [3, 4] {
+                    post_click(kind, point, 1, 1);
+                }
+            }
+        }
+    }
+
+    pub fn start_drag(&mut self) -> bool {
+        if !can_post_input() {
+            return false;
+        }
+        pointer_location().is_some_and(|point| post_click(1, point, 0, 1))
+    }
+
+    pub fn end_drag(&mut self) {
+        if let Some(point) = pointer_location() {
+            post_click(2, point, 0, 1);
         }
     }
 
@@ -364,6 +389,17 @@ fn post_owned(event: Event) {
             CFRelease(event);
         }
     }
+}
+
+fn post_click(kind: u32, point: Point, button: u32, count: i64) -> bool {
+    const CLICK_STATE: u32 = 1;
+    let event = unsafe { CGEventCreateMouseEvent(null_mut(), kind, point, button) };
+    if event.is_null() {
+        return false;
+    }
+    unsafe { CGEventSetIntegerValueField(event, CLICK_STATE, count) };
+    post_owned(event);
+    true
 }
 
 fn media_key(key: isize) {
