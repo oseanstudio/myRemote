@@ -38,6 +38,64 @@ SESSION_KEYBOARD_EDIT = base64.b64decode(
 )
 
 
+# Apple RTI archives for a pending "Swipe", committing it, and appending space.
+MARKED_WORD = base64.b64decode(
+    "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QEFJU"
+    "SUtleWVkQXJjaGl2ZXLRCAledGV4dE9wZXJhdGlvbnOAAakLDBcZICorLDBVJG51bGzVDQ4PEBESEhQV"
+    "Fl8QF2lzQXV0b0ZpbGxUZXh0T3BlcmF0aW9uXxAcaXNFeHBsaWNpdEF1dG9GaWxsSW52b2NhdGlvbl8Q"
+    "EGludGVybWVkaWF0ZVRleHRea2V5Ym9hcmRPdXRwdXRWJGNsYXNzCAiABIACgAjRERiAA9IaGxwdWiRj"
+    "bGFzc25hbWVYJGNsYXNzZXNfEBBUSUtleWJvYXJkT3V0cHV0oh4fXxAQVElLZXlib2FyZE91dHB1dFhO"
+    "U09iamVjdNUhIiMkESUmJygpXxAPY2FuZGlkYXRlT2Zmc2V0W2lucHV0U3RyaW5nXWRpc3BsYXlTdHJp"
+    "bmdfEBVoaWdobGlnaHRTZWdtZW50SW5kZXgTf/////////+ABYAGE3//////////gAdTc3dpVVN3aXBl"
+    "0hobLS5fEBpUSUtleWJvYXJkSW50ZXJtZWRpYXRlVGV4dKIvH18QGlRJS2V5Ym9hcmRJbnRlcm1lZGlh"
+    "dGVUZXh00hobMTJfEBFSVElUZXh0T3BlcmF0aW9uc6IzH18QEVJUSVRleHRPcGVyYXRpb25zAAgAEQAa"
+    "ACQAKQAyADcASgBNAFwAXgBoAG4AeQCTALIAxQDUANsA3ADdAN8A4QDjAOYA6ADtAPgBAQEUARcBKgEz"
+    "AT4BUAFcAWoBggGLAY0BjwGYAZoBngGkAakBxgHJAeYB6wH/AgIAAAAAAAACAQAAAAAAAAA0AAAAAAAA"
+    "AAAAAAAAAAACFg=="
+)
+
+STYLED_WORD = base64.b64decode(
+    "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QEFJU"
+    "SUtleWVkQXJjaGl2ZXLRCAledGV4dE9wZXJhdGlvbnOAAa4LDBcZICYnLTE1Oz5DR1UkbnVsbNUNDg8Q"
+    "ERITEhUWXxAXaXNBdXRvRmlsbFRleHRPcGVyYXRpb25fEBZzdHlsZWRJbnRlcm1lZGlhdGVUZXh0XxAc"
+    "aXNFeHBsaWNpdEF1dG9GaWxsSW52b2NhdGlvbl5rZXlib2FyZE91dHB1dFYkY2xhc3MIgAQIgAKADdER"
+    "GIAD0hobHB1aJGNsYXNzbmFtZVgkY2xhc3Nlc18QEFRJS2V5Ym9hcmRPdXRwdXSiHh9fEBBUSUtleWJv"
+    "YXJkT3V0cHV0WE5TT2JqZWN00xEhIiMkJVtpbnB1dFN0cmluZ18QE3N0eWxlZERpc3BsYXlTdHJpbmeA"
+    "DIAFgAZTc3dp0ygRKSorLFhOU1N0cmluZ1xOU0F0dHJpYnV0ZXOAB4ALgAnSES4vMFhOUy5ieXRlc4AI"
+    "RVN3aXBl0hobMjNfEA9OU011dGFibGVTdHJpbmejMjQfWE5TU3RyaW5n0zY3ETg5OldOUy5rZXlzWk5T"
+    "Lm9iamVjdHOgoIAK0hobPD1cTlNEaWN0aW9uYXJ5ojwf0hobP0BfEBlOU011dGFibGVBdHRyaWJ1dGVk"
+    "U3RyaW5no0FCH18QGU5TTXV0YWJsZUF0dHJpYnV0ZWRTdHJpbmdfEBJOU0F0dHJpYnV0ZWRTdHJpbmfS"
+    "GhtERV8QGVJUSVN0eWxlZEludGVybWVkaWF0ZVRleHSiRh9fEBlSVElTdHlsZWRJbnRlcm1lZGlhdGVU"
+    "ZXh00hobSElfEBFSVElUZXh0T3BlcmF0aW9uc6JKH18QEVJUSVRleHRPcGVyYXRpb25zAAgAEQAaACQA"
+    "KQAyADcASgBNAFwAXgBtAHMAfgCYALEA0ADfAOYA5wDpAOoA7ADuAPEA8wD4AQMBDAEfASIBNQE+AUUB"
+    "UQFnAWkBawFtAXEBeAGBAY4BkAGSAZQBmQGiAaQBqgGvAcEBxQHOAdUB3QHoAekB6gHsAfEB/gIBAgYC"
+    "IgImAkICVwJcAngCewKXApwCsAKzAAAAAAAAAgEAAAAAAAAASwAAAAAAAAAAAAAAAAAAAsc="
+)
+
+UNMARK_WORD = base64.b64decode(
+    "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QEFJU"
+    "SUtleWVkQXJjaGl2ZXLRCAledGV4dE9wZXJhdGlvbnOAAaULDBUZIFUkbnVsbNQNDg8QERETFF8QF2lz"
+    "QXV0b0ZpbGxUZXh0T3BlcmF0aW9uXxAcaXNFeHBsaWNpdEF1dG9GaWxsSW52b2NhdGlvbl5rZXlib2Fy"
+    "ZE91dHB1dFYkY2xhc3MICIACgATSFhAXGF8QEXVubWFya0lmTmVjZXNzYXJ5CYAD0hobHB1aJGNsYXNz"
+    "bmFtZVgkY2xhc3Nlc18QEFRJS2V5Ym9hcmRPdXRwdXSiHh9fEBBUSUtleWJvYXJkT3V0cHV0WE5TT2Jq"
+    "ZWN00hobISJfEBFSVElUZXh0T3BlcmF0aW9uc6IjH18QEVJUSVRleHRPcGVyYXRpb25zAAgAEQAaACQA"
+    "KQAyADcASgBNAFwAXgBkAGoAcwCNAKwAuwDCAMMAxADGAMgAzQDhAOIA5ADpAPQA/QEQARMBJgEvATQB"
+    "SAFLAAAAAAAAAgEAAAAAAAAAJAAAAAAAAAAAAAAAAAAAAV8="
+)
+
+COMMIT_WITH_SPACE = base64.b64decode(
+    "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QEFJU"
+    "SUtleWVkQXJjaGl2ZXLRCAledGV4dE9wZXJhdGlvbnOAAacLDBUbHB0kVSRudWxs1A0ODxARERMUXxAX"
+    "aXNBdXRvRmlsbFRleHRPcGVyYXRpb25fEBxpc0V4cGxpY2l0QXV0b0ZpbGxJbnZvY2F0aW9uXmtleWJv"
+    "YXJkT3V0cHV0ViRjbGFzcwgIgAKABtMQFhcYGRpdaW5zZXJ0aW9uVGV4dFx0ZXh0VG9Db21taXSABYAE"
+    "gANVU3dpcGVRINIeHyAhWiRjbGFzc25hbWVYJGNsYXNzZXNfEBBUSUtleWJvYXJkT3V0cHV0oiIjXxAQ"
+    "VElLZXlib2FyZE91dHB1dFhOU09iamVjdNIeHyUmXxARUlRJVGV4dE9wZXJhdGlvbnOiJyNfEBFSVElU"
+    "ZXh0T3BlcmF0aW9ucwAIABEAGgAkACkAMgA3AEoATQBcAF4AZgBsAHUAjwCuAL0AxADFAMYAyADKANEA"
+    "3wDsAO4A8ADyAPgA+gD/AQoBEwEmASkBPAFFAUoBXgFhAAAAAAAAAgEAAAAAAAAAKAAAAAAAAAAAAAAA"
+    "AAAAAXU="
+)
+
+
 @contextmanager
 def receiver(binary, state, *options):
     process = subprocess.Popen(
@@ -242,6 +300,27 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         await command(first, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 12 characters)"
 
+        # Marks can arrive independently of the edit that commits the word.
+        # A different phone's Space must not commit the first phone's word.
+        keyboard_edit(first, MARKED_WORD)
+        await command(first, "FetchAttentionState", {})
+        keyboard_edit(second, get_rti_input_text_payload(second_id, " "))
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 1 characters)"
+        keyboard_edit(first, get_rti_input_text_payload(first_id, " "))
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
+
+        keyboard_edit(first, MARKED_WORD)
+        keyboard_edit(first, COMMIT_WITH_SPACE)
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
+
+        keyboard_edit(first, STYLED_WORD)
+        keyboard_edit(first, UNMARK_WORD)
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 5 characters)"
+
         keyboard_edit(first, b"not a plist")
         keyboard_edit(first, get_rti_input_text_payload(second_id, "wrong session"))
         invalid_target = plistlib.loads(get_rti_input_text_payload(first_id, "invalid target"))
@@ -314,6 +393,8 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         keyboard_edit(second, get_rti_input_text_payload(second_id, "still connected"))
         await command(second, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 15 characters)"
+        keyboard_edit(second, MARKED_WORD)
+        await command(second, "FetchAttentionState", {})
         await asyncio.sleep(0.55)
         await command(second, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
         expect(r"^Received click$")
@@ -326,6 +407,9 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         keyboard_edit(second, get_rti_input_text_payload(replacement_id, "new focus"))
         await command(second, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 9 characters)"
+        keyboard_edit(second, get_rti_input_text_payload(replacement_id, " "))
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 1 characters)"
         # A fresh subscription binds edits to this new field.
         assert keyboard_id((await command(second, "_tiStart", {}))["_c"]) == replacement_id
         keyboard_edit(second, SESSION_KEYBOARD_EDIT)

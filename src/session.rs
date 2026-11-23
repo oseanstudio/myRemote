@@ -21,7 +21,7 @@ use crate::delegate::{RemoteInput, TrackpadMode};
 use crate::error::{Error, Result};
 use crate::opack::{self, Value};
 use crate::pairing::PairingState;
-use crate::remote_keyboard::KeyboardSession;
+use crate::remote_keyboard::{KeyboardField, KeyboardSession};
 use crate::remote_media;
 use crate::srp::SrpServer;
 use crate::tlv::{self, tags};
@@ -952,7 +952,10 @@ impl CompanionSession {
             }
             self.keyboard = focus.map(KeyboardSession::new);
             if let Some(keyboard) = &self.keyboard {
-                fields.insert((controller, keyboard.id), keyboard.field);
+                fields.insert(
+                    (controller, keyboard.id),
+                    KeyboardField::new(keyboard.field),
+                );
             }
         }
     }
@@ -1017,6 +1020,11 @@ impl CompanionSession {
             }
         };
         diagnostics.keyboard_edits.fetch_add(1, Ordering::Relaxed);
+        if edit.marked.is_some() {
+            diagnostics
+                .keyboard_composition_updates
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let target = match edit.target {
             Some(target) => target,
             None => {
@@ -1043,20 +1051,26 @@ impl CompanionSession {
         let pairing = self.pairing.clone();
         let input = self.input.clone();
         let applied = tokio::task::spawn_blocking(move || {
-            let field = pairing
-                .keyboard_fields
-                .lock()
-                .unwrap()
-                .get(&(controller, target))
-                .copied();
-            let Some(field) = field else {
-                return false;
+            let (field, keystrokes) = {
+                let mut fields = pairing.keyboard_fields.lock().unwrap();
+                let Some(field) = fields.get_mut(&(controller, target)) else {
+                    return false;
+                };
+                pairing
+                    .diagnostics
+                    .keyboard_matched
+                    .fetch_add(1, Ordering::Relaxed);
+                let Some(keystrokes) = field.apply(edit) else {
+                    return false;
+                };
+                (field.id, keystrokes)
             };
-            pairing
-                .diagnostics
-                .keyboard_matched
-                .fetch_add(1, Ordering::Relaxed);
-            input.type_text(field, edit.backspaces, edit.deletes, &edit.text)
+            input.type_text(
+                field,
+                keystrokes.backspaces,
+                keystrokes.deletes,
+                &keystrokes.text,
+            )
         })
         .await
         .unwrap_or(false);

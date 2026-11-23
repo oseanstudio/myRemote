@@ -3,6 +3,7 @@ use std::io::Cursor;
 use plist::stream::BinaryReader;
 use plist::{Dictionary, Value};
 use rand::{rngs::OsRng, RngCore};
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{keyed_archive, opack};
 use keyed_archive::{class, dictionary, uid};
@@ -14,9 +15,70 @@ pub(crate) struct KeyboardSession {
 
 pub(crate) struct TextEdit {
     pub target: Option<[u8; 16]>,
+    backspaces: u8,
+    deletes: u8,
+    insertion: String,
+    commit: Option<String>,
+    pub marked: Option<String>,
+    unmark: bool,
+}
+
+pub(crate) struct KeyboardField {
+    pub id: u64,
+    marked: String,
+}
+
+pub(crate) struct KeyboardInput {
     pub backspaces: u8,
     pub deletes: u8,
     pub text: String,
+}
+
+impl KeyboardField {
+    pub fn new(id: u64) -> Self {
+        Self {
+            id,
+            marked: String::new(),
+        }
+    }
+
+    pub fn apply(&mut self, edit: TextEdit) -> Option<KeyboardInput> {
+        let mut backspaces = edit.backspaces;
+        let mut text = edit.insertion;
+        // Composed text lives on the phone until committed. A delete inside
+        // that text must not erase characters that were already on the Mac.
+        if !self.marked.is_empty() && edit.commit.is_none() && !edit.unmark && backspaces != 0 {
+            let mut graphemes = self.marked.grapheme_indices(true).rev();
+            let mut end = self.marked.len();
+            while backspaces != 0 {
+                let Some((index, _)) = graphemes.next() else {
+                    break;
+                };
+                end = index;
+                backspaces -= 1;
+            }
+            self.marked.truncate(end);
+        }
+        if let Some(committed) = edit.commit {
+            text.insert_str(0, &committed);
+            self.marked.clear();
+        } else if edit.unmark
+            || (edit.marked.is_none() && !text.is_empty() && text.chars().all(char::is_whitespace))
+        {
+            text.insert_str(0, &std::mem::take(&mut self.marked));
+        } else if !text.is_empty() {
+            // A direct insertion replaces the phone's unposted marked text.
+            self.marked.clear();
+        }
+        if let Some(marked) = edit.marked {
+            self.marked = marked;
+        }
+        (backspaces != 0 || edit.deletes != 0 || !text.is_empty()).then_some(KeyboardInput {
+            backspaces,
+            deletes: edit.deletes,
+            text,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -151,38 +213,59 @@ impl KeyboardSession {
         // Applying it to the real field could erase text typed elsewhere.
         let mut backspaces = deletion_count(objects, output, "deletionCount").ok_or(Output)?;
         let mut deletes = deletion_count(objects, output, "forwardDeletionCount").ok_or(Output)?;
-        let mut text = [
-            "insertionText",
-            "textToCommit",
-            "insertionTextAfterSelection",
+        let mut insertion = ["insertionText", "insertionTextAfterSelection"]
+            .into_iter()
+            .filter_map(|key| read_string(objects, property(objects, output, key)?))
+            .find(|text| !text.is_empty())
+            .or_else(|| {
+                read_string(
+                    objects,
+                    property(objects, operations, "attributedInsertionText")?,
+                )
+            })
+            .unwrap_or("");
+        let commit =
+            property(objects, output, "textToCommit").and_then(|value| read_string(objects, value));
+        let marked = [
+            ("styledIntermediateText", "styledDisplayString"),
+            ("intermediateText", "displayString"),
         ]
         .into_iter()
-        .filter_map(|key| read_string(objects, property(objects, output, key)?))
-        .find(|text| !text.is_empty())
-        .or_else(|| {
-            read_string(
-                objects,
-                property(objects, operations, "attributedInsertionText")?,
-            )
-        })
-        .unwrap_or("");
-        if backspaces == 0 && deletes == 0 && text.is_empty() {
+        .find_map(|(operation, display)| {
+            let mark = property(objects, operations, operation)?.as_dictionary()?;
+            read_string(objects, property(objects, mark, display)?)
+        });
+        let mut unmark = property(objects, output, "unmarkIfNecessary").and_then(Value::as_boolean)
+            == Some(true);
+        if backspaces == 0
+            && deletes == 0
+            && insertion.is_empty()
+            && commit.is_none()
+            && marked.is_none()
+            && !unmark
+        {
             match property(objects, operations, "editingActionSelector").and_then(Value::as_string)
             {
                 Some("deleteBackward:") => backspaces = 1,
                 Some("deleteForward:") => deletes = 1,
-                Some("insertNewline:") => text = "\n",
+                Some("insertNewline:") => insertion = "\n",
+                Some("unmarkText" | "unmarkText:") => unmark = true,
                 _ => return Err(NoEdit),
             }
         }
-        if text.len() > 8 * 1024 {
+        if insertion.len() + commit.map_or(0, str::len) > 8 * 1024
+            || marked.is_some_and(|text| text.len() > 8 * 1024)
+        {
             return Err(Output);
         }
         Ok(TextEdit {
             target,
             backspaces,
             deletes,
-            text: text.to_owned(),
+            insertion: insertion.to_owned(),
+            commit: commit.map(str::to_owned),
+            marked: marked.map(str::to_owned),
+            unmark,
         })
     }
 }
@@ -211,6 +294,9 @@ fn read_string<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a str> {
         let Some(attrs) = text.as_dictionary() else {
             return text.as_string();
         };
+        if let Some(bytes) = property(objects, attrs, "NS.bytes").and_then(Value::as_data) {
+            return std::str::from_utf8(bytes).ok();
+        }
         text = property(objects, attrs, "NSString")
             .or_else(|| property(objects, attrs, "NS.string"))?;
     }
