@@ -187,8 +187,10 @@ def keyboard_id(content):
     context = objects[document["docSt"].data]
     for key in ("contextBeforeInput", "contextAfterInput", "selectedText"):
         assert objects[context[key].data] == ""
-    identifier = objects[top["sessionUUID"].data]["NS.uuidbytes"]
-    assert len(identifier) == 16
+    # Apple's RTIInputSystemDataPayload decodes the top-level UUID as raw
+    # bytes. RTITextOperations wraps its target in an NSUUID object instead.
+    identifier = objects[top["sessionUUID"].data]
+    assert isinstance(identifier, bytes) and len(identifier) == 16
     return identifier
 
 

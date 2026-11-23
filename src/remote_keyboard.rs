@@ -40,26 +40,25 @@ impl KeyboardSession {
     }
 
     pub fn focus_payload(&self) -> opack::Value {
-        let state = dictionary([("docSt", uid(4)), ("$class", uid(5))]);
+        let state = dictionary([("docSt", uid(3)), ("$class", uid(4))]);
         let context = dictionary([
-            ("contextBeforeInput", uid(7)),
-            ("selectedText", uid(7)),
-            ("contextAfterInput", uid(7)),
-            ("$class", uid(6)),
+            ("contextBeforeInput", uid(6)),
+            ("selectedText", uid(6)),
+            ("contextAfterInput", uid(6)),
+            ("$class", uid(5)),
         ]);
         let objects = vec![
             Value::String("$null".into()),
-            dictionary([
-                ("NS.uuidbytes", Value::Data(self.id.to_vec())),
-                ("$class", uid(2)),
-            ]),
-            class("NSUUID"),
+            // RTIInputSystemDataPayload encodes the top-level sessionUUID as
+            // 16 raw bytes. An NSUUID object is used for targetSessionUUID
+            // inside incoming RTITextOperations, which has a different decoder.
+            Value::Data(self.id.to_vec()),
             state,
             context,
             class("RTIDocumentState"),
             class("TIDocumentState"),
             Value::String(String::new()),
-            dictionary([("$class", uid(9))]),
+            dictionary([("$class", uid(8))]),
             class("RTIDocumentTraits"),
         ];
         // Describe the focus without exporting any desktop text or field metadata.
@@ -67,8 +66,8 @@ impl KeyboardSession {
             "RTIKeyedArchiver",
             dictionary([
                 ("sessionUUID", uid(1)),
-                ("documentState", uid(3)),
-                ("documentTraits", uid(8)),
+                ("documentState", uid(2)),
+                ("documentTraits", uid(7)),
             ]),
             objects,
         );
