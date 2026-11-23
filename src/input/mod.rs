@@ -54,6 +54,19 @@ impl RemoteInput for Desktop {
         self.device.lock().unwrap().click();
     }
 
+    #[cfg(target_os = "macos")]
+    fn focused_text_field(&self) -> Option<u64> {
+        platform::Desktop::focused_text_field()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn type_text(&self, field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
+        self.device
+            .lock()
+            .unwrap()
+            .type_text(field, backspaces, deletes, text)
+    }
+
     fn volume(&self) -> Option<f64> {
         self.device.lock().unwrap().volume()
     }
@@ -63,10 +76,16 @@ impl RemoteInput for Desktop {
     }
 }
 
-pub struct DryRun;
+#[derive(Default)]
+pub struct DryRun {
+    text_focus: Mutex<(u64, bool)>,
+}
 
 impl RemoteInput for DryRun {
     fn button(&self, name: &str) {
+        if name == "menu" {
+            self.text_focus.lock().unwrap().1 = false;
+        }
         println!("Received button {name}");
     }
 
@@ -75,6 +94,25 @@ impl RemoteInput for DryRun {
     }
 
     fn click(&self) {
+        // In a dry run, a tap stands in for focusing a text field.
+        let mut focus = self.text_focus.lock().unwrap();
+        *focus = (focus.0 + 1, true);
         println!("Received click");
+    }
+
+    fn focused_text_field(&self) -> Option<u64> {
+        let (field, focused) = *self.text_focus.lock().unwrap();
+        focused.then_some(field)
+    }
+
+    fn type_text(&self, field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
+        if self.focused_text_field() != Some(field) {
+            return false;
+        }
+        println!(
+            "Received keyboard edit ({backspaces} backspaces, {deletes} deletes, {} characters)",
+            text.chars().count()
+        );
+        true
     }
 }

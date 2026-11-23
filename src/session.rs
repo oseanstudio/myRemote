@@ -17,6 +17,7 @@ use crate::delegate::{RemoteInput, TrackpadMode};
 use crate::error::{Error, Result};
 use crate::opack::{self, Value};
 use crate::pairing::PairingState;
+use crate::remote_keyboard::KeyboardSession;
 use crate::srp::SrpServer;
 use crate::tlv::{self, tags};
 use crate::FrameType;
@@ -94,6 +95,8 @@ pub(crate) struct CompanionSession {
     background_probe: bool,
     current_identifier: Option<String>,
     remote_session_id: u32,
+    keyboard_subscribed: bool,
+    keyboard: Option<KeyboardSession>,
     touch_origin: Option<(f64, f64)>,
     touch_last: Option<(f64, f64)>,
     touch_distance: f64,
@@ -125,6 +128,8 @@ impl CompanionSession {
             background_probe: false,
             current_identifier: None,
             remote_session_id: 0,
+            keyboard_subscribed: false,
+            keyboard: None,
             touch_origin: None,
             touch_last: None,
             touch_distance: 0.0,
@@ -551,8 +556,12 @@ impl CompanionSession {
                 self.send_media_state(xid).await?;
                 self.start_remote();
             }
-            Some("_sessionStop" | "_touchStop" | "HIDTouchStop" | "_tiStop") => {
+            Some("_sessionStop" | "_touchStop" | "HIDTouchStop") => {
                 if self.current_identifier.as_deref() == Some("_sessionStop") {
+                    self.keyboard_subscribed = false;
+                    if self.keyboard.take().is_some() {
+                        self.send_event("_tiStopped", None, None).await?;
+                    }
                     self.stop_remote();
                     self.last_select = None;
                     self.pairing.set_connection_status("iPhone remote closed");
@@ -619,14 +628,19 @@ impl CompanionSession {
                 self.send_response(xid, Some(media_flags()), 0).await?
             }
             Some("MediaControlCommand" | "_mcc") => self.handle_media_control(xid, content).await?,
-            Some("_tiStart") => {
-                self.send_response(
-                    xid,
-                    Some(Value::dict(vec![Value::kv("_tiE", Value::Bool(false))])),
-                    0,
-                )
-                .await?;
+            Some("_tiStart") if !is_event => {
+                self.keyboard_subscribed = true;
+                let focused = self.focused_text_field().await;
+                self.update_keyboard(focused);
+                let payload = self.keyboard.as_ref().map(KeyboardSession::focus_payload);
+                self.send_response(xid, payload, 0).await?;
             }
+            Some("_tiStop") if !is_event => {
+                self.keyboard_subscribed = false;
+                self.keyboard = None;
+                self.send_response(xid, None, 0).await?;
+            }
+            Some("_tiC") if is_event => self.type_text(content).await,
             Some("FetchLaunchableApplicationsEvent") => {
                 self.send_response(
                     xid,
@@ -642,6 +656,61 @@ impl CompanionSession {
             _ => {}
         }
         Ok(())
+    }
+
+    pub(crate) fn watches_keyboard_focus(&self) -> bool {
+        self.keyboard_subscribed && self.remote_started()
+    }
+
+    async fn focused_text_field(&self) -> Option<u64> {
+        if !self.watches_keyboard_focus() {
+            return None;
+        }
+        let input = self.input.clone();
+        tokio::task::spawn_blocking(move || input.focused_text_field())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    fn update_keyboard(&mut self, focus: Option<u64>) {
+        if self.keyboard.as_ref().map(|keyboard| keyboard.field) != focus {
+            self.keyboard = focus.map(KeyboardSession::new);
+        }
+    }
+
+    pub(crate) async fn refresh_keyboard(&mut self) -> Result<()> {
+        let focus = self.focused_text_field().await;
+        if self.keyboard.as_ref().map(|keyboard| keyboard.field) != focus {
+            if self.keyboard.is_some() {
+                self.send_event("_tiStopped", None, None).await?;
+            }
+            self.update_keyboard(focus);
+            if let Some(keyboard) = &self.keyboard {
+                let payload = keyboard.focus_payload();
+                self.send_event("_tiStarted", None, Some(payload)).await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn type_text(&mut self, content: &Value) {
+        let Some(keyboard) = &self.keyboard else {
+            return;
+        };
+        let Some(edit) = keyboard.text_edit(content) else {
+            return;
+        };
+        let input = self.input.clone();
+        let field = keyboard.field;
+        let applied = tokio::task::spawn_blocking(move || {
+            input.type_text(field, edit.backspaces, edit.deletes, &edit.text)
+        })
+        .await
+        .unwrap_or(false);
+        if applied {
+            self.record_input();
+        }
     }
 
     fn system_info(&self) -> Value {

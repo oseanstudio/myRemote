@@ -1,4 +1,5 @@
 use std::ffi::{c_char, c_void};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::process::Command;
 use std::ptr::{null, null_mut};
@@ -16,7 +17,25 @@ struct Point {
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> bool;
     fn AXIsProcessTrustedWithOptions(options: *const c_void) -> bool;
+    fn AXUIElementCreateSystemWide() -> *const c_void;
+    fn AXUIElementCopyAttributeValue(
+        element: *const c_void,
+        attribute: *const c_void,
+        value: *mut *const c_void,
+    ) -> i32;
+    fn AXUIElementIsAttributeSettable(
+        element: *const c_void,
+        attribute: *const c_void,
+        settable: *mut u8,
+    ) -> i32;
+    fn AXUIElementSetMessagingTimeout(element: *const c_void, seconds: f32) -> i32;
+    fn AXUIElementGetPid(element: *const c_void, pid: *mut i32) -> i32;
     static kAXTrustedCheckOptionPrompt: *const c_void;
+}
+
+#[link(name = "Carbon", kind = "framework")]
+unsafe extern "C" {
+    fn IsSecureEventInputEnabled() -> u8;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -30,6 +49,13 @@ unsafe extern "C" {
         key_callbacks: *const c_void,
         value_callbacks: *const c_void,
     ) -> *const c_void;
+    fn CFStringCreateWithCString(
+        allocator: *const c_void,
+        string: *const c_char,
+        encoding: u32,
+    ) -> *const c_void;
+    fn CFEqual(first: *const c_void, second: *const c_void) -> bool;
+    fn CFHash(object: *const c_void) -> usize;
     fn CFRelease(object: *const c_void);
 }
 
@@ -38,8 +64,10 @@ unsafe extern "C" {
     fn CGEventCreate(source: *mut c_void) -> Event;
     fn CGEventGetLocation(event: Event) -> Point;
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> Event;
+    fn CGEventKeyboardSetUnicodeString(event: Event, length: usize, text: *const u16);
     fn CGEventCreateMouseEvent(source: *mut c_void, kind: u32, point: Point, button: u32) -> Event;
     fn CGEventPost(tap: u32, event: Event);
+    fn CGEventPostToPid(pid: i32, event: Event);
     fn CGPreflightPostEventAccess() -> bool;
     fn CGRequestPostEventAccess() -> bool;
 }
@@ -55,6 +83,103 @@ unsafe extern "C" {
 }
 
 pub struct Desktop;
+
+struct OwnedCf(*const c_void);
+
+impl OwnedCf {
+    fn new(value: *const c_void) -> Option<Self> {
+        (!value.is_null()).then(|| Self(value))
+    }
+
+    fn string(value: &std::ffi::CStr) -> Option<Self> {
+        const UTF8: u32 = 0x0800_0100;
+        Self::new(unsafe { CFStringCreateWithCString(null(), value.as_ptr(), UTF8) })
+    }
+
+    fn attribute(&self, name: &std::ffi::CStr) -> Result<Self, i32> {
+        let name = Self::string(name).ok_or(-1)?;
+        let mut value = null();
+        let status = unsafe { AXUIElementCopyAttributeValue(self.0, name.0, &mut value) };
+        let value = Self::new(value);
+        if status != 0 {
+            return Err(status);
+        }
+        value.ok_or(-1)
+    }
+
+    fn is(&self, name: &std::ffi::CStr) -> bool {
+        Self::string(name).is_some_and(|name| unsafe { CFEqual(self.0, name.0) })
+    }
+}
+
+impl Drop for OwnedCf {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0) };
+    }
+}
+
+struct TextField {
+    id: u64,
+    pid: i32,
+}
+
+fn focused_text_field() -> Option<TextField> {
+    const AX_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+    const AX_NO_VALUE: i32 = -25212;
+
+    if !can_post_input()
+        || !accessibility_is_trusted()
+        || unsafe { IsSecureEventInputEnabled() } != 0
+    {
+        return None;
+    }
+    let system = OwnedCf::new(unsafe { AXUIElementCreateSystemWide() })?;
+    // Avoid blocking input for long periods if the frontmost app is unresponsive.
+    unsafe { AXUIElementSetMessagingTimeout(system.0, 0.1) };
+    let field = system.attribute(c"AXFocusedUIElement").ok()?;
+    let role = field.attribute(c"AXRole").ok()?;
+    if !role.is(c"AXTextField") && !role.is(c"AXTextArea") && !role.is(c"AXComboBox") {
+        return None;
+    }
+    match field.attribute(c"AXSubrole") {
+        Ok(subrole) if !subrole.is(c"AXSecureTextField") => {}
+        Err(AX_ATTRIBUTE_UNSUPPORTED | AX_NO_VALUE) => {}
+        _ => return None,
+    }
+    let value = OwnedCf::string(c"AXValue")?;
+    let mut editable = 0;
+    if unsafe { AXUIElementIsAttributeSettable(field.0, value.0, &mut editable) } != 0
+        || editable == 0
+    {
+        return None;
+    }
+    let mut pid = 0;
+    if unsafe { AXUIElementGetPid(field.0, &mut pid) } != 0 || pid <= 0 {
+        return None;
+    }
+    let mut id = DefaultHasher::new();
+    pid.hash(&mut id);
+    unsafe { CFHash(field.0) }.hash(&mut id);
+    Some(TextField {
+        id: id.finish(),
+        pid,
+    })
+}
+
+fn send_key_to(pid: i32, key: u16, text: &[u16]) {
+    for down in [true, false] {
+        unsafe {
+            let event = CGEventCreateKeyboardEvent(null_mut(), key, down);
+            if !event.is_null() {
+                if !text.is_empty() {
+                    CGEventKeyboardSetUnicodeString(event, text.len(), text.as_ptr());
+                }
+                CGEventPostToPid(pid, event);
+                CFRelease(event);
+            }
+        }
+    }
+}
 
 pub fn can_post_input() -> bool {
     unsafe { CGPreflightPostEventAccess() }
@@ -86,6 +211,32 @@ pub fn request_input_permission() {
 impl Desktop {
     pub fn open() -> io::Result<Self> {
         Ok(Self)
+    }
+
+    pub fn focused_text_field() -> Option<u64> {
+        focused_text_field().map(|field| field.id)
+    }
+
+    pub fn type_text(&mut self, field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
+        let Some(target) = focused_text_field().filter(|target| target.id == field) else {
+            return false;
+        };
+        for _ in 0..backspaces {
+            send_key_to(target.pid, 51, &[]);
+        }
+        for _ in 0..deletes {
+            send_key_to(target.pid, 117, &[]);
+        }
+        match text {
+            "\n" | "\r" | "\r\n" => send_key_to(target.pid, 36, &[]),
+            "\t" => send_key_to(target.pid, 48, &[]),
+            _ => {
+                for character in text.chars().filter(|c| !c.is_control() || *c == '\n') {
+                    send_key_to(target.pid, 0, character.encode_utf16(&mut [0; 2]));
+                }
+            }
+        }
+        true
     }
 
     pub fn button(&mut self, name: &str) {

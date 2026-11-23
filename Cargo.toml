@@ -1,6 +1,6 @@
 [package]
 name = "myremote"
-version = "0.2.12"
+version = "0.2.13"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -15,6 +15,7 @@ if-addrs = "0.13"
 mdns-sd = "0.13"
 num-bigint = "0.4"
 num-traits = "0.2"
+plist = { version = "~1.10.0", default-features = false, features = ["enable_unstable_features_that_may_break_with_minor_version_bumps"] }
 rand = "0.8"
 semver = "1"
 serde = { version = "1", features = ["derive"] }

@@ -259,7 +259,7 @@ fn open_state(options: &Options) -> Result<Arc<PairingState>, Box<dyn std::error
 
 async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std::error::Error>> {
     let input: Arc<dyn RemoteInput> = if options.dry_run {
-        Arc::new(input::DryRun)
+        Arc::new(input::DryRun::default())
     } else {
         Arc::new(input::Desktop::open(options.speed)?)
     };

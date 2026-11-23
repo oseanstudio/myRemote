@@ -6,6 +6,7 @@ mod delegate;
 mod error;
 pub mod opack;
 mod pairing;
+mod remote_keyboard;
 mod server;
 mod session;
 pub mod srp;

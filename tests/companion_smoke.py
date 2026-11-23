@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import contextmanager
 from pathlib import Path
+import plistlib
 from queue import Empty, Queue
 import re
 import subprocess
@@ -16,6 +17,10 @@ from pyatv.conf import ManualService
 from pyatv.const import Protocol
 from pyatv.protocols.companion.auth import CompanionPairSetupProcedure
 from pyatv.protocols.companion.connection import CompanionConnection, FrameType
+from pyatv.protocols.companion.plist_payloads.rti_text_operations import (
+    get_rti_clear_text_payload,
+    get_rti_input_text_payload,
+)
 from pyatv.protocols.companion.protocol import CompanionProtocol
 
 
@@ -157,6 +162,107 @@ async def exercise_tv_remote(client, expect):
     assert legacy["_c"]["_vol"] == 0.25
 
 
+class KeyboardEvents:
+    def __init__(self, client):
+        self.events = asyncio.Queue()
+        client.listener = self
+
+    def event_received(self, name, content):
+        if name in ("_tiStarted", "_tiStopped"):
+            self.events.put_nowait((name, content))
+
+    async def expect(self, name):
+        event, content = await asyncio.wait_for(self.events.get(), timeout=5)
+        assert event == name, (event, content)
+        return content
+
+
+def keyboard_id(content):
+    archive = plistlib.loads(content["_tiD"])
+    objects = archive["$objects"]
+    top = archive["$top"]
+    document = objects[top["documentState"].data]
+    context = objects[document["docSt"].data]
+    for key in ("contextBeforeInput", "contextAfterInput", "selectedText"):
+        assert objects[context[key].data] == ""
+    identifier = objects[top["sessionUUID"].data]["NS.uuidbytes"]
+    assert len(identifier) == 16
+    return identifier
+
+
+def keyboard_edit(client, payload):
+    client.send_opack(
+        FrameType.E_OPACK,
+        {"_i": "_tiC", "_t": 1, "_c": {"_tiV": 1, "_tiD": payload}},
+    )
+
+
+async def exercise_two_phones(port, credentials, second_credentials, expect):
+    first = protocol(port, credentials)
+    second = protocol(port, second_credentials)
+    try:
+        await asyncio.gather(first.start(), second.start())
+        (_, first_session), (_, second_session) = await asyncio.gather(
+            start_remote(first), start_remote(second)
+        )
+        assert first_session != second_session
+        first_events = KeyboardEvents(first)
+        second_events = KeyboardEvents(second)
+        for client in (first, second):
+            assert (await command(client, "_tiStart", {}))["_c"] == {}
+
+        # A dry-run click simulates an editable field getting focus.
+        await command(second, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        expect(r"^Received click$")
+        first_id = keyboard_id(await first_events.expect("_tiStarted"))
+        second_id = keyboard_id(await second_events.expect("_tiStarted"))
+        assert first_id != second_id
+        assert keyboard_id((await command(second, "_tiStart", {}))["_c"]) == second_id
+
+        keyboard_edit(first, b"not a plist")
+        keyboard_edit(first, get_rti_input_text_payload(second_id, "wrong session"))
+        keyboard_edit(first, get_rti_clear_text_payload(first_id))
+        keyboard_edit(first, get_rti_input_text_payload(first_id, "é🙂"))
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 2 characters)"
+
+        payload = plistlib.loads(get_rti_input_text_payload(second_id, ""))
+        operations = payload["$objects"][payload["$top"]["textOperations"].data]
+        keyboard_output = payload["$objects"][operations["keyboardOutput"].data]
+        keyboard_output["deletionCount"] = 1
+        keyboard_edit(second, plistlib.dumps(payload, fmt=plistlib.FMT_BINARY))
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (1 backspaces, 0 deletes, 0 characters)"
+
+        await command(first, "_sessionStop", {"_sid": (first_session << 32) | 456})
+        await first_events.expect("_tiStopped")
+        keyboard_edit(first, get_rti_input_text_payload(first_id, "closed"))
+        await command(first, "FetchAttentionState", {})
+        first.stop()
+
+        keyboard_edit(second, get_rti_input_text_payload(second_id, "still connected"))
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 15 characters)"
+        await command(second, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        expect(r"^Received click$")
+        await second_events.expect("_tiStopped")
+        replacement_id = keyboard_id(await second_events.expect("_tiStarted"))
+        assert replacement_id != second_id
+        keyboard_edit(second, get_rti_input_text_payload(second_id, "old focus"))
+        keyboard_edit(second, get_rti_input_text_payload(replacement_id, "new focus"))
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 9 characters)"
+        await command(second, "HIDCommand", {"HIDCommand": 5, "HIDButtonState": 2})
+        expect(r"^Received button menu$")
+        await second_events.expect("_tiStopped")
+        keyboard_edit(second, get_rti_input_text_payload(replacement_id, "no focus"))
+        await command(second, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
+        assert expect(r"^Received (.*)$")[1] == "button right"
+    finally:
+        first.stop()
+        second.stop()
+
+
 async def exercise(binary, state):
     with receiver(binary, state, "--pair") as (port, expect):
         pin = int(expect(r"Pairing code (\d{4})")[1])
@@ -169,6 +275,10 @@ async def exercise(binary, state):
             identity, session_id = await start_remote(client)
         finally:
             client.stop()
+
+    with receiver(binary, state, "--pair") as (port, expect):
+        pin = int(expect(r"Pairing code (\d{4})")[1])
+        second_credentials = await pair(port, pin, allowed=True)
 
     with receiver(binary, state) as (port, expect):
         plaintext = protocol(port)
@@ -230,10 +340,13 @@ async def exercise(binary, state):
         finally:
             client.stop()
 
+    with receiver(binary, state) as (port, expect):
+        await exercise_two_phones(port, credentials, second_credentials, expect)
+
 
 if __name__ == "__main__":
     executable = Path(sys.argv[1]).resolve(strict=True)
     # Resolve the executable before creating a short-lived pairing directory.
     with TemporaryDirectory(prefix="myremote-smoke-", dir=executable.parent) as directory:
         asyncio.run(exercise(executable, directory))
-    print("Companion pairing, reconnect, authorization, and legacy and TVRemoteCore input passed.")
+    print("Companion pairing, reconnect, simultaneous controllers, and keyboard focus passed.")

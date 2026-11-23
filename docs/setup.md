@@ -11,6 +11,8 @@ myRemote is an MIT-licensed desktop receiver for the **Apple TV Remote** already
 
 The phone can reconnect after a server restart. Run the receiver on another computer and repeat the pairing steps to add it to the same picker. Use **Stop Receiver** to pause the service or **Quit myRemote** to close the app. From a terminal, press **Ctrl+C**.
 
+To use two iPhones at once, pair each one individually. They share the same desktop pointer and keyboard focus, and either phone can disconnect while the other keeps working.
+
 ### Desktop permissions
 
 | OS | Setup |
@@ -56,8 +58,9 @@ Sign out and back in, then run the AppImage as your desktop user. If FUSE is una
 | TV button | Home key |
 | Guide and channel buttons, when shown | Tab and Page Up/Down |
 | Play/Pause, volume and mute, when shown | Desktop media and volume controls |
+| Keyboard, on macOS | Type in the focused editable field using the Apple TV Remote keyboard. |
 
-The current release covers pointer movement, left-click, navigation, and media controls. Text entry, right-click, drag, scrolling, Siri, power, screen sharing, and remote access over the internet are outside this release.
+On macOS, connect in Control Center and click an editable field. myRemote signals the iPhone to present its keyboard when the field gains focus and dismiss it when focus leaves. This uses the same Accessibility permission as pointer control. Password fields are excluded, and the contents of the Mac's text field stay on the Mac.
 
 ## Configuration
 
@@ -92,7 +95,7 @@ cargo build --release --locked
 
 The executable is `target/release/myremote` on macOS and Linux, or `target\release\myremote.exe` on Windows. Pass `--menu` to launch the native interface from an unbundled binary. The [build and release workflow](../.github/workflows/build.yml) publishes a universal DMG, Linux AppImages, and Windows ZIPs when a version tag matches the version in `Cargo.toml`.
 
-An optional interoperability test runs against an independent Companion client and uses the receiver’s dry-run input backend. It checks pairing, reconnection, rejection of unpaired input, and event delivery. Use the path to your platform’s binary.
+An optional interoperability test runs against independent Companion clients and uses the receiver’s dry-run input backend. It checks pairing, reconnection, rejection of unpaired input, simultaneous controllers, and keyboard focus and edits. Use the path to your platform’s binary.
 
 ```sh
 python -m pip install pyatv==0.18.0 srptools==1.0.1

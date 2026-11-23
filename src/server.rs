@@ -432,14 +432,33 @@ async fn run_session(
 
 async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession) -> Result<()> {
     let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);
+    let mut focus_poll = tokio::time::interval(Duration::from_millis(250));
+    focus_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         let header_deadline = session
             .idle_limit()
             .map_or(auth_deadline, |limit| Instant::now() + limit);
         let mut header = [0; 4];
-        timeout_at(header_deadline, reader.read_exact(&mut header))
-            .await
-            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
+        {
+            // Keep the same read alive across focus notifications, including
+            // when only part of the header has arrived.
+            let read = timeout_at(header_deadline, reader.read_exact(&mut header));
+            tokio::pin!(read);
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut read => {
+                        result.map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
+                        break;
+                    }
+                    _ = focus_poll.tick(), if session.watches_keyboard_focus() => {
+                        timeout(Duration::from_secs(5), session.refresh_keyboard())
+                            .await
+                            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
+                    }
+                }
+            }
+        }
         let size = u32::from_be_bytes([0, header[1], header[2], header[3]]) as usize;
         if size > MAX_FRAME_SIZE {
             return Err(Error::Protocol("Companion frame too large".into()));
