@@ -33,13 +33,15 @@ pub struct Desktop {
     media_controls: Arc<AtomicBool>,
     #[cfg(target_os = "macos")]
     playback: Mutex<PlaybackCache>,
+    #[cfg(target_os = "macos")]
+    keyboard: Mutex<()>,
 }
 
 #[cfg(target_os = "macos")]
 #[derive(Default)]
 struct PlaybackCache {
     checked: Option<std::time::Instant>,
-    state: Option<PlaybackState>,
+    media: Option<macos_media::BrowserPlayback>,
 }
 
 struct PointerState {
@@ -64,6 +66,8 @@ impl Desktop {
             media_controls,
             #[cfg(target_os = "macos")]
             playback: Mutex::new(PlaybackCache::default()),
+            #[cfg(target_os = "macos")]
+            keyboard: Mutex::new(()),
         })
     }
 
@@ -149,10 +153,10 @@ impl RemoteInput for Desktop {
             .checked
             .is_none_or(|time| time.elapsed() >= std::time::Duration::from_millis(750))
         {
-            playback.state = macos_media::playback_state();
+            playback.media = macos_media::playback_state(playback.media);
             playback.checked = Some(std::time::Instant::now());
         }
-        playback.state
+        playback.media.map(|video| video.state)
     }
 
     #[cfg(target_os = "macos")]
@@ -174,18 +178,21 @@ impl RemoteInput for Desktop {
 
     #[cfg(target_os = "macos")]
     fn type_text(&self, field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
-        self.state
-            .lock()
-            .unwrap()
-            .device
-            .type_text(field, backspaces, deletes, text)
+        let _keyboard = self.keyboard.lock().unwrap();
+        platform::Desktop::type_text(field, backspaces, deletes, text)
     }
 
     fn volume(&self) -> Option<f64> {
+        #[cfg(target_os = "macos")]
+        return platform::Desktop::volume();
+        #[cfg(not(target_os = "macos"))]
         self.state.lock().unwrap().device.volume()
     }
 
     fn set_volume(&self, volume: f64) {
+        #[cfg(target_os = "macos")]
+        platform::Desktop::set_volume(volume);
+        #[cfg(not(target_os = "macos"))]
         self.state.lock().unwrap().device.set_volume(volume);
     }
 }
@@ -213,6 +220,7 @@ impl RemoteInput for DryRun {
                     source,
                     playing: Some(true),
                     captions: (source == VideoSource::YouTube).then_some(false),
+                    duration_seconds: Some(600),
                 });
             }
             "menu" => *self.playback.lock().unwrap() = None,

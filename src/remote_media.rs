@@ -9,11 +9,17 @@ const SKIP_FORWARD: u64 = 0x0200;
 const SKIP_BACKWARD: u64 = 0x0400;
 const PLAY: u64 = 0x0001;
 const PAUSE: u64 = 0x0002;
+const FAST_FORWARD: u64 = 0x0010;
+const REWIND: u64 = 0x0020;
 
 pub(crate) fn flags(playback: Option<PlaybackState>) -> u64 {
     VOLUME
         | playback.map_or(0, |state| {
-            SKIP_FORWARD | SKIP_BACKWARD | state.playing.map_or(0, |_| PLAY | PAUSE)
+            SKIP_FORWARD
+                | SKIP_BACKWARD
+                | FAST_FORWARD
+                | REWIND
+                | state.playing.map_or(0, |_| PLAY | PAUSE)
         })
 }
 
@@ -35,7 +41,14 @@ pub(crate) fn now_playing(playback: Option<PlaybackState>) -> Value {
             let id = add(Plist::String(format!("myRemote.{source}")));
             let title = add(Plist::String(source.into()));
             let meta_class = add(class("TVRCNowPlayingMetadata"));
-            let metadata = add(dictionary([("title", title), ("$class", meta_class)]));
+            let duration = state
+                .duration_seconds
+                .map_or_else(|| uid(0), |seconds| add(Plist::Real(f64::from(seconds))));
+            let metadata = add(dictionary([
+                ("title", title),
+                ("duration", duration),
+                ("$class", meta_class),
+            ]));
             let playback_state = add(Plist::Integer(
                 state
                     .playing

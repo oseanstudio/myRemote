@@ -64,7 +64,9 @@ On macOS, connect in Control Center and click an editable field, including a pas
 
 On macOS, **Foreground Media Controls** in the myRemote menu maps Play/Pause and TV to the active browser or supported media player. In the browser, Back presses an available **Skip Intro** button or sends the player's forward shortcut. Turn off **Foreground Media Controls** to restore the usual Remote button mappings.
 
-While a Jellyfin or YouTube video page is in the foreground, myRemote advertises the built-in Remote's skip controls and handles both directions. YouTube's shortcuts skip 10 seconds. In Jellyfin, set both **Skip forward length** and **Skip back length** to **10 seconds** in **Settings → Playback**. myRemote also reports subtitle availability when it can read the YouTube player's caption toggle.
+While a Jellyfin or YouTube video page is in the foreground, myRemote uses macOS Accessibility to identify the player and advertise the built-in Remote's skip controls. This works with browsers that expose the foreground web page, including Zen. YouTube's shortcuts skip 10 seconds. In Jellyfin, set both **Skip forward length** and **Skip back length** to **10 seconds** in **Settings → Playback**. myRemote also reports subtitle availability when it can read the YouTube player's caption toggle.
+
+**Remote Diagnostics…** in the Mac menu shows connection and input counters and the last player advertised to the iPhone. It shows counts only for keyboard input.
 
 ## Configuration
 

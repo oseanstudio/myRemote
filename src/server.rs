@@ -6,8 +6,8 @@ use std::time::Duration;
 use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use socket2::{Domain, Protocol, Socket, Type};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{tcp::OwnedReadHalf, TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at, Instant};
@@ -182,6 +182,7 @@ impl Receiver {
             tokio::spawn(discovery_endpoint(airplay, true)),
             tokio::spawn(companion_endpoint(
                 companion,
+                (!fixed_ports).then_some(ports[1]),
                 name.into(),
                 pairing,
                 mode,
@@ -392,6 +393,7 @@ async fn discovery_endpoint(listener: TcpListener, airplay: bool) {
 
 async fn companion_endpoint(
     listener: TcpListener,
+    advertised_port: Option<u16>,
     name: Arc<str>,
     pairing: Arc<PairingState>,
     mode: TrackpadMode,
@@ -404,7 +406,7 @@ async fn companion_endpoint(
             Ok((stream, peer)) = listener.accept(), if clients.len() < MAX_CONNECTIONS => {
                 let (name, pairing, input) = (name.clone(), pairing.clone(), input.clone());
                 clients.spawn(async move {
-                    if let Err(error) = run_session(stream, input, pairing, name, mode).await {
+                    if let Err(error) = run_session(stream, input, pairing, name, mode, advertised_port).await {
                         debug!("Companion connection from {peer} ended: {error}");
                     }
                 });
@@ -419,10 +421,18 @@ async fn run_session(
     pairing: Arc<PairingState>,
     name: Arc<str>,
     mode: TrackpadMode,
+    advertised_port: Option<u16>,
 ) -> Result<()> {
     stream.set_nodelay(true)?;
-    let (mut reader, writer) = stream.into_split();
-    let mut session = CompanionSession::new(writer, input, pairing, name, mode);
+    // Keep verified sockets usable across idle periods while letting the OS
+    // reclaim dead connections when an iPhone changes networks.
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10));
+    let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
+    let (reader, writer) = stream.into_split();
+    let mut reader = BufReader::with_capacity(16 * 1024, reader);
+    let mut session = CompanionSession::new(writer, input, pairing, name, mode, advertised_port);
     let result = read_session(&mut reader, &mut session).await;
     if let Err(error) = &result {
         session.report_disconnect(error);
@@ -430,13 +440,18 @@ async fn run_session(
     result
 }
 
-async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession) -> Result<()> {
+async fn read_session(
+    reader: &mut BufReader<OwnedReadHalf>,
+    session: &mut CompanionSession,
+) -> Result<()> {
     let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);
     let mut focus_poll = tokio::time::interval(Duration::from_millis(250));
     focus_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut keyboard_probes = JoinSet::new();
     let mut media_poll = tokio::time::interval(Duration::from_secs(1));
     media_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut media_probes = JoinSet::new();
+    let mut data = Vec::new();
     loop {
         let header_deadline = session
             .idle_limit()
@@ -449,6 +464,7 @@ async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession
             tokio::pin!(read);
             loop {
                 let touch_deadline = session.touch_deadline();
+                let seek_deadline = session.seek_deadline();
                 if touch_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                     session.touch_timer();
                     continue;
@@ -462,8 +478,16 @@ async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession
                     _ = tokio::time::sleep_until(touch_deadline.unwrap_or(header_deadline)), if touch_deadline.is_some() => {
                         session.touch_timer();
                     }
-                    _ = focus_poll.tick(), if session.watches_keyboard_focus() => {
-                        timeout(Duration::from_secs(5), session.refresh_keyboard())
+                    _ = tokio::time::sleep_until(seek_deadline.unwrap_or(header_deadline)), if seek_deadline.is_some() => {
+                        timeout(Duration::from_secs(2), session.repeat_seek())
+                            .await
+                            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?;
+                    }
+                    _ = focus_poll.tick(), if session.watches_keyboard_focus() && keyboard_probes.is_empty() => {
+                        session.queue_keyboard_probe(&mut keyboard_probes);
+                    }
+                    Some(result) = keyboard_probes.join_next(), if !keyboard_probes.is_empty() => {
+                        timeout(Duration::from_secs(5), session.publish_keyboard_focus(result.ok().flatten()))
                             .await
                             .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
                     }
@@ -483,7 +507,7 @@ async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession
         if size > MAX_FRAME_SIZE {
             return Err(Error::Protocol("Companion frame too large".into()));
         }
-        let mut data = vec![0; size];
+        data.resize(size, 0);
         let frame_deadline = header_deadline.min(Instant::now() + Duration::from_secs(5));
         timeout_at(frame_deadline, async {
             reader.read_exact(&mut data).await?;

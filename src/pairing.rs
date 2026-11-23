@@ -1,6 +1,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -37,6 +38,17 @@ pub struct PairingState {
     pub(crate) identifier: String,
     pub(crate) mac: [u8; 6],
     pairing: Mutex<Pairing>,
+    pub(crate) diagnostics: Diagnostics,
+}
+
+#[derive(Default)]
+pub(crate) struct Diagnostics {
+    pub verified_connections: AtomicU32,
+    pub double_clicks: AtomicU32,
+    pub keyboard_messages: AtomicU32,
+    pub keyboard_edits: AtomicU32,
+    pub keyboard_posted: AtomicU32,
+    pub player: AtomicU8,
 }
 
 impl PairingState {
@@ -85,7 +97,26 @@ impl PairingState {
                 connected_remotes: 0,
                 remotes_with_input: 0,
             }),
+            diagnostics: Diagnostics::default(),
         })
+    }
+
+    pub fn remote_diagnostics(&self) -> String {
+        let counters = &self.diagnostics;
+        let read = |counter: &AtomicU32| counter.load(Ordering::Relaxed);
+        let player = match counters.player.load(Ordering::Relaxed) {
+            1 => "Jellyfin",
+            2 => "YouTube",
+            _ => "None",
+        };
+        format!(
+            "Verified connections: {}\nDouble-click events sent: {}\nKeyboard messages received: {}\nKeyboard edits decoded: {}\nKeyboard edits posted: {}\nLast player advertised: {player}",
+            read(&counters.verified_connections),
+            read(&counters.double_clicks),
+            read(&counters.keyboard_messages),
+            read(&counters.keyboard_edits),
+            read(&counters.keyboard_posted),
+        )
     }
 
     pub fn enable_pairing_on_request(&self) {

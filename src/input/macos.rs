@@ -3,6 +3,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::process::Command;
 use std::ptr::{null, null_mut};
+use std::time::{Duration, Instant};
 
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -64,7 +65,6 @@ unsafe extern "C" {
     fn CGEventKeyboardSetUnicodeString(event: Event, length: usize, text: *const u16);
     fn CGEventCreateMouseEvent(source: *mut c_void, kind: u32, point: Point, button: u32) -> Event;
     fn CGEventPost(tap: u32, event: Event);
-    fn CGEventPostToPid(pid: i32, event: Event);
     fn CGEventSetFlags(event: Event, flags: u64);
     fn CGEventSetIntegerValueField(event: Event, field: u32, value: i64);
     fn CGPreflightPostEventAccess() -> bool;
@@ -81,7 +81,11 @@ unsafe extern "C" {
     fn dlsym(handle: *mut c_void, name: *const c_char) -> *mut c_void;
 }
 
-pub struct Desktop;
+pub struct Desktop {
+    mouse_number: i64,
+    drag_number: Option<i64>,
+    pointer: Option<(Instant, Point)>,
+}
 
 pub(super) struct OwnedCf(pub(super) *const c_void);
 
@@ -117,12 +121,7 @@ impl Drop for OwnedCf {
     }
 }
 
-struct TextField {
-    id: u64,
-    pid: i32,
-}
-
-fn focused_text_field() -> Option<TextField> {
+fn focused_text_field() -> Option<u64> {
     const AX_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
     const AX_NO_VALUE: i32 = -25212;
 
@@ -161,26 +160,26 @@ fn focused_text_field() -> Option<TextField> {
     pid.hash(&mut id);
     unsafe { CFHash(field.0) }.hash(&mut id);
     secure.hash(&mut id);
-    Some(TextField {
-        id: id.finish(),
-        pid,
-    })
+    Some(id.finish())
 }
 
-pub(super) fn send_key_to(pid: i32, key: u16, flags: u64, text: &[u16]) {
+pub(super) fn post_key(key: u16, flags: u64, text: &[u16]) -> bool {
+    const SESSION_EVENT_TAP: u32 = 1;
     for down in [true, false] {
         unsafe {
             let event = CGEventCreateKeyboardEvent(null_mut(), key, down);
-            if !event.is_null() {
-                CGEventSetFlags(event, flags);
-                if !text.is_empty() {
-                    CGEventKeyboardSetUnicodeString(event, text.len(), text.as_ptr());
-                }
-                CGEventPostToPid(pid, event);
-                CFRelease(event);
+            if event.is_null() {
+                return false;
             }
+            CGEventSetFlags(event, flags);
+            if !text.is_empty() {
+                CGEventKeyboardSetUnicodeString(event, text.len(), text.as_ptr());
+            }
+            CGEventPost(SESSION_EVENT_TAP, event);
+            CFRelease(event);
         }
     }
+    true
 }
 
 fn post_text_graphemes(text: &str, mut post: impl FnMut(&[u16])) {
@@ -235,29 +234,40 @@ pub fn request_input_permission() {
 
 impl Desktop {
     pub fn open() -> io::Result<Self> {
-        Ok(Self)
+        Ok(Self {
+            mouse_number: 0,
+            drag_number: None,
+            pointer: None,
+        })
     }
 
     pub fn focused_text_field() -> Option<u64> {
-        focused_text_field().map(|field| field.id)
+        focused_text_field()
     }
 
-    pub fn type_text(&mut self, field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
-        let Some(target) = focused_text_field().filter(|target| target.id == field) else {
+    pub fn type_text(field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
+        if focused_text_field() != Some(field) {
             return false;
-        };
+        }
+        let mut posted = true;
         for _ in 0..backspaces {
-            send_key_to(target.pid, 51, 0, &[]);
+            posted &= post_key(51, 0, &[]);
         }
         for _ in 0..deletes {
-            send_key_to(target.pid, 117, 0, &[]);
+            posted &= post_key(117, 0, &[]);
         }
         match text {
-            "\n" | "\r" | "\r\n" => send_key_to(target.pid, 36, 0, &[]),
-            "\t" => send_key_to(target.pid, 48, 0, &[]),
-            _ => post_text_graphemes(text, |units| send_key_to(target.pid, 0, 0, units)),
+            "\n" | "\r" | "\r\n" => posted &= post_key(36, 0, &[]),
+            "\t" => posted &= post_key(48, 0, &[]),
+            _ => post_text_graphemes(text, |units| {
+                posted &= if units == [u16::from(b'\n')] {
+                    post_key(36, 0, &[])
+                } else {
+                    post_key(49, 0, units)
+                };
+            }),
         }
-        true
+        posted
     }
 
     pub fn button(&mut self, name: &str) {
@@ -291,13 +301,15 @@ impl Desktop {
         if !can_post_input() {
             return;
         }
-        if let Some(point) = pointer_location() {
+        if let Some((sampled_at, point)) = self.pointer_sample() {
             let next = Point {
                 x: point.x + f64::from(dx),
                 y: point.y + f64::from(dy),
             };
             let kind = if dragging { 6 } else { 5 };
-            post_owned(unsafe { CGEventCreateMouseEvent(null_mut(), kind, next, 0) });
+            if post_mouse(kind, next, 0, self.drag_number, None) {
+                self.pointer = Some((sampled_at, next));
+            }
         }
     }
 
@@ -305,18 +317,20 @@ impl Desktop {
         if !can_post_input() {
             return;
         }
-        if let Some(point) = pointer_location() {
+        if let Some((_, point)) = self.pointer_sample() {
+            let number = self.next_mouse_event();
             for kind in [1, 2] {
-                post_click(kind, point, 0, count);
+                post_mouse(kind, point, 0, Some(number), Some(count));
             }
         }
     }
 
     pub fn right_click(&mut self) {
         if can_post_input() {
-            if let Some(point) = pointer_location() {
+            if let Some((_, point)) = self.pointer_sample() {
+                let number = self.next_mouse_event();
                 for kind in [3, 4] {
-                    post_click(kind, point, 1, 1);
+                    post_mouse(kind, point, 1, Some(number), Some(1));
                 }
             }
         }
@@ -326,16 +340,40 @@ impl Desktop {
         if !can_post_input() {
             return false;
         }
-        pointer_location().is_some_and(|point| post_click(1, point, 0, 1))
-    }
-
-    pub fn end_drag(&mut self) {
-        if let Some(point) = pointer_location() {
-            post_click(2, point, 0, 1);
+        let Some((_, point)) = self.pointer_sample() else {
+            return false;
+        };
+        let number = self.next_mouse_event();
+        if post_mouse(1, point, 0, Some(number), Some(1)) {
+            self.drag_number = Some(number);
+            true
+        } else {
+            false
         }
     }
 
-    pub fn volume(&self) -> Option<f64> {
+    pub fn end_drag(&mut self) {
+        let number = self.drag_number.take();
+        if let Some((_, point)) = self.pointer_sample() {
+            post_mouse(2, point, 0, number, Some(1));
+        }
+    }
+
+    fn next_mouse_event(&mut self) -> i64 {
+        self.mouse_number = (self.mouse_number + 1) % i64::from(i32::MAX);
+        self.mouse_number
+    }
+
+    fn pointer_sample(&self) -> Option<(Instant, Point)> {
+        // During a short burst, Quartz may not have applied the previous move
+        // yet. Accumulate every delta and periodically resync for local input
+        // and screen edges.
+        self.pointer
+            .filter(|(sampled, _)| sampled.elapsed() < Duration::from_millis(16))
+            .or_else(|| pointer_location().map(|point| (Instant::now(), point)))
+    }
+
+    pub fn volume() -> Option<f64> {
         if !can_post_input() {
             return None;
         }
@@ -354,7 +392,7 @@ impl Desktop {
         }
     }
 
-    pub fn set_volume(&self, volume: f64) {
+    pub fn set_volume(volume: f64) {
         if !can_post_input() {
             return;
         }
@@ -391,13 +429,27 @@ fn post_owned(event: Event) {
     }
 }
 
-fn post_click(kind: u32, point: Point, button: u32, count: i64) -> bool {
+fn post_mouse(
+    kind: u32,
+    point: Point,
+    button: u32,
+    number: Option<i64>,
+    count: Option<i64>,
+) -> bool {
+    const EVENT_NUMBER: u32 = 0;
     const CLICK_STATE: u32 = 1;
     let event = unsafe { CGEventCreateMouseEvent(null_mut(), kind, point, button) };
     if event.is_null() {
         return false;
     }
-    unsafe { CGEventSetIntegerValueField(event, CLICK_STATE, count) };
+    unsafe {
+        if let Some(number) = number {
+            CGEventSetIntegerValueField(event, EVENT_NUMBER, number);
+        }
+        if let Some(count) = count {
+            CGEventSetIntegerValueField(event, CLICK_STATE, count);
+        }
+    }
     post_owned(event);
     true
 }

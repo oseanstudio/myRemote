@@ -99,6 +99,7 @@ async def start_remote(client):
     assert reply["_c"]["_stA"] == ["com.apple.tvremoteservices"]
     assert reply["_c"]["model"] == "AppleTV14,1"
     assert reply["_c"]["name"] == "myRemote smoke test"
+    assert reply["_c"]["_lP"] == client.connection.port
     device = reply["_c"]
 
     # Extra frames and keepalives can arrive after verification. Nonempty encrypted
@@ -247,6 +248,15 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (6 backspaces, 0 deletes, 6 characters)"
 
+        # Native keyboard edits can commit text through a named output field
+        # and leave their default deletion count as a nil archive reference.
+        keyboard_output["deletionCount"] = plistlib.UID(0)
+        keyboard_output["textToCommit"] = keyboard_output.pop("insertionText")
+        await command(second, "_tiC", {
+            "_tiD": plistlib.dumps(payload, fmt=plistlib.FMT_BINARY),
+        })
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
+
         await command(first, "_sessionStop", {"_sid": (first_session << 32) | 456})
         await first_events.expect("_tiStopped")
         keyboard_edit(first, get_rti_input_text_payload(first_id, "closed"))
@@ -256,6 +266,7 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         keyboard_edit(second, get_rti_input_text_payload(second_id, "still connected"))
         await command(second, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 15 characters)"
+        await asyncio.sleep(0.55)
         await command(second, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
         expect(r"^Received click$")
         await second_events.expect("_tiStopped")
@@ -302,6 +313,25 @@ async def exercise_gestures(port, credentials, second_credentials, expect):
         assert expect(r"^Received (.*)$")[1] == "click"
         assert expect(r"^Received (.*)$")[1] == "double-click"
 
+        # Some Remote layouts send only HID Select. A native double tap
+        # must work on this path as well as the touch-event path.
+        for _ in range(2):
+            await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        assert expect(r"^Received (.*)$")[1] == "click"
+        assert expect(r"^Received (.*)$")[1] == "double-click"
+
+        touch_event(client, 1, CoordinateX=120, CoordinateY=120, Nanoseconds=1_000_000_000)
+        touch_event(client, 3, Nanoseconds=1_050_000_000)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "click"
+        # Arrival times may be delayed or batched on Wi-Fi. Phone timestamps
+        # still put these taps inside the double-click interval.
+        await asyncio.sleep(0.55)
+        touch_event(client, 1, CoordinateX=120, CoordinateY=120, Nanoseconds=1_300_000_000)
+        touch_event(client, 3, Nanoseconds=1_350_000_000)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "double-click"
+
         touch(1)
         await flush_input()
         assert expect(r"^Received (.*)$")[1] == "right-click"
@@ -346,8 +376,12 @@ async def exercise_media(port, credentials, expect):
         objects = archive["$objects"]
         info = objects[archive["$top"]["root"].data]
         assert objects[info["$class"].data]["$classname"] == "TVRCNowPlayingInfo"
-        return {key: objects[info[key].data] for key in
-                ("playerIdentifier", "playbackRate", "hasValidCaptionOptions", "captionsEnabled")}
+        values = {key: objects[info[key].data] for key in
+                  ("playerIdentifier", "playbackRate", "hasValidCaptionOptions", "captionsEnabled")}
+        metadata = objects[info["metadata"].data]
+        if isinstance(metadata, dict):
+            values["duration"] = objects[metadata["duration"].data]
+        return values
 
     try:
         await client.start()
@@ -367,7 +401,8 @@ async def exercise_media(port, credentials, expect):
         await command(client, "_mcc", {"_mcc": 7, "_skpS": 10.0})
         await command(client, "HIDCommand", {"HIDCommand": 14, "HIDButtonState": 2})
         assert expect(r"^Received (.*)$")[1] == "button play_pause"
-        assert (await state(0x0703, "myRemote.YouTube", True, False))["playbackRate"] == 1.0
+        media = await state(0x0733, "myRemote.YouTube", True, False)
+        assert media["playbackRate"] == 1.0 and media["duration"] == 600
 
         await command(client, "_mcc", {"_mcc": 7, "_skpS": float("inf")})
         await command(client, "_mcc", {"_mcc": 7, "_skpS": 0.0})
@@ -378,14 +413,14 @@ async def exercise_media(port, credentials, expect):
         assert expect(r"^Received (.*)$")[1] == "playback YouTube SkipBackward"
         await command(client, "ToggleCaptions", {})
         assert expect(r"^Received (.*)$")[1] == "playback YouTube ToggleCaptions"
-        await state(0x0703, "myRemote.YouTube", True, True)
+        await state(0x0733, "myRemote.YouTube", True, True)
         assert (await command(client, "_mcc", {"_mcc": 12}))["_c"]["_cse"] is True
 
         await command(client, "FetchCurrentNowPlayingInfoEvent", {})
-        await state(0x0703, "myRemote.YouTube", True, True)
+        await state(0x0733, "myRemote.YouTube", True, True)
         await command(client, "HIDCommand", {"HIDCommand": 7, "HIDButtonState": 2})
         expect(r"^Received button home$")
-        await state(0x0703, "myRemote.Jellyfin", False, "$null")
+        await state(0x0733, "myRemote.Jellyfin", False, "$null")
         await command(client, "_mcc", {"_mcc": 7, "_skpS": -10.0})
         assert expect(r"^Received (.*)$")[1] == "playback Jellyfin SkipBackward"
 
@@ -450,12 +485,18 @@ async def exercise(binary, state):
         client = protocol(port, credentials)
         try:
             await client.start()
+            # A background probe is already verified. It can become the
+            # foreground Remote later without another Pair Verify.
+            client._xid |= 0x80000000
+            probe = await command(client, "_systemInfo", {"_clFl": 128})
+            assert probe["_c"]["_lP"] == port
+            await asyncio.sleep(16)
             assert await start_remote(client) == (identity, session_id)
             assert identity[1] == identity[2]
             await exercise_tv_remote(client, expect)
+            await command(client, "TVRCSessionStop", {})
+            assert await start_remote(client) == (identity, session_id)
             await command(client, "_sessionStop", {"_sid": (session_id << 32) | 456})
-            # Reopen Remote on the same transport after the former 15-second cutoff.
-            await asyncio.sleep(16)
             assert await start_remote(client) == (identity, session_id)
             await command(client, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
             expect(r"^Received button right$")

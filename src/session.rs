@@ -1,6 +1,7 @@
 //! Companion Link session: pairing, verification and the encrypted control
 //! channel, including legacy Rapport and TVRemoteCore input messages.
 
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,14 +24,15 @@ use crate::remote_keyboard::KeyboardSession;
 use crate::remote_media;
 use crate::srp::SrpServer;
 use crate::tlv::{self, tags};
-use crate::{FrameType, PlaybackAction, PlaybackState};
+use crate::{FrameType, PlaybackAction, PlaybackState, VideoSource};
 
 pub const DEVICE_MODEL: &str = "AppleTV14,1";
 pub(crate) const SOURCE_VERSION: &str = "715.2";
 const REMOTE_SERVICE: &str = "com.apple.tvremoteservices";
 const SWIPE_MIN_DISTANCE: f64 = 150.0; // touchpad units; the surface is 1000x1000
 const TAP_MAX_DISTANCE: f64 = 60.0; // below this a touch sequence counts as a tap
-const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(350);
+const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
+const SELECT_ECHO_WINDOW: Duration = Duration::from_millis(90);
 const RIGHT_CLICK_HOLD: Duration = Duration::from_millis(500);
 const DRAG_HOLD: Duration = Duration::from_millis(200);
 const DRAG_IDLE_LIMIT: Duration = Duration::from_secs(10);
@@ -89,6 +91,35 @@ struct ActiveTouch {
     right_clicked: bool,
 }
 
+#[derive(Clone, Copy)]
+struct TapTime {
+    received: Instant,
+    phone_ns: Option<u64>,
+}
+
+impl TapTime {
+    fn follows(self, previous: Self, within: Duration) -> bool {
+        if let (Some(previous), Some(current)) = (previous.phone_ns, self.phone_ns) {
+            if let Some(elapsed) = current.checked_sub(previous).filter(|elapsed| *elapsed > 0) {
+                return Duration::from_nanos(elapsed) < within;
+            }
+        }
+        self.received.saturating_duration_since(previous.received) < within
+    }
+}
+
+struct Click {
+    time: TapTime,
+    sources: u8,
+    double: bool,
+}
+
+struct SeekHold {
+    action: PlaybackAction,
+    next: Instant,
+    expires: Instant,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RemoteState {
     Waiting,
@@ -103,6 +134,7 @@ pub(crate) struct CompanionSession {
     input: Arc<dyn RemoteInput>,
     pairing: Arc<PairingState>,
     device_name: Arc<str>,
+    advertised_port: Option<u16>,
     mode: TrackpadMode,
     signing_key: SigningKey,
     setup: Option<(SrpServer, u64)>,
@@ -115,11 +147,13 @@ pub(crate) struct CompanionSession {
     remote_session_id: u32,
     keyboard_subscribed: bool,
     keyboard: Option<KeyboardSession>,
+    focus_missing: bool,
     playback: Option<PlaybackState>,
+    seek_hold: Option<SeekHold>,
     next_event_id: u32,
     touch: Option<ActiveTouch>,
-    last_tap: Option<Instant>,
-    last_select: Option<(Instant, bool)>,
+    last_click: Option<Click>,
+    suppress_select_until: Option<Instant>,
     volume: f64,
     muted: bool,
 }
@@ -131,6 +165,7 @@ impl CompanionSession {
         pairing: Arc<PairingState>,
         device_name: Arc<str>,
         mode: TrackpadMode,
+        advertised_port: Option<u16>,
     ) -> Self {
         Self {
             writer,
@@ -138,6 +173,7 @@ impl CompanionSession {
             signing_key: SigningKey::from_bytes(&pairing.private_key),
             pairing,
             device_name,
+            advertised_port,
             mode,
             setup: None,
             setup_proved: false,
@@ -149,11 +185,13 @@ impl CompanionSession {
             remote_session_id: 0,
             keyboard_subscribed: false,
             keyboard: None,
+            focus_missing: false,
             playback: None,
+            seek_hold: None,
             next_event_id: 0x8000_0000 | rand::random::<u32>(),
             touch: None,
-            last_tap: None,
-            last_select: None,
+            last_click: None,
+            suppress_select_until: None,
             volume: 0.5,
             muted: false,
         }
@@ -172,10 +210,11 @@ impl CompanionSession {
 
     pub(crate) fn idle_limit(&self) -> Option<Duration> {
         match self.remote {
-            RemoteState::Connected | RemoteState::ReceivingInput => Some(Duration::from_secs(1800)),
+            RemoteState::Connected | RemoteState::ReceivingInput => Some(Duration::from_secs(3600)),
             // A paired phone may reopen Remote on the same authenticated connection.
-            RemoteState::Closed => Some(Duration::from_secs(5 * 60)),
-            RemoteState::Waiting if self.is_verified() => Some(Duration::from_secs(15)),
+            RemoteState::Closed => Some(Duration::from_secs(3600)),
+            RemoteState::Waiting if self.is_verified() => Some(Duration::from_secs(10 * 60)),
+            RemoteState::Waiting if self.setup.is_none() => Some(Duration::from_secs(15)),
             RemoteState::Waiting => None,
         }
     }
@@ -535,6 +574,10 @@ impl CompanionSession {
             12,
         )?);
         self.pairing
+            .diagnostics
+            .verified_connections
+            .fetch_add(1, Ordering::Relaxed);
+        self.pairing
             .set_connection_status("iPhone verified · waiting for Remote session");
         Ok(())
     }
@@ -582,16 +625,21 @@ impl CompanionSession {
                     self.send_now_playing().await?;
                 }
             }
-            Some("_sessionStop" | "_touchStop" | "HIDTouchStop") => {
+            Some("_sessionStop" | "TVRCSessionStop" | "_touchStop" | "HIDTouchStop") => {
                 self.clear_touch();
-                if self.current_identifier.as_deref() == Some("_sessionStop") {
+                if matches!(
+                    self.current_identifier.as_deref(),
+                    Some("_sessionStop" | "TVRCSessionStop")
+                ) {
                     self.keyboard_subscribed = false;
                     self.playback = None;
+                    self.seek_hold = None;
                     if self.keyboard.take().is_some() {
                         self.send_event("_tiStopped", None, None).await?;
                     }
                     self.stop_remote();
-                    self.last_select = None;
+                    self.last_click = None;
+                    self.suppress_select_until = None;
                     self.pairing.set_connection_status("iPhone remote closed");
                 }
                 self.send_response(xid, None, 0).await?;
@@ -617,11 +665,11 @@ impl CompanionSession {
                 self.handle_hid_command(content, xid).await?;
             }
             Some("_hidT" | "HIDTouch") => {
+                let modern = self.current_identifier.as_deref() == Some("HIDTouch");
+                self.handle_touch(content, modern);
                 if !is_event {
                     self.send_response(xid, None, 0).await?;
                 }
-                let modern = self.current_identifier.as_deref() == Some("HIDTouch");
-                self.handle_touch(content, modern);
             }
             Some("_interest") => {
                 if let Some(Value::Array(events)) = content.get("_regEvents") {
@@ -675,6 +723,7 @@ impl CompanionSession {
                 self.keyboard_subscribed = true;
                 let focused = self.focused_text_field().await;
                 self.update_keyboard(focused);
+                self.focus_missing = false;
                 let payload = self.keyboard.as_ref().map(KeyboardSession::focus_payload);
                 self.send_response(xid, payload, 0).await?;
             }
@@ -683,7 +732,12 @@ impl CompanionSession {
                 self.keyboard = None;
                 self.send_response(xid, None, 0).await?;
             }
-            Some("_tiC") if is_event => self.type_text(content).await,
+            Some("_tiC") if is_event || data.get("_t").and_then(Value::as_int) == Some(2) => {
+                self.type_text(content).await;
+                if !is_event {
+                    self.send_response(xid, None, 0).await?;
+                }
+            }
             Some("FetchLaunchableApplicationsEvent") => {
                 self.send_response(
                     xid,
@@ -723,7 +777,19 @@ impl CompanionSession {
     pub(crate) async fn update_playback(&mut self, next: Option<PlaybackState>) -> Result<()> {
         let next = next.filter(|_| self.watches_playback() && self.input.playback_enabled());
         if next != self.playback {
+            if self.playback.map(|old| old.source) != next.map(|new| new.source) {
+                self.seek_hold = None;
+            }
             self.playback = next;
+            let player = match next.map(|state| state.source) {
+                Some(VideoSource::Jellyfin) => 1,
+                Some(VideoSource::YouTube) => 2,
+                None => 0,
+            };
+            self.pairing
+                .diagnostics
+                .player
+                .store(player, Ordering::Relaxed);
             self.send_media_state(None).await?;
             self.send_now_playing().await?;
         }
@@ -743,6 +809,26 @@ impl CompanionSession {
         }
     }
 
+    pub(crate) fn seek_deadline(&self) -> Option<Instant> {
+        self.seek_hold
+            .as_ref()
+            .map(|hold| hold.next.min(hold.expires))
+    }
+
+    pub(crate) async fn repeat_seek(&mut self) {
+        let now = Instant::now();
+        let Some(hold) = &mut self.seek_hold else {
+            return;
+        };
+        if now >= hold.expires || !self.input.playback_enabled() {
+            self.seek_hold = None;
+            return;
+        }
+        hold.next = now + Duration::from_millis(500);
+        let action = hold.action;
+        self.apply_playback_action(action).await;
+    }
+
     async fn focused_text_field(&self) -> Option<u64> {
         if !self.watches_keyboard_focus() {
             return None;
@@ -760,8 +846,22 @@ impl CompanionSession {
         }
     }
 
-    pub(crate) async fn refresh_keyboard(&mut self) -> Result<()> {
-        let focus = self.focused_text_field().await;
+    pub(crate) fn queue_keyboard_probe(&self, probes: &mut JoinSet<Option<u64>>) {
+        let input = self.input.clone();
+        probes.spawn_blocking(move || input.focused_text_field());
+    }
+
+    pub(crate) async fn publish_keyboard_focus(&mut self, focus: Option<u64>) -> Result<()> {
+        if !self.watches_keyboard_focus() {
+            return Ok(());
+        }
+        // A busy app can miss one Accessibility query. Keep the session UUID
+        // through that gap so a valid edit can still target the same field.
+        if focus.is_none() && self.keyboard.is_some() && !self.focus_missing {
+            self.focus_missing = true;
+            return Ok(());
+        }
+        self.focus_missing = false;
         if self.keyboard.as_ref().map(|keyboard| keyboard.field) != focus {
             if self.keyboard.is_some() {
                 self.send_event("_tiStopped", None, None).await?;
@@ -776,12 +876,17 @@ impl CompanionSession {
     }
 
     async fn type_text(&mut self, content: &Value) {
+        let diagnostics = &self.pairing.diagnostics;
+        diagnostics
+            .keyboard_messages
+            .fetch_add(1, Ordering::Relaxed);
         let Some(keyboard) = &self.keyboard else {
             return;
         };
         let Some(edit) = keyboard.text_edit(content) else {
             return;
         };
+        diagnostics.keyboard_edits.fetch_add(1, Ordering::Relaxed);
         let input = self.input.clone();
         let field = keyboard.field;
         let applied = tokio::task::spawn_blocking(move || {
@@ -790,13 +895,14 @@ impl CompanionSession {
         .await
         .unwrap_or(false);
         if applied {
+            diagnostics.keyboard_posted.fetch_add(1, Ordering::Relaxed);
             self.record_input();
         }
     }
 
     fn system_info(&self) -> Value {
         let mac = self.pairing.mac.map(|byte| format!("{byte:02X}")).join(":");
-        Value::dict(vec![
+        let mut fields = vec![
             Value::kv("_sf", Value::Int(65536)),
             Value::kv("_cf", Value::Int(512)),
             Value::kv("_i", Value::str(&hex::encode_upper(self.pairing.mac))),
@@ -808,7 +914,13 @@ impl CompanionSession {
             Value::kv("_sv", Value::str(SOURCE_VERSION)),
             Value::kv("model", Value::str(DEVICE_MODEL)),
             Value::kv("name", Value::str(&self.device_name)),
-        ])
+        ];
+        // A relay has its own advertised LAN port, which the backend cannot
+        // know. On the direct LAN connection, report the actual receiver port.
+        if let Some(port) = self.advertised_port {
+            fields.push(Value::kv("_lP", Value::Int(u64::from(port))));
+        }
+        Value::dict(fields)
     }
 
     async fn handle_hid_command(&mut self, content: &Value, xid: Option<u64>) -> Result<()> {
@@ -830,7 +942,14 @@ impl CompanionSession {
         self.record_input();
         if button == "select" {
             if self.mode == TrackpadMode::Direction || self.touch.is_none() {
-                self.select(false, false);
+                self.select(
+                    None,
+                    TapTime {
+                        received: Instant::now(),
+                        phone_ns: None,
+                    },
+                    false,
+                );
             }
         } else if matches!(button, "play_pause" | "home" | "menu") {
             let input = self.input.clone();
@@ -922,10 +1041,16 @@ impl CompanionSession {
                 None
             }
             Some(5) => {
-                let volume =
-                    self.input
-                        .volume()
-                        .unwrap_or(if self.muted { 0.0 } else { self.volume });
+                let input = self.input.clone();
+                let volume = tokio::time::timeout(
+                    Duration::from_millis(100),
+                    tokio::task::spawn_blocking(move || input.volume()),
+                )
+                .await
+                .ok()
+                .and_then(|result| result.ok())
+                .flatten()
+                .unwrap_or(if self.muted { 0.0 } else { self.volume });
                 Some(Value::dict(vec![Value::kv(
                     volume_key,
                     Value::Double(volume),
@@ -959,6 +1084,25 @@ impl CompanionSession {
                     };
                     self.apply_playback_action(action).await;
                 }
+                None
+            }
+            Some(8 | 10) if self.playback.is_some() => {
+                let action = if command == Some(8) {
+                    PlaybackAction::SkipForward
+                } else {
+                    PlaybackAction::SkipBackward
+                };
+                let now = Instant::now();
+                self.seek_hold = Some(SeekHold {
+                    action,
+                    next: now,
+                    expires: now + Duration::from_secs(8),
+                });
+                self.repeat_seek().await;
+                None
+            }
+            Some(9 | 11) => {
+                self.seek_hold = None;
                 None
             }
             Some(12) => Some(Value::dict(vec![Value::kv(
@@ -1007,22 +1151,57 @@ impl CompanionSession {
         }
     }
 
-    fn select(&mut self, from_touch: bool, double: bool) -> bool {
-        // A touch tap can also generate a HID Select. Suppress the second event
-        // from the other source while allowing consecutive taps from one source.
-        let now = Instant::now();
-        if self.last_select.is_some_and(|(time, touch)| {
-            touch != from_touch && now - time < Duration::from_millis(120)
-        }) {
-            return false;
+    fn select(&mut self, touch_started: Option<Instant>, time: TapTime, continuation: bool) {
+        let from_touch = touch_started.is_some();
+        let source = if from_touch { 1 } else { 2 };
+        if !from_touch
+            && self
+                .suppress_select_until
+                .is_some_and(|until| time.received < until)
+        {
+            return;
         }
-        self.last_select = Some((now, from_touch));
+        // A physical tap can arrive as both Touch End and HID Select. Only
+        // consume one echo, leaving the next touch or button tap eligible.
+        if let Some(last) = &mut self.last_click {
+            if last.sources & source == 0
+                && !touch_started.is_some_and(|start| start >= last.time.received)
+                && time.follows(last.time, SELECT_ECHO_WINDOW)
+            {
+                last.sources |= source;
+                return;
+            }
+        }
+        let double = self.mode == TrackpadMode::Mouse && (continuation || self.is_second_tap(time));
+        self.last_click = Some(Click {
+            time,
+            sources: source,
+            double,
+        });
         match self.mode {
-            TrackpadMode::Mouse if double => self.input.double_click(),
+            TrackpadMode::Mouse if double => {
+                self.input.double_click();
+                self.pairing
+                    .diagnostics
+                    .double_clicks
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             TrackpadMode::Mouse => self.input.click(),
             TrackpadMode::Direction => self.input.button("select"),
         }
-        true
+    }
+
+    fn is_second_tap(&self, time: TapTime) -> bool {
+        self.mode == TrackpadMode::Mouse
+            && self
+                .last_click
+                .as_ref()
+                .is_some_and(|last| !last.double && time.follows(last.time, DOUBLE_TAP_WINDOW))
+    }
+
+    fn suppress_click_echo(&mut self, now: Instant) {
+        self.last_click = None;
+        self.suppress_select_until = Some(now + SELECT_ECHO_WINDOW);
     }
 
     pub(crate) fn touch_deadline(&self) -> Option<Instant> {
@@ -1059,8 +1238,8 @@ impl CompanionSession {
     fn clear_touch(&mut self) {
         if self.touch.take().is_some_and(|touch| touch.dragging) {
             self.input.end_drag();
+            self.suppress_click_echo(Instant::now());
         }
-        self.last_tap = None;
     }
 
     fn handle_touch(&mut self, content: &Value, modern: bool) {
@@ -1086,25 +1265,32 @@ impl CompanionSession {
                 .and_then(Value::as_float)
                 .filter(|value| value.is_finite() && (-4000.0..=4000.0).contains(value))
         };
-        let (Some(x), Some(y)) = (coordinate(x_key), coordinate(y_key)) else {
-            if phase == TouchPhase::Ended {
-                self.clear_touch();
-            }
+        let point = coordinate(x_key).zip(coordinate(y_key)).or_else(|| {
+            // A lift can omit coordinates. The last reported touch position
+            // still determines whether this gesture was a tap or a drag.
+            (phase == TouchPhase::Ended)
+                .then(|| self.touch.as_ref().map(|touch| touch.last))
+                .flatten()
+        });
+        let Some(point) = point else {
             return;
         };
         self.record_input();
-        let point = (x, y);
+        let (x, y) = point;
         let now = Instant::now();
+        let time = TapTime {
+            received: now,
+            phone_ns: content
+                .get(if modern { "Nanoseconds" } else { "_ns" })
+                .and_then(Value::as_int)
+                .filter(|value| *value != 0),
+        };
         match phase {
             TouchPhase::Began => {
                 if self.touch.is_some() {
                     self.clear_touch();
                 }
-                let second_tap = self.mode == TrackpadMode::Mouse
-                    && self
-                        .last_tap
-                        .take()
-                        .is_some_and(|time| now - time < DOUBLE_TAP_WINDOW);
+                let second_tap = self.is_second_tap(time);
                 self.touch = Some(ActiveTouch {
                     origin: point,
                     last: point,
@@ -1150,27 +1336,22 @@ impl CompanionSession {
                 let touch = self.touch.take().unwrap();
                 if touch.dragging {
                     self.input.end_drag();
-                    self.last_select = Some((now, true));
+                    self.suppress_click_echo(now);
                 } else if touch.right_clicked {
-                    self.last_select = Some((now, true));
+                    self.suppress_click_echo(now);
                 } else if self.mode == TrackpadMode::Mouse
                     && !touch.second_tap
                     && touch.distance < DRAG_MOVE_DISTANCE
                     && now - touch.started >= RIGHT_CLICK_HOLD
                 {
                     self.input.right_click();
-                    self.last_select = Some((now, true));
+                    self.suppress_click_echo(now);
                 } else if touch.distance < TAP_MAX_DISTANCE
                     && !touch.drag_attempted
                     && (self.mode == TrackpadMode::Direction
                         || now - touch.started < RIGHT_CLICK_HOLD)
                 {
-                    if self.select(true, touch.second_tap)
-                        && !touch.second_tap
-                        && self.mode == TrackpadMode::Mouse
-                    {
-                        self.last_tap = Some(now);
-                    }
+                    self.select(Some(touch.started), time, touch.second_tap);
                 } else if self.mode == TrackpadMode::Direction && distance >= SWIPE_MIN_DISTANCE {
                     let button = if dx.abs() > dy.abs() {
                         if dx > 0.0 {
@@ -1184,6 +1365,8 @@ impl CompanionSession {
                         "up"
                     };
                     self.input.button(button);
+                } else if self.mode == TrackpadMode::Mouse {
+                    self.last_click = None;
                 }
             }
             TouchPhase::Cancelled => unreachable!(),

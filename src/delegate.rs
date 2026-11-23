@@ -15,6 +15,7 @@ pub struct PlaybackState {
     pub source: VideoSource,
     pub playing: Option<bool>,
     pub captions: Option<bool>,
+    pub duration_seconds: Option<u32>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

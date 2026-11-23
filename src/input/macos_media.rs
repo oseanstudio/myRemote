@@ -1,4 +1,5 @@
 use std::ffi::{c_char, c_void, CStr};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ptr::null;
 use std::time::{Duration, Instant};
 
@@ -6,7 +7,7 @@ use myremote::{PlaybackAction, PlaybackState, VideoSource};
 use objc2::rc::{autoreleasepool, Retained};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 
-use super::platform::{can_post_input, send_key_to, Desktop, OwnedCf};
+use super::platform::{can_post_input, post_key, Desktop, OwnedCf};
 
 #[link(name = "ApplicationServices", kind = "framework")]
 unsafe extern "C" {
@@ -26,12 +27,14 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetTypeID() -> usize;
     fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
     fn CFRetain(object: *const c_void) -> *const c_void;
     fn CFEqual(first: *const c_void, second: *const c_void) -> bool;
     static kCFBooleanTrue: *const c_void;
     static kCFBooleanFalse: *const c_void;
     fn CFGetTypeID(value: *const c_void) -> usize;
+    fn CFHash(value: *const c_void) -> usize;
     fn CFStringGetTypeID() -> usize;
     fn CFURLGetTypeID() -> usize;
     fn CFURLGetString(url: *const c_void) -> *const c_void;
@@ -57,6 +60,8 @@ impl Player {
             | "com.google.Chrome"
             | "org.chromium.Chromium"
             | "org.mozilla.firefox"
+            | "app.zen-browser.zen"
+            | "app.zen-browser.zen.twilight"
             | "com.microsoft.edgemac"
             | "com.brave.Browser"
             | "company.thebrowser.Browser"
@@ -97,7 +102,10 @@ pub(super) fn handle(action: &str) -> bool {
     autoreleasepool(|_| {
         let workspace = NSWorkspace::sharedWorkspace();
         let app = workspace.frontmostApplication()?;
-        let player = Player::identify(&app.bundleIdentifier()?.to_string())?;
+        let player = app
+            .bundleIdentifier()
+            .and_then(|bundle| Player::identify(&bundle.to_string()))
+            .or_else(|| BrowserVideo::from_app(app.clone()).map(|_| Player::Browser))?;
         let (key, flags) = player.shortcut(action)?;
         if Desktop::focused_text_field().is_some() {
             // A browser search box should keep its normal Escape behavior.
@@ -113,7 +121,7 @@ pub(super) fn handle(action: &str) -> bool {
             }
         }
         if app.isActive() {
-            send_key_to(pid, key, flags, &[]);
+            post_key(key, flags, &[]);
         }
         Some(true)
     })
@@ -124,34 +132,98 @@ struct BrowserVideo {
     app: Retained<NSRunningApplication>,
     page: OwnedCf,
     source: VideoSource,
+    fingerprint: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct BrowserPlayback {
+    pub state: PlaybackState,
+    pub fingerprint: u64,
 }
 
 impl BrowserVideo {
     fn foreground() -> Option<Self> {
         let app = NSWorkspace::sharedWorkspace().frontmostApplication()?;
-        if Player::identify(&app.bundleIdentifier()?.to_string()) != Some(Player::Browser) {
-            return None;
-        }
+        Self::from_app(app)
+    }
+
+    fn from_app(app: Retained<NSRunningApplication>) -> Option<Self> {
         if let Some(system) = OwnedCf::new(unsafe { AXUIElementCreateSystemWide() }) {
             unsafe { AXUIElementSetMessagingTimeout(system.0, 0.1) };
         }
-        let page = find_element(focused_window(app.processIdentifier())?, |element| {
-            element
-                .attribute(c"AXRole")
-                .is_ok_and(|role| role.is(c"AXWebArea"))
-                && flag(element, c"AXHidden") != Some(true)
-        })?;
-        let source = video_source(&text(&page.attribute(c"AXURL").ok()?)?)?;
-        app.isActive().then_some(Self { app, page, source })
+        let pid = app.processIdentifier();
+        let mut candidate = None;
+        let window = focused_window(pid)?;
+        let page = find_element(retain(&window), |element| {
+            if !is_web_area(element) {
+                return false;
+            }
+            candidate = element
+                .attribute(c"AXURL")
+                .ok()
+                .and_then(|url| text(&url))
+                .and_then(|url| Some((video_source(&url)?, url)));
+            candidate.is_some()
+        });
+        let (page, source, url) = match (page, candidate) {
+            (Some(page), Some((source, url))) => (page, source, Some(url)),
+            _ => {
+                // Jellyfin can use a custom base URL or remain on an item
+                // route while its player is open. Recognize its player DOM
+                // markers in the front document as a second signal.
+                let page = find_element(window, is_web_area)?;
+                find_element(retain(&page), |e| {
+                    has_dom_class(
+                        e,
+                        &[
+                            "osdPositionSlider",
+                            "htmlvideoplayer",
+                            "videoOsdBottom-maincontrols",
+                        ],
+                    )
+                })?;
+                let url = page.attribute(c"AXURL").ok().and_then(|url| text(&url));
+                (page, VideoSource::Jellyfin, url)
+            }
+        };
+        let mut key = DefaultHasher::new();
+        pid.hash(&mut key);
+        url.hash(&mut key);
+        (unsafe { CFHash(page.0) }).hash(&mut key);
+        page.attribute(c"AXTitle")
+            .ok()
+            .and_then(|title| text(&title))
+            .hash(&mut key);
+        app.isActive().then_some(Self {
+            app,
+            page,
+            source,
+            fingerprint: key.finish(),
+        })
     }
 
-    fn state(self) -> PlaybackState {
+    fn state(self, previous: Option<PlaybackState>) -> PlaybackState {
         let mut state = PlaybackState {
             source: self.source,
             playing: None,
             captions: None,
+            duration_seconds: None,
         };
         find_element(self.page, |element| {
+            if state.duration_seconds.is_none() {
+                let duration_class = match state.source {
+                    VideoSource::Jellyfin => "osdDurationText",
+                    VideoSource::YouTube => "ytp-time-duration",
+                };
+                if has_dom_class(element, &[duration_class]) {
+                    find_element(retain(element), |node| {
+                        state.duration_seconds = [c"AXValue", c"AXTitle", c"AXDescription"]
+                            .into_iter()
+                            .find_map(|name| duration(node, name));
+                        state.duration_seconds.is_some()
+                    });
+                }
+            }
             if !element.attribute(c"AXRole").is_ok_and(|role| {
                 role.is(c"AXButton") || role.is(c"AXCheckBox") || role.is(c"AXToggleButton")
             }) || flag(element, c"AXHidden") == Some(true)
@@ -179,18 +251,36 @@ impl BrowserVideo {
                     _ => {}
                 }
             }
-            state.playing.is_some()
+            state.duration_seconds.is_some()
+                && state.playing.is_some()
                 && (state.source == VideoSource::Jellyfin || state.captions.is_some())
         });
+        // Jellyfin hides the playback controls a few seconds after they are
+        // used. Keep the last observed information for this same document.
+        if let Some(previous) = previous {
+            state.playing = state.playing.or(previous.playing);
+            state.captions = state.captions.or(previous.captions);
+            state.duration_seconds = state.duration_seconds.or(previous.duration_seconds);
+        }
         state
     }
 }
 
-pub(super) fn playback_state() -> Option<PlaybackState> {
+pub(super) fn playback_state(previous: Option<BrowserPlayback>) -> Option<BrowserPlayback> {
     if !can_post_input() {
         return None;
     }
-    autoreleasepool(|_| BrowserVideo::foreground().map(BrowserVideo::state))
+    autoreleasepool(|_| {
+        let video = BrowserVideo::foreground()?;
+        let fingerprint = video.fingerprint;
+        let previous = previous
+            .filter(|cached| cached.fingerprint == fingerprint)
+            .map(|cached| cached.state);
+        Some(BrowserPlayback {
+            fingerprint,
+            state: video.state(previous),
+        })
+    })
 }
 
 pub(super) fn playback_action(source: VideoSource, action: PlaybackAction) -> bool {
@@ -204,14 +294,14 @@ pub(super) fn playback_action(source: VideoSource, action: PlaybackAction) -> bo
             PlaybackAction::SkipForward => 37,  // L
             PlaybackAction::SkipBackward => 38, // J
             PlaybackAction::Play | PlaybackAction::Pause => {
-                let playing = video.state().playing?;
+                let playing = video.state(None).playing?;
                 if playing == (action == PlaybackAction::Play) {
                     return Some(true);
                 }
                 40 // K
             }
             PlaybackAction::ToggleCaptions | PlaybackAction::SetCaptions(_) => {
-                let enabled = video.state().captions?;
+                let enabled = video.state(None).captions?;
                 if action == PlaybackAction::SetCaptions(enabled) {
                     return Some(true);
                 }
@@ -221,8 +311,7 @@ pub(super) fn playback_action(source: VideoSource, action: PlaybackAction) -> bo
         if !app.isActive() || Desktop::focused_text_field().is_some() {
             return None;
         }
-        send_key_to(app.processIdentifier(), key, 0, &[]);
-        Some(true)
+        Some(post_key(key, 0, &[]))
     })
     .unwrap_or(false)
 }
@@ -286,6 +375,63 @@ fn text(value: &OwnedCf) -> Option<String> {
             .ok()
             .map(str::to_owned)
     }
+}
+
+fn retain(value: &OwnedCf) -> OwnedCf {
+    // CFRetain returns the same non-null reference, with an additional owner.
+    OwnedCf(unsafe { CFRetain(value.0) })
+}
+
+fn is_web_area(element: &OwnedCf) -> bool {
+    element
+        .attribute(c"AXRole")
+        .is_ok_and(|role| role.is(c"AXWebArea"))
+        && flag(element, c"AXHidden") != Some(true)
+}
+
+fn has_dom_class(element: &OwnedCf, classes_to_match: &[&str]) -> bool {
+    let Ok(classes) = element.attribute(c"AXDOMClassList") else {
+        return false;
+    };
+    if unsafe { CFGetTypeID(classes.0) != CFArrayGetTypeID() } {
+        return text(&classes).is_some_and(|list| {
+            list.split_ascii_whitespace()
+                .any(|item| classes_to_match.contains(&item))
+        });
+    }
+    (0..unsafe { CFArrayGetCount(classes.0) }.min(32)).any(|index| {
+        let raw = unsafe { CFArrayGetValueAtIndex(classes.0, index) };
+        if raw.is_null() {
+            return false;
+        }
+        let item = OwnedCf(unsafe { CFRetain(raw) });
+        text(&item).is_some_and(|name| classes_to_match.contains(&name.as_str()))
+    })
+}
+
+fn duration(node: &OwnedCf, attribute: &CStr) -> Option<u32> {
+    clock_seconds(&text(&node.attribute(attribute).ok()?)?)
+}
+
+fn clock_seconds(clock: &str) -> Option<u32> {
+    let mut parts = clock.trim().rsplitn(3, ':');
+    let seconds = parts
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|seconds| *seconds < 60)?;
+    let minutes = parts.next()?.parse::<u32>().ok()?;
+    let hours = parts
+        .next()
+        .map(str::parse::<u32>)
+        .transpose()
+        .ok()?
+        .unwrap_or(0);
+    let total = hours
+        .checked_mul(3600)?
+        .checked_add(minutes.checked_mul(60)?)?
+        .checked_add(seconds)?;
+    (total > 0).then_some(total)
 }
 
 fn flag(element: &OwnedCf, name: &CStr) -> Option<bool> {
@@ -361,7 +507,7 @@ fn find_element(root: OwnedCf, mut matches: impl FnMut(&OwnedCf) -> bool) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{video_source, Player, VideoSource};
+    use super::{clock_seconds, video_source, Player, VideoSource};
 
     #[test]
     fn browser_uses_player_keys_instead_of_global_media_keys() {
@@ -370,6 +516,17 @@ mod tests {
         assert_eq!(browser.shortcut("home"), Some((3, 0)));
         assert_eq!(browser.shortcut("menu"), Some((37, 0)));
         assert!(Player::identify("com.spotify.client").is_none());
+        assert!(
+            Player::identify("app.zen-browser.zen").is_some_and(|player| player == Player::Browser)
+        );
+    }
+
+    #[test]
+    fn playback_duration_uses_observed_clock_text() {
+        assert_eq!(clock_seconds("05:20"), Some(320));
+        assert_eq!(clock_seconds("1:40:03"), Some(6003));
+        assert_eq!(clock_seconds("0:00"), None);
+        assert_eq!(clock_seconds("12:60"), None);
     }
 
     #[test]

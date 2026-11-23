@@ -66,7 +66,11 @@ impl KeyboardSession {
 
     pub fn text_edit(&self, data: &opack::Value) -> Option<TextEdit> {
         let bytes = data.get("_tiD")?.as_bytes()?;
-        if bytes.len() > 16 * 1024 || data.get("_tiV")?.as_int()? != 1 {
+        if bytes.len() > 16 * 1024
+            || data
+                .get("_tiV")
+                .is_some_and(|version| version.as_int() != Some(1))
+        {
             return None;
         }
         // Bound the expanded event stream as binary-plist references can reuse
@@ -77,21 +81,42 @@ impl KeyboardSession {
         let root = archive.as_dictionary()?;
         let objects = root.get("$objects")?.as_array()?;
         let top = root.get("$top")?.as_dictionary()?;
-        let operations = resolve(objects, top.get("textOperations")?)?.as_dictionary()?;
-        let target = resolve(objects, operations.get("targetSessionUUID")?)?.as_dictionary()?;
-        if resolve(objects, target.get("NS.uuidbytes")?)?.as_data()? != self.id {
+        let operations = resolve(
+            objects,
+            top.get("textOperations").or_else(|| top.get("root"))?,
+        )?
+        .as_dictionary()?;
+        let target = resolve(objects, operations.get("targetSessionUUID")?)?;
+        let uuid = match target {
+            Value::Dictionary(uuid) => resolve(objects, uuid.get("NS.uuidbytes")?)?,
+            value => value,
+        };
+        let matches_session = uuid.as_data().is_some_and(|bytes| bytes == self.id)
+            || uuid
+                .as_string()
+                .and_then(|text| uuid::Uuid::parse_str(text).ok())
+                .is_some_and(|uuid| uuid.as_bytes() == &self.id);
+        if !matches_session {
             return None;
         }
-        let output = resolve(objects, operations.get("keyboardOutput")?)?.as_dictionary()?;
+        let output = operations
+            .get("keyboardOutput")
+            .and_then(|value| resolve(objects, value))
+            .and_then(Value::as_dictionary);
         // A text assertion refers to the phone's empty synthetic document.
         // Applying it to the real field could erase text typed elsewhere.
         let backspaces = deletion_count(objects, output, "deletionCount")?;
         let deletes = deletion_count(objects, output, "forwardDeletionCount")?;
-        let text = output
-            .get("insertionText")
-            .and_then(|value| resolve(objects, value))
-            .and_then(Value::as_string)
-            .unwrap_or("");
+        let text = [
+            "insertionText",
+            "textToCommit",
+            "insertionTextAfterSelection",
+        ]
+        .into_iter()
+        .filter_map(|key| read_string(objects, output?.get(key)?))
+        .find(|text| !text.is_empty())
+        .or_else(|| read_string(objects, operations.get("attributedInsertionText")?))
+        .unwrap_or("");
         if text.len() > 8 * 1024 || backspaces == 0 && deletes == 0 && text.is_empty() {
             return None;
         }
@@ -103,9 +128,22 @@ impl KeyboardSession {
     }
 }
 
-fn deletion_count(objects: &[Value], output: &Dictionary, key: &str) -> Option<u8> {
-    match output.get(key) {
+fn read_string<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a str> {
+    let value = resolve(objects, value)?;
+    let text = match value {
+        Value::Dictionary(attrs) => resolve(
+            objects,
+            attrs.get("NSString").or_else(|| attrs.get("NS.string"))?,
+        )?,
+        text => text,
+    };
+    text.as_string()
+}
+
+fn deletion_count(objects: &[Value], output: Option<&Dictionary>, key: &str) -> Option<u8> {
+    match output.and_then(|output| output.get(key)) {
         None => Some(0),
+        Some(value) if value.as_uid().is_some_and(|uid| uid.get() == 0) => Some(0),
         Some(value) => {
             let count = resolve(objects, value)?.as_unsigned_integer()?;
             (count <= 64).then_some(count as u8)
@@ -115,6 +153,7 @@ fn deletion_count(objects: &[Value], output: &Dictionary, key: &str) -> Option<u
 
 fn resolve<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a Value> {
     match value.as_uid() {
+        Some(reference) if reference.get() == 0 => None,
         Some(reference) => objects.get(usize::try_from(reference.get()).ok()?),
         None => Some(value),
     }

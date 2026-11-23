@@ -35,6 +35,7 @@ const TAILSCALE_SHARE: isize = 12;
 const TAILSCALE_BRIDGE: isize = 13;
 const CONNECTION: isize = 14;
 const MEDIA_CONTROLS: isize = 15;
+const DIAGNOSTICS: isize = 16;
 
 struct State {
     options: Options,
@@ -83,6 +84,9 @@ define_class!(
             if let Some(item) = menu.itemWithTag(MEDIA_CONTROLS) {
                 item.setState(isize::from(self.ivars().options.media_controls.load(Ordering::Relaxed)));
             }
+            if let Some(item) = menu.itemWithTag(DIAGNOSTICS) {
+                item.setEnabled(active.is_some());
+            }
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
             }
@@ -128,6 +132,15 @@ define_class!(
     }
 
     impl MenuController {
+        #[unsafe(method(myRemoteDiagnostics:))]
+        fn diagnostics(&self, _sender: &NSMenuItem) {
+            let report = self.ivars().active.borrow().as_ref()
+                .map(|active| active.state.remote_diagnostics());
+            if let Some(report) = report {
+                self.alert("Remote Diagnostics", &report);
+            }
+        }
+
         #[unsafe(method(myRemoteToggleMediaControls:))]
         fn toggle_media_controls(&self, _sender: &NSMenuItem) {
             let options = &self.ivars().options;
@@ -398,6 +411,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             "Foreground Media Controls",
             Some(sel!(myRemoteToggleMediaControls:)),
             MEDIA_CONTROLS,
+        );
+        controller.add_item(
+            &menu,
+            "Remote Diagnostics…",
+            Some(sel!(myRemoteDiagnostics:)),
+            DIAGNOSTICS,
         );
         controller.add_item(
             &menu,
