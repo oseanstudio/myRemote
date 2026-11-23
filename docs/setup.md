@@ -60,7 +60,7 @@ Sign out and back in, then run the AppImage as your desktop user. If FUSE is una
 | Play/Pause, volume and mute, when shown | Desktop media and volume controls |
 | Keyboard, on macOS | Type in the focused editable field using the Apple TV Remote keyboard. |
 
-On macOS, connect in Control Center and click an editable field. myRemote signals the iPhone to present its keyboard when the field gains focus and dismiss it when focus leaves. This uses the same Accessibility permission as pointer control. Password fields are excluded, and the contents of the Mac's text field stay on the Mac.
+On macOS, connect in Control Center and click an editable field, including a password field in an app. myRemote signals the iPhone to show its keyboard and forwards text, including completed swipe-typed words when the iPhone offers QuickPath. This uses the same Accessibility permission as pointer control. myRemote leaves the clipboard alone, and the contents of the Mac's text field stay on the Mac.
 
 ## Configuration
 

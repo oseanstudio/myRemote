@@ -904,7 +904,7 @@ dependencies = [
 
 [[package]]
 name = "myremote"
-version = "0.2.13"
+version = "0.2.14"
 dependencies = [
  "chacha20poly1305",
  "ed25519-dalek",
@@ -933,6 +933,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "unicode-segmentation",
  "uuid",
  "windows",
  "x25519-dalek",
@@ -1688,6 +1689,12 @@ name = "unicode-ident"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+
+[[package]]
+name = "unicode-segmentation"
+version = "1.13.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6f5d3c3b1bf09027a88a6bc961fc00497d651009560b5463668dc81b0fa87a8"
 
 [[package]]
 name = "universal-hash"

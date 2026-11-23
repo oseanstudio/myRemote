@@ -8,7 +8,7 @@ pub trait RemoteInput: Send + Sync + 'static {
     fn button(&self, name: &str);
     fn move_pointer(&self, dx: f64, dy: f64);
     fn click(&self);
-    /// Identifies the focused editable, non-password field without reading its value.
+    /// Identifies the focused text field without reading its value.
     fn focused_text_field(&self) -> Option<u64> {
         None
     }

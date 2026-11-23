@@ -4,6 +4,8 @@ use std::io;
 use std::process::Command;
 use std::ptr::{null, null_mut};
 
+use unicode_segmentation::UnicodeSegmentation;
+
 type Event = *mut c_void;
 
 #[repr(C)]
@@ -31,11 +33,6 @@ unsafe extern "C" {
     fn AXUIElementSetMessagingTimeout(element: *const c_void, seconds: f32) -> i32;
     fn AXUIElementGetPid(element: *const c_void, pid: *mut i32) -> i32;
     static kAXTrustedCheckOptionPrompt: *const c_void;
-}
-
-#[link(name = "Carbon", kind = "framework")]
-unsafe extern "C" {
-    fn IsSecureEventInputEnabled() -> u8;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -68,6 +65,7 @@ unsafe extern "C" {
     fn CGEventCreateMouseEvent(source: *mut c_void, kind: u32, point: Point, button: u32) -> Event;
     fn CGEventPost(tap: u32, event: Event);
     fn CGEventPostToPid(pid: i32, event: Event);
+    fn CGEventSetFlags(event: Event, flags: u64);
     fn CGPreflightPostEventAccess() -> bool;
     fn CGRequestPostEventAccess() -> bool;
 }
@@ -127,10 +125,7 @@ fn focused_text_field() -> Option<TextField> {
     const AX_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
     const AX_NO_VALUE: i32 = -25212;
 
-    if !can_post_input()
-        || !accessibility_is_trusted()
-        || unsafe { IsSecureEventInputEnabled() } != 0
-    {
+    if !can_post_input() || !accessibility_is_trusted() {
         return None;
     }
     let system = OwnedCf::new(unsafe { AXUIElementCreateSystemWide() })?;
@@ -141,17 +136,21 @@ fn focused_text_field() -> Option<TextField> {
     if !role.is(c"AXTextField") && !role.is(c"AXTextArea") && !role.is(c"AXComboBox") {
         return None;
     }
-    match field.attribute(c"AXSubrole") {
-        Ok(subrole) if !subrole.is(c"AXSecureTextField") => {}
-        Err(AX_ATTRIBUTE_UNSUPPORTED | AX_NO_VALUE) => {}
+    let secure = match field.attribute(c"AXSubrole") {
+        Ok(subrole) => subrole.is(c"AXSecureTextField"),
+        Err(AX_ATTRIBUTE_UNSUPPORTED | AX_NO_VALUE) => false,
         _ => return None,
-    }
-    let value = OwnedCf::string(c"AXValue")?;
-    let mut editable = 0;
-    if unsafe { AXUIElementIsAttributeSettable(field.0, value.0, &mut editable) } != 0
-        || editable == 0
-    {
-        return None;
+    };
+    // A password field may accept typing while protecting its AXValue.
+    // Use the normal event-posting API without reading or setting that value.
+    if !secure {
+        let value = OwnedCf::string(c"AXValue")?;
+        let mut editable = 0;
+        if unsafe { AXUIElementIsAttributeSettable(field.0, value.0, &mut editable) } != 0
+            || editable == 0
+        {
+            return None;
+        }
     }
     let mut pid = 0;
     if unsafe { AXUIElementGetPid(field.0, &mut pid) } != 0 || pid <= 0 {
@@ -160,6 +159,7 @@ fn focused_text_field() -> Option<TextField> {
     let mut id = DefaultHasher::new();
     pid.hash(&mut id);
     unsafe { CFHash(field.0) }.hash(&mut id);
+    secure.hash(&mut id);
     Some(TextField {
         id: id.finish(),
         pid,
@@ -171,11 +171,35 @@ fn send_key_to(pid: i32, key: u16, text: &[u16]) {
         unsafe {
             let event = CGEventCreateKeyboardEvent(null_mut(), key, down);
             if !event.is_null() {
+                CGEventSetFlags(event, 0);
                 if !text.is_empty() {
                     CGEventKeyboardSetUnicodeString(event, text.len(), text.as_ptr());
                 }
                 CGEventPostToPid(pid, event);
                 CFRelease(event);
+            }
+        }
+    }
+}
+
+fn post_text_graphemes(text: &str, mut post: impl FnMut(&[u16])) {
+    // Quartz text events work best with one visible character per event and
+    // accept up to 20 UTF-16 units. Keep combining marks and emoji together.
+    let mut units = [0; 20];
+    for grapheme in text.graphemes(true) {
+        let grapheme = if grapheme == "\r\n" { "\n" } else { grapheme };
+        if grapheme != "\n" && grapheme.chars().any(char::is_control) {
+            continue;
+        }
+        let length = grapheme.encode_utf16().count();
+        if length <= units.len() {
+            for (slot, unit) in units.iter_mut().zip(grapheme.encode_utf16()) {
+                *slot = unit;
+            }
+            post(&units[..length]);
+        } else {
+            for character in grapheme.chars() {
+                post(character.encode_utf16(&mut units));
             }
         }
     }
@@ -230,11 +254,7 @@ impl Desktop {
         match text {
             "\n" | "\r" | "\r\n" => send_key_to(target.pid, 36, &[]),
             "\t" => send_key_to(target.pid, 48, &[]),
-            _ => {
-                for character in text.chars().filter(|c| !c.is_control() || *c == '\n') {
-                    send_key_to(target.pid, 0, character.encode_utf16(&mut [0; 2]));
-                }
-            }
+            _ => post_text_graphemes(text, |units| send_key_to(target.pid, 0, units)),
         }
         true
     }
@@ -398,5 +418,19 @@ fn media_key(key: isize) {
             }
         }
         objc_autoreleasePoolPop(pool);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::post_text_graphemes;
+
+    #[test]
+    fn text_events_preserve_spaces_and_combined_characters() {
+        let mut events = Vec::new();
+        post_text_graphemes("e\u{301} 👩‍💻\r\n\u{1b}", |units| {
+            events.push(String::from_utf16(units).unwrap());
+        });
+        assert_eq!(events, ["e\u{301}", " ", "👩‍💻", "\n"]);
     }
 }

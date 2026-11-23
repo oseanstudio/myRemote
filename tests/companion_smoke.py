@@ -234,6 +234,18 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         await command(second, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (1 backspaces, 0 deletes, 0 characters)"
 
+        # A completed swipe can arrive as a whole word, followed by a
+        # correction that removes the old word and inserts the replacement.
+        keyboard_edit(second, get_rti_input_text_payload(second_id, "swpie "))
+        payload = plistlib.loads(get_rti_input_text_payload(second_id, "swipe "))
+        operations = payload["$objects"][payload["$top"]["textOperations"].data]
+        keyboard_output = payload["$objects"][operations["keyboardOutput"].data]
+        keyboard_output["deletionCount"] = len("swpie ")
+        keyboard_edit(second, plistlib.dumps(payload, fmt=plistlib.FMT_BINARY))
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (6 backspaces, 0 deletes, 6 characters)"
+
         await command(first, "_sessionStop", {"_sid": (first_session << 32) | 456})
         await first_events.expect("_tiStopped")
         keyboard_edit(first, get_rti_input_text_payload(first_id, "closed"))
