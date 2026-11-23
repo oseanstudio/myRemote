@@ -13,7 +13,7 @@ pub(crate) struct KeyboardSession {
 }
 
 pub(crate) struct TextEdit {
-    pub target: [u8; 16],
+    pub target: Option<[u8; 16]>,
     pub backspaces: u8,
     pub deletes: u8,
     pub text: String,
@@ -71,12 +71,16 @@ impl KeyboardSession {
             ]),
             objects,
         );
-        opack::Value::dict(vec![opack::Value::kv("_tiD", opack::Value::Bytes(bytes))])
+        opack::Value::dict(vec![
+            opack::Value::kv("_tiV", opack::Value::Int(1)),
+            opack::Value::kv("_tiD", opack::Value::Bytes(bytes)),
+        ])
     }
 
     pub fn text_edit(
         content: &opack::Value,
         message: &opack::Value,
+        version: Option<u64>,
     ) -> Result<TextEdit, KeyboardEditError> {
         use KeyboardEditError::*;
 
@@ -96,6 +100,7 @@ impl KeyboardSession {
         let archive = Value::from_events(BinaryReader::new(Cursor::new(bytes)).take(4096))
             .map_err(|_| Archive)?;
         let root = archive.as_dictionary().ok_or(Archive)?;
+        let archiver = root.get("$archiver").and_then(Value::as_string);
         let objects = root
             .get("$objects")
             .and_then(Value::as_array)
@@ -110,9 +115,8 @@ impl KeyboardSession {
             .or_else(|| {
                 top.values().find_map(|value| {
                     let dict = resolve(objects, value)?.as_dictionary()?;
-                    let class = property(objects, dict, "$class")?.as_dictionary()?;
                     matches!(
-                        class.get("$classname")?.as_string()?,
+                        class_name(objects, dict)?,
                         "RTITextOperations" | "RTIInputOperation"
                     )
                     .then_some(dict)
@@ -124,26 +128,22 @@ impl KeyboardSession {
             .unwrap_or(root);
         let target_reference = [operations, root, top]
             .into_iter()
-            .find_map(|dict| {
-                property(objects, dict, "targetSessionUUID")
-                    .or_else(|| property(objects, dict, "sessionUUID"))
+            .flat_map(|dict| {
+                ["targetSessionUUID", "sessionUUID"]
+                    .into_iter()
+                    .filter_map(move |key| keyed_value(objects, dict, key))
             })
-            .ok_or(Target)?;
-        let target_value = target_reference
-            .as_dictionary()
-            .and_then(|dict| property(objects, dict, "NS.uuidbytes"))
-            .unwrap_or(target_reference);
-        let target = target_value
-            .as_data()
-            .and_then(|bytes| bytes.try_into().ok())
-            .or_else(|| {
-                Some(
-                    *uuid::Uuid::parse_str(target_value.as_string()?)
-                        .ok()?
-                        .as_bytes(),
-                )
-            })
-            .ok_or(Target)?;
+            .find(|value| value.as_uid().is_none_or(|uid| uid.get() != 0));
+        let target = match target_reference {
+            Some(reference) => Some(read_uuid(objects, reference).ok_or(Target)?),
+            None if version == Some(1)
+                && archiver == Some("RTIKeyedArchiver")
+                && class_name(objects, operations) == Some("RTITextOperations") =>
+            {
+                None
+            }
+            None => return Err(Target),
+        };
         let output = property(objects, operations, "keyboardOutput")
             .and_then(Value::as_dictionary)
             .unwrap_or(operations);
@@ -187,6 +187,24 @@ impl KeyboardSession {
     }
 }
 
+fn class_name<'a>(objects: &'a [Value], dict: &'a Dictionary) -> Option<&'a str> {
+    property(objects, dict, "$class")?
+        .as_dictionary()?
+        .get("$classname")?
+        .as_string()
+}
+
+fn read_uuid(objects: &[Value], reference: &Value) -> Option<[u8; 16]> {
+    let target = resolve(objects, reference)?;
+    let uuid = target
+        .as_dictionary()
+        .and_then(|dict| property(objects, dict, "NS.uuidbytes"))
+        .unwrap_or(target);
+    uuid.as_data()
+        .and_then(|bytes| bytes.try_into().ok())
+        .or_else(|| Some(*uuid::Uuid::parse_str(uuid.as_string()?).ok()?.as_bytes()))
+}
+
 fn read_string<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a str> {
     let mut text = value;
     for _ in 0..4 {
@@ -212,19 +230,19 @@ fn deletion_count(objects: &[Value], output: &Dictionary, key: &str) -> Option<u
 }
 
 fn property<'a>(objects: &'a [Value], dict: &'a Dictionary, key: &str) -> Option<&'a Value> {
+    resolve(objects, keyed_value(objects, dict, key)?)
+}
+
+fn keyed_value<'a>(objects: &'a [Value], dict: &'a Dictionary, key: &str) -> Option<&'a Value> {
     if let Some(value) = dict.get(key) {
-        return resolve(objects, value);
+        return Some(value);
     }
     // NSKeyedArchiver can encode NSDictionary entries as parallel arrays.
     let keys = resolve(objects, dict.get("NS.keys")?)?.as_array()?;
     let values = resolve(objects, dict.get("NS.objects")?)?.as_array()?;
     keys.iter().zip(values).find_map(|(name, value)| {
         let name = resolve(objects, name)?.as_string()?;
-        if name == key {
-            resolve(objects, value)
-        } else {
-            None
-        }
+        (name == key).then_some(value)
     })
 }
 

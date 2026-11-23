@@ -1,6 +1,7 @@
 """Exercise the built receiver with pyatv 0.18.0 and a disposable identity."""
 
 import asyncio
+import base64
 from contextlib import contextmanager
 from pathlib import Path
 import plistlib
@@ -22,6 +23,19 @@ from pyatv.protocols.companion.plist_payloads.rti_text_operations import (
     get_rti_input_text_payload,
 )
 from pyatv.protocols.companion.protocol import CompanionProtocol
+
+
+# Apple's RTIKeyedArchiver output for inserting "rti fixture " with no UUID.
+SESSION_KEYBOARD_EDIT = base64.b64decode(
+    "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QEFJU"
+    "SUtleWVkQXJjaGl2ZXLRCAledGV4dE9wZXJhdGlvbnOAAaYLDBUZGiFVJG51bGzUDQ4PEBERExRfEBdp"
+    "c0F1dG9GaWxsVGV4dE9wZXJhdGlvbl8QHGlzRXhwbGljaXRBdXRvRmlsbEludm9jYXRpb25ea2V5Ym9h"
+    "cmRPdXRwdXRWJGNsYXNzCAiAAoAF0hYQFxhdaW5zZXJ0aW9uVGV4dIADgARccnRpIGZpeHR1cmUg0hsc"
+    "HR5aJGNsYXNzbmFtZVgkY2xhc3Nlc18QEFRJS2V5Ym9hcmRPdXRwdXSiHyBfEBBUSUtleWJvYXJkT3V0"
+    "cHV0WE5TT2JqZWN00hscIiNfEBFSVElUZXh0T3BlcmF0aW9uc6IkIF8QEVJUSVRleHRPcGVyYXRpb25z"
+    "AAgAEQAaACQAKQAyADcASgBNAFwAXgBlAGsAdACOAK0AvADDAMQAxQDHAMkAzgDcAN4A4ADtAPIA/QEG"
+    "ARkBHAEvATgBPQFRAVQAAAAAAAACAQAAAAAAAAAlAAAAAAAAAAAAAAAAAAABaA=="
+)
 
 
 @contextmanager
@@ -180,6 +194,7 @@ class RemoteEvents:
 
 
 def keyboard_id(content):
+    assert content["_tiV"] == 1
     archive = plistlib.loads(content["_tiD"])
     objects = archive["$objects"]
     top = archive["$top"]
@@ -223,8 +238,17 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         assert first_id != second_id
         assert keyboard_id((await command(second, "_tiStart", {}))["_c"]) == second_id
 
+        keyboard_edit(first, SESSION_KEYBOARD_EDIT)
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 12 characters)"
+
         keyboard_edit(first, b"not a plist")
         keyboard_edit(first, get_rti_input_text_payload(second_id, "wrong session"))
+        invalid_target = plistlib.loads(get_rti_input_text_payload(first_id, "invalid target"))
+        invalid_target["$objects"][invalid_target["$top"]["textOperations"].data][
+            "targetSessionUUID"
+        ] = plistlib.UID(250)
+        keyboard_edit(first, plistlib.dumps(invalid_target, fmt=plistlib.FMT_BINARY))
         keyboard_edit(first, get_rti_clear_text_payload(first_id))
         keyboard_edit(first, get_rti_input_text_payload(first_id, "é🙂"))
         await command(first, "FetchAttentionState", {})
@@ -296,10 +320,17 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         await second_events.expect("_tiStopped")
         replacement_id = keyboard_id(await second_events.expect("_tiStarted"))
         assert replacement_id != second_id
+        # An edit without a UUID must never carry over into the new field.
+        keyboard_edit(second, SESSION_KEYBOARD_EDIT)
         keyboard_edit(second, get_rti_input_text_payload(second_id, "old focus"))
         keyboard_edit(second, get_rti_input_text_payload(replacement_id, "new focus"))
         await command(second, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 9 characters)"
+        # A fresh subscription binds edits to this new field.
+        assert keyboard_id((await command(second, "_tiStart", {}))["_c"]) == replacement_id
+        keyboard_edit(second, SESSION_KEYBOARD_EDIT)
+        await command(second, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 12 characters)"
         await command(second, "HIDCommand", {"HIDCommand": 5, "HIDButtonState": 2})
         expect(r"^Received button menu$")
         await second_events.expect("_tiStopped")
@@ -329,6 +360,8 @@ async def exercise_reconnect(port, credentials, second_credentials, expect):
         await replacement.start()
         await command(replacement, "_systemInfo", {"_clFl": 128}, FrameType.P_OPACK)
         assert original.connection.connected
+        # A second socket with the same pairing has no implicit field binding.
+        keyboard_edit(replacement, SESSION_KEYBOARD_EDIT)
         await command(replacement, "_tiC", {
             "_tiV": 1,
             "_tiD": get_rti_input_text_payload(field, "alternate connection"),

@@ -129,6 +129,12 @@ enum RemoteState {
     Closed,
 }
 
+#[derive(Clone, Copy)]
+enum KeyboardEditScope {
+    FirstField,
+    Field([u8; 16]),
+}
+
 /// One Companion connection's state machine.
 pub(crate) struct CompanionSession {
     writer: OwnedWriteHalf,
@@ -153,6 +159,7 @@ pub(crate) struct CompanionSession {
     remote_session_id: u32,
     keyboard_subscribed: bool,
     keyboard: Option<KeyboardSession>,
+    keyboard_edit_scope: Option<KeyboardEditScope>,
     focus_missing: bool,
     playback: Option<PlaybackState>,
     seek_hold: Option<SeekHold>,
@@ -202,6 +209,7 @@ impl CompanionSession {
             remote_session_id: 0,
             keyboard_subscribed: false,
             keyboard: None,
+            keyboard_edit_scope: None,
             focus_missing: false,
             playback: None,
             seek_hold: None,
@@ -695,6 +703,7 @@ impl CompanionSession {
                     }
                     self.playback = None;
                     self.seek_hold = None;
+                    self.keyboard_edit_scope = None;
                     if self.keyboard.is_some() {
                         self.update_keyboard(None);
                         self.send_event("_tiStopped", None, None).await?;
@@ -806,9 +815,17 @@ impl CompanionSession {
                     }
                     self.send_response(xid, payload, 0).await?;
                 }
+                self.keyboard_edit_scope = Some(
+                    self.keyboard
+                        .as_ref()
+                        .map_or(KeyboardEditScope::FirstField, |keyboard| {
+                            KeyboardEditScope::Field(keyboard.id)
+                        }),
+                );
             }
             Some("_tiStop") => {
                 self.keyboard_subscribed = false;
+                self.keyboard_edit_scope = None;
                 self.update_keyboard(None);
                 if !is_event {
                     self.send_response(xid, None, 0).await?;
@@ -964,6 +981,15 @@ impl CompanionSession {
             if let Some(keyboard) = &self.keyboard {
                 let payload = keyboard.focus_payload();
                 self.send_event("_tiStarted", None, Some(payload)).await?;
+                if matches!(
+                    self.keyboard_edit_scope,
+                    Some(KeyboardEditScope::FirstField)
+                ) {
+                    self.keyboard_edit_scope = self
+                        .keyboard
+                        .as_ref()
+                        .map(|field| KeyboardEditScope::Field(field.id));
+                }
                 self.pairing
                     .diagnostics
                     .keyboard_focuses
@@ -978,11 +1004,12 @@ impl CompanionSession {
         diagnostics
             .keyboard_messages
             .fetch_add(1, Ordering::Relaxed);
-        *diagnostics.keyboard_version.lock().unwrap() = content
+        let version = content
             .get("_tiV")
             .or_else(|| message.get("_tiV"))
             .and_then(Value::as_int);
-        let edit = match KeyboardSession::text_edit(content, message) {
+        *diagnostics.keyboard_version.lock().unwrap() = version;
+        let edit = match KeyboardSession::text_edit(content, message, version) {
             Ok(edit) => edit,
             Err(error) => {
                 diagnostics.keyboard_failures[error as usize].fetch_add(1, Ordering::Relaxed);
@@ -990,11 +1017,29 @@ impl CompanionSession {
             }
         };
         diagnostics.keyboard_edits.fetch_add(1, Ordering::Relaxed);
+        let target = match edit.target {
+            Some(target) => target,
+            None => {
+                // Only the connection that started the keyboard can supply a
+                // target implicitly. Keep the original offer even after focus
+                // changes: a delayed edit cannot fall through to another field.
+                diagnostics
+                    .keyboard_session_edits
+                    .fetch_add(1, Ordering::Relaxed);
+                let Some(target) = self.keyboard.as_ref().map(|keyboard| keyboard.id).filter(|id| {
+                    matches!(self.keyboard_edit_scope, Some(KeyboardEditScope::Field(armed)) if armed == *id)
+                }) else {
+                    diagnostics.keyboard_scope_rejections.fetch_add(1, Ordering::Relaxed);
+                    return;
+                };
+                target
+            }
+        };
         let controller = self
             .controller
             .expect("keyboard is only available after verification");
-        // Rapport can carry text input on a separate connection verified with
-        // the same pairing. The phone must still present the offered field UUID.
+        // A separate connection can name a field from the same pairing if it
+        // supplies the UUID explicitly.
         let pairing = self.pairing.clone();
         let input = self.input.clone();
         let applied = tokio::task::spawn_blocking(move || {
@@ -1002,7 +1047,7 @@ impl CompanionSession {
                 .keyboard_fields
                 .lock()
                 .unwrap()
-                .get(&(controller, edit.target))
+                .get(&(controller, target))
                 .copied();
             let Some(field) = field else {
                 return false;
