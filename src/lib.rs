@@ -4,15 +4,17 @@
 pub mod crypto;
 mod delegate;
 mod error;
+mod keyed_archive;
 pub mod opack;
 mod pairing;
 mod remote_keyboard;
+mod remote_media;
 mod server;
 mod session;
 pub mod srp;
 mod tlv;
 
-pub use delegate::{RemoteInput, TrackpadMode};
+pub use delegate::{PlaybackAction, PlaybackState, RemoteInput, TrackpadMode, VideoSource};
 pub use error::{Error, Result};
 pub use pairing::PairingState;
 pub use server::{detect_local_ip, DiscoveryRecord, Receiver, TAILNET_PORTS};

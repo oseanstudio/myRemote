@@ -434,6 +434,9 @@ async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession
     let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);
     let mut focus_poll = tokio::time::interval(Duration::from_millis(250));
     focus_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut media_poll = tokio::time::interval(Duration::from_secs(1));
+    media_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut media_probes = JoinSet::new();
     loop {
         let header_deadline = session
             .idle_limit()
@@ -461,6 +464,15 @@ async fn read_session(reader: &mut OwnedReadHalf, session: &mut CompanionSession
                     }
                     _ = focus_poll.tick(), if session.watches_keyboard_focus() => {
                         timeout(Duration::from_secs(5), session.refresh_keyboard())
+                            .await
+                            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
+                    }
+                    _ = media_poll.tick(), if session.watches_playback() && media_probes.is_empty() => {
+                        // The browser's accessibility tree may be slow to answer.
+                        session.queue_playback_probe(&mut media_probes);
+                    }
+                    Some(result) = media_probes.join_next(), if !media_probes.is_empty() => {
+                        timeout(Duration::from_secs(5), session.update_playback(result.ok().flatten()))
                             .await
                             .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
                     }

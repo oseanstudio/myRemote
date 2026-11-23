@@ -9,6 +9,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, info};
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret};
@@ -19,15 +20,14 @@ use crate::error::{Error, Result};
 use crate::opack::{self, Value};
 use crate::pairing::PairingState;
 use crate::remote_keyboard::KeyboardSession;
+use crate::remote_media;
 use crate::srp::SrpServer;
 use crate::tlv::{self, tags};
-use crate::FrameType;
+use crate::{FrameType, PlaybackAction, PlaybackState};
 
 pub const DEVICE_MODEL: &str = "AppleTV14,1";
 pub(crate) const SOURCE_VERSION: &str = "715.2";
 const REMOTE_SERVICE: &str = "com.apple.tvremoteservices";
-pub const MEDIA_CONTROL_VOLUME: u64 = 0x0100;
-
 const SWIPE_MIN_DISTANCE: f64 = 150.0; // touchpad units; the surface is 1000x1000
 const TAP_MAX_DISTANCE: f64 = 60.0; // below this a touch sequence counts as a tap
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(350);
@@ -115,6 +115,8 @@ pub(crate) struct CompanionSession {
     remote_session_id: u32,
     keyboard_subscribed: bool,
     keyboard: Option<KeyboardSession>,
+    playback: Option<PlaybackState>,
+    next_event_id: u32,
     touch: Option<ActiveTouch>,
     last_tap: Option<Instant>,
     last_select: Option<(Instant, bool)>,
@@ -147,6 +149,8 @@ impl CompanionSession {
             remote_session_id: 0,
             keyboard_subscribed: false,
             keyboard: None,
+            playback: None,
+            next_event_id: 0x8000_0000 | rand::random::<u32>(),
             touch: None,
             last_tap: None,
             last_select: None,
@@ -258,9 +262,12 @@ impl CompanionSession {
             Value::kv("_t", Value::Int(1)),
             Value::kv("_c", content.unwrap_or(Value::dict(vec![]))),
         ];
-        if let Some(xid) = xid {
-            event.push(Value::kv("_x", Value::Int(xid)));
-        }
+        let xid = xid.unwrap_or_else(|| {
+            let id = self.next_event_id;
+            self.next_event_id = self.next_event_id.wrapping_add(1) | 0x8000_0000;
+            u64::from(id)
+        });
+        event.push(Value::kv("_x", Value::Int(xid)));
         self.send_encrypted_opack(&Value::Dict(event)).await
     }
 
@@ -569,13 +576,17 @@ impl CompanionSession {
                     0,
                 )
                 .await?;
-                self.send_media_state(xid).await?;
                 self.start_remote();
+                self.send_media_state(xid).await?;
+                if self.playback.is_some() {
+                    self.send_now_playing().await?;
+                }
             }
             Some("_sessionStop" | "_touchStop" | "HIDTouchStop") => {
                 self.clear_touch();
                 if self.current_identifier.as_deref() == Some("_sessionStop") {
                     self.keyboard_subscribed = false;
+                    self.playback = None;
                     if self.keyboard.take().is_some() {
                         self.send_event("_tiStopped", None, None).await?;
                     }
@@ -617,9 +628,11 @@ impl CompanionSession {
                     for event in events.iter().filter_map(Value::as_str) {
                         match event {
                             "MediaControlStatus" => {
-                                self.send_event(event, xid, Some(media_flags())).await?
+                                self.send_event(event, xid, Some(self.media_flags()))
+                                    .await?
                             }
-                            "NowPlayingInfo" => self.send_event(event, xid, None).await?,
+                            "_iMC" => self.send_legacy_media_flags(xid).await?,
+                            "NowPlayingInfo" => self.send_now_playing().await?,
                             "SystemStatus" | "TVSystemStatus" => {
                                 self.send_event(event, xid, Some(awake())).await?
                             }
@@ -639,9 +652,25 @@ impl CompanionSession {
             }
             Some("FetchAttentionState") => self.send_response(xid, Some(awake()), 0).await?,
             Some("FetchMediaControlStatus") => {
-                self.send_response(xid, Some(media_flags()), 0).await?
+                self.send_response(xid, Some(self.media_flags()), 0).await?
             }
-            Some("MediaControlCommand" | "_mcc") => self.handle_media_control(xid, content).await?,
+            Some("FetchCurrentNowPlayingInfoEvent") => {
+                if !is_event {
+                    self.send_response(xid, None, 0).await?;
+                }
+                self.send_media_state(None).await?;
+                self.send_now_playing().await?;
+            }
+            Some("MediaControlCommand" | "_mcc") => {
+                self.handle_media_control(xid, content, is_event).await?
+            }
+            Some("ToggleCaptions") => {
+                self.apply_playback_action(PlaybackAction::ToggleCaptions)
+                    .await;
+                if !is_event {
+                    self.send_response(xid, None, 0).await?;
+                }
+            }
             Some("_tiStart") if !is_event => {
                 self.keyboard_subscribed = true;
                 let focused = self.focused_text_field().await;
@@ -674,6 +703,44 @@ impl CompanionSession {
 
     pub(crate) fn watches_keyboard_focus(&self) -> bool {
         self.keyboard_subscribed && self.remote_started()
+    }
+
+    pub(crate) fn watches_playback(&self) -> bool {
+        self.remote_started() && (self.playback.is_some() || self.input.playback_enabled())
+    }
+
+    pub(crate) fn queue_playback_probe(&self, probes: &mut JoinSet<Option<PlaybackState>>) {
+        let input = self.input.clone();
+        probes.spawn_blocking(move || {
+            if input.playback_enabled() {
+                input.playback_state()
+            } else {
+                None
+            }
+        });
+    }
+
+    pub(crate) async fn update_playback(&mut self, next: Option<PlaybackState>) -> Result<()> {
+        let next = next.filter(|_| self.watches_playback() && self.input.playback_enabled());
+        if next != self.playback {
+            self.playback = next;
+            self.send_media_state(None).await?;
+            self.send_now_playing().await?;
+        }
+        Ok(())
+    }
+
+    async fn apply_playback_action(&mut self, action: PlaybackAction) {
+        let Some(playback) = self.playback else {
+            return;
+        };
+        let input = self.input.clone();
+        if tokio::task::spawn_blocking(move || input.playback_action(playback.source, action))
+            .await
+            .unwrap_or(false)
+        {
+            self.record_input();
+        }
     }
 
     async fn focused_text_field(&self) -> Option<u64> {
@@ -792,24 +859,49 @@ impl CompanionSession {
     }
 
     async fn send_media_state(&mut self, xid: Option<u64>) -> Result<()> {
-        let mut status = media_flags();
+        let mut status = self.media_flags();
         if let Value::Dict(entries) = &mut status {
             entries.push(Value::kv("Muted", Value::Bool(self.muted)));
         }
         self.send_event("MediaControlStatus", xid, Some(status))
             .await?;
+        self.send_legacy_media_flags(xid).await
+    }
+
+    fn media_flags(&self) -> Value {
+        Value::dict(vec![Value::kv(
+            "MediaControlFlags",
+            Value::Int(remote_media::flags(self.playback)),
+        )])
+    }
+
+    async fn send_legacy_media_flags(&mut self, xid: Option<u64>) -> Result<()> {
         self.send_event(
             "_iMC",
             xid,
             Some(Value::dict(vec![Value::kv(
                 "_mcF",
-                Value::Int(MEDIA_CONTROL_VOLUME),
+                Value::Int(remote_media::flags(self.playback)),
             )])),
         )
         .await
     }
 
-    async fn handle_media_control(&mut self, xid: Option<u64>, content: &Value) -> Result<()> {
+    async fn send_now_playing(&mut self) -> Result<()> {
+        self.send_event(
+            "NowPlayingInfo",
+            None,
+            Some(remote_media::now_playing(self.playback)),
+        )
+        .await
+    }
+
+    async fn handle_media_control(
+        &mut self,
+        xid: Option<u64>,
+        content: &Value,
+        is_event: bool,
+    ) -> Result<()> {
         let volume_key = if self.current_identifier.as_deref() == Some("MediaControlCommand") {
             "MessageKeyVolume"
         } else {
@@ -820,6 +912,15 @@ impl CompanionSession {
             .or_else(|| content.get("_mcc"))
             .and_then(Value::as_int);
         let response = match command {
+            Some(1 | 2) => {
+                let action = if command == Some(1) {
+                    PlaybackAction::Play
+                } else {
+                    PlaybackAction::Pause
+                };
+                self.apply_playback_action(action).await;
+                None
+            }
             Some(5) => {
                 let volume =
                     self.input
@@ -844,10 +945,43 @@ impl CompanionSession {
                 }
                 None
             }
-            Some(12) => Some(Value::dict(vec![Value::kv("_cse", Value::Bool(false))])),
+            Some(7) => {
+                if let Some(seconds) = content
+                    .get("_skpS")
+                    .or_else(|| content.get("MessageKeySkipSeconds"))
+                    .and_then(Value::as_float)
+                    .filter(|seconds| seconds.is_finite() && *seconds != 0.0)
+                {
+                    let action = if seconds > 0.0 {
+                        PlaybackAction::SkipForward
+                    } else {
+                        PlaybackAction::SkipBackward
+                    };
+                    self.apply_playback_action(action).await;
+                }
+                None
+            }
+            Some(12) => Some(Value::dict(vec![Value::kv(
+                "_cse",
+                Value::Bool(
+                    self.playback
+                        .and_then(|state| state.captions)
+                        .unwrap_or(false),
+                ),
+            )])),
+            Some(13) => {
+                if let Some(Value::Bool(enabled)) = content.get("_cse") {
+                    self.apply_playback_action(PlaybackAction::SetCaptions(*enabled))
+                        .await;
+                }
+                None
+            }
             _ => None,
         };
-        self.send_response(xid, response, 0).await
+        if !is_event {
+            self.send_response(xid, response, 0).await?;
+        }
+        Ok(())
     }
 
     fn record_input(&mut self) {
@@ -1101,13 +1235,6 @@ fn verification_cipher(shared: &[u8; 32]) -> Result<CompanionCipher> {
         shared,
     );
     CompanionCipher::new(&key, &key, 8)
-}
-
-fn media_flags() -> Value {
-    Value::dict(vec![Value::kv(
-        "MediaControlFlags",
-        Value::Int(MEDIA_CONTROL_VOLUME),
-    )])
 }
 
 fn awake() -> Value {

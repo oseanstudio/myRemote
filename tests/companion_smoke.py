@@ -162,13 +162,14 @@ async def exercise_tv_remote(client, expect):
     assert legacy["_c"]["_vol"] == 0.25
 
 
-class KeyboardEvents:
-    def __init__(self, client):
+class RemoteEvents:
+    def __init__(self, client, *names):
         self.events = asyncio.Queue()
+        self.names = set(names)
         client.listener = self
 
     def event_received(self, name, content):
-        if name in ("_tiStarted", "_tiStopped"):
+        if name in self.names:
             self.events.put_nowait((name, content))
 
     async def expect(self, name):
@@ -206,8 +207,8 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
             start_remote(first), start_remote(second)
         )
         assert first_session != second_session
-        first_events = KeyboardEvents(first)
-        second_events = KeyboardEvents(second)
+        first_events = RemoteEvents(first, "_tiStarted", "_tiStopped")
+        second_events = RemoteEvents(second, "_tiStarted", "_tiStopped")
         for client in (first, second):
             assert (await command(client, "_tiStart", {}))["_c"] == {}
 
@@ -336,6 +337,69 @@ async def exercise_gestures(port, credentials, second_credentials, expect):
         other.stop()
 
 
+async def exercise_media(port, credentials, expect):
+    client = protocol(port, credentials)
+
+    def now_playing_values(content):
+        archive = plistlib.loads(content["NowPlayingInfoKey"])
+        assert archive["$archiver"] == "NSKeyedArchiver"
+        objects = archive["$objects"]
+        info = objects[archive["$top"]["root"].data]
+        assert objects[info["$class"].data]["$classname"] == "TVRCNowPlayingInfo"
+        return {key: objects[info[key].data] for key in
+                ("playerIdentifier", "playbackRate", "hasValidCaptionOptions", "captionsEnabled")}
+
+    try:
+        await client.start()
+        await start_remote(client)
+        events = RemoteEvents(client, "MediaControlStatus", "_iMC", "NowPlayingInfo")
+
+        async def state(flags, expected_player, caption_options, captions_enabled):
+            assert (await events.expect("MediaControlStatus"))["MediaControlFlags"] == flags
+            assert (await events.expect("_iMC"))["_mcF"] == flags
+            info = now_playing_values(await events.expect("NowPlayingInfo"))
+            assert info["playerIdentifier"] == expected_player
+            assert info["hasValidCaptionOptions"] == caption_options
+            assert info["captionsEnabled"] == captions_enabled
+            return info
+
+        assert (await command(client, "FetchMediaControlStatus", {}))["_c"]["MediaControlFlags"] == 0x0100
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": 10.0})
+        await command(client, "HIDCommand", {"HIDCommand": 14, "HIDButtonState": 2})
+        assert expect(r"^Received (.*)$")[1] == "button play_pause"
+        assert (await state(0x0703, "myRemote.YouTube", True, False))["playbackRate"] == 1.0
+
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": float("inf")})
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": 0.0})
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": 10.0})
+        await command(client, "MediaControlCommand",
+                      {"MediaControlCommand": 7, "MessageKeySkipSeconds": -10.0})
+        assert expect(r"^Received (.*)$")[1] == "playback YouTube SkipForward"
+        assert expect(r"^Received (.*)$")[1] == "playback YouTube SkipBackward"
+        await command(client, "ToggleCaptions", {})
+        assert expect(r"^Received (.*)$")[1] == "playback YouTube ToggleCaptions"
+        await state(0x0703, "myRemote.YouTube", True, True)
+        assert (await command(client, "_mcc", {"_mcc": 12}))["_c"]["_cse"] is True
+
+        await command(client, "FetchCurrentNowPlayingInfoEvent", {})
+        await state(0x0703, "myRemote.YouTube", True, True)
+        await command(client, "HIDCommand", {"HIDCommand": 7, "HIDButtonState": 2})
+        expect(r"^Received button home$")
+        await state(0x0703, "myRemote.Jellyfin", False, "$null")
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": -10.0})
+        assert expect(r"^Received (.*)$")[1] == "playback Jellyfin SkipBackward"
+
+        await command(client, "HIDCommand", {"HIDCommand": 5, "HIDButtonState": 2})
+        expect(r"^Received button menu$")
+        await state(0x0100, "$null", "$null", "$null")
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": float("inf")})
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": -10.0})
+        await command(client, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
+        assert expect(r"^Received (.*)$")[1] == "button right"
+    finally:
+        client.stop()
+
+
 async def exercise(binary, state):
     with receiver(binary, state, "--pair") as (port, expect):
         pin = int(expect(r"Pairing code (\d{4})")[1])
@@ -419,10 +483,13 @@ async def exercise(binary, state):
     with receiver(binary, state) as (port, expect):
         await exercise_gestures(port, credentials, second_credentials, expect)
 
+    with receiver(binary, state) as (port, expect):
+        await exercise_media(port, credentials, expect)
+
 
 if __name__ == "__main__":
     executable = Path(sys.argv[1]).resolve(strict=True)
     # Resolve the executable before creating a short-lived pairing directory.
     with TemporaryDirectory(prefix="myremote-smoke-", dir=executable.parent) as directory:
         asyncio.run(exercise(executable, directory))
-    print("Companion pairing, reconnect, simultaneous controllers, keyboard, and gestures passed.")
+    print("Companion pairing, reconnect, simultaneous controllers, keyboard, gestures, and media passed.")

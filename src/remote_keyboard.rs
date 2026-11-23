@@ -1,10 +1,11 @@
 use std::io::Cursor;
 
 use plist::stream::BinaryReader;
-use plist::{Dictionary, Uid, Value};
+use plist::{Dictionary, Value};
 use rand::{rngs::OsRng, RngCore};
 
-use crate::opack;
+use crate::{keyed_archive, opack};
+use keyed_archive::{class, dictionary, uid};
 
 pub(crate) struct KeyboardSession {
     pub field: u64,
@@ -35,7 +36,7 @@ impl KeyboardSession {
             ("contextAfterInput", uid(7)),
             ("$class", uid(6)),
         ]);
-        let objects = Value::Array(vec![
+        let objects = vec![
             Value::String("$null".into()),
             dictionary([
                 ("NS.uuidbytes", Value::Data(self.id.to_vec())),
@@ -49,25 +50,17 @@ impl KeyboardSession {
             Value::String(String::new()),
             dictionary([("$class", uid(9))]),
             class("RTIDocumentTraits"),
-        ]);
+        ];
         // Describe the focus without exporting any desktop text or field metadata.
-        let archive = dictionary([
-            ("$version", Value::Integer(100000.into())),
-            ("$archiver", Value::String("RTIKeyedArchiver".into())),
-            (
-                "$top",
-                dictionary([
-                    ("sessionUUID", uid(1)),
-                    ("documentState", uid(3)),
-                    ("documentTraits", uid(8)),
-                ]),
-            ),
-            ("$objects", objects),
-        ]);
-        let mut bytes = Vec::new();
-        archive
-            .to_writer_binary(&mut bytes)
-            .expect("fixed keyboard archive is serializable");
+        let bytes = keyed_archive::encode(
+            "RTIKeyedArchiver",
+            dictionary([
+                ("sessionUUID", uid(1)),
+                ("documentState", uid(3)),
+                ("documentTraits", uid(8)),
+            ]),
+            objects,
+        );
         opack::Value::dict(vec![opack::Value::kv("_tiD", opack::Value::Bytes(bytes))])
     }
 
@@ -125,30 +118,4 @@ fn resolve<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a Value> {
         Some(reference) => objects.get(usize::try_from(reference.get()).ok()?),
         None => Some(value),
     }
-}
-
-fn uid(index: u64) -> Value {
-    Value::Uid(Uid::new(index))
-}
-
-fn dictionary<const N: usize>(entries: [(&str, Value); N]) -> Value {
-    Value::Dictionary(
-        entries
-            .into_iter()
-            .map(|(key, value)| (key.to_owned(), value))
-            .collect(),
-    )
-}
-
-fn class(name: &str) -> Value {
-    dictionary([
-        ("$classname", Value::String(name.into())),
-        (
-            "$classes",
-            Value::Array(vec![
-                Value::String(name.into()),
-                Value::String("NSObject".into()),
-            ]),
-        ),
-    ])
 }

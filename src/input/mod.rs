@@ -6,7 +6,7 @@ use std::sync::{
     Arc,
 };
 
-use myremote::RemoteInput;
+use myremote::{PlaybackAction, PlaybackState, RemoteInput, VideoSource};
 
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
@@ -31,6 +31,15 @@ pub struct Desktop {
     speed: f64,
     #[cfg(target_os = "macos")]
     media_controls: Arc<AtomicBool>,
+    #[cfg(target_os = "macos")]
+    playback: Mutex<PlaybackCache>,
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct PlaybackCache {
+    checked: Option<std::time::Instant>,
+    state: Option<PlaybackState>,
 }
 
 struct PointerState {
@@ -53,6 +62,8 @@ impl Desktop {
             speed,
             #[cfg(target_os = "macos")]
             media_controls,
+            #[cfg(target_os = "macos")]
+            playback: Mutex::new(PlaybackCache::default()),
         })
     }
 
@@ -127,6 +138,36 @@ impl RemoteInput for Desktop {
     }
 
     #[cfg(target_os = "macos")]
+    fn playback_enabled(&self) -> bool {
+        self.media_controls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn playback_state(&self) -> Option<PlaybackState> {
+        let mut playback = self.playback.lock().unwrap();
+        if playback
+            .checked
+            .is_none_or(|time| time.elapsed() >= std::time::Duration::from_millis(750))
+        {
+            playback.state = macos_media::playback_state();
+            playback.checked = Some(std::time::Instant::now());
+        }
+        playback.state
+    }
+
+    #[cfg(target_os = "macos")]
+    fn playback_action(&self, source: VideoSource, action: PlaybackAction) -> bool {
+        if !self.playback_enabled() {
+            return false;
+        }
+        let applied = macos_media::playback_action(source, action);
+        if applied {
+            self.playback.lock().unwrap().checked = None;
+        }
+        applied
+    }
+
+    #[cfg(target_os = "macos")]
     fn focused_text_field(&self) -> Option<u64> {
         platform::Desktop::focused_text_field()
     }
@@ -152,12 +193,30 @@ impl RemoteInput for Desktop {
 #[derive(Default)]
 pub struct DryRun {
     text_focus: Mutex<(u64, bool)>,
+    playback: Mutex<Option<PlaybackState>>,
 }
 
 impl RemoteInput for DryRun {
     fn button(&self, name: &str) {
         if name == "menu" {
             self.text_focus.lock().unwrap().1 = false;
+        }
+        // Media buttons also simulate entering and leaving a player in smoke tests.
+        match name {
+            "play_pause" | "home" => {
+                let source = if name == "home" {
+                    VideoSource::Jellyfin
+                } else {
+                    VideoSource::YouTube
+                };
+                *self.playback.lock().unwrap() = Some(PlaybackState {
+                    source,
+                    playing: Some(true),
+                    captions: (source == VideoSource::YouTube).then_some(false),
+                });
+            }
+            "menu" => *self.playback.lock().unwrap() = None,
+            _ => {}
         }
         println!("Received button {name}");
     }
@@ -192,6 +251,34 @@ impl RemoteInput for DryRun {
 
     fn end_drag(&self) {
         println!("Received drag end");
+    }
+
+    fn playback_enabled(&self) -> bool {
+        true
+    }
+
+    fn playback_state(&self) -> Option<PlaybackState> {
+        *self.playback.lock().unwrap()
+    }
+
+    fn playback_action(&self, source: VideoSource, action: PlaybackAction) -> bool {
+        let mut state = self.playback.lock().unwrap();
+        let Some(state) = state.as_mut().filter(|state| state.source == source) else {
+            return false;
+        };
+        match action {
+            PlaybackAction::Play => state.playing = Some(true),
+            PlaybackAction::Pause => state.playing = Some(false),
+            PlaybackAction::ToggleCaptions => {
+                state.captions = state.captions.map(|enabled| !enabled)
+            }
+            PlaybackAction::SetCaptions(enabled) => {
+                state.captions = state.captions.map(|_| enabled)
+            }
+            PlaybackAction::SkipForward | PlaybackAction::SkipBackward => {}
+        }
+        println!("Received playback {source:?} {action:?}");
+        true
     }
 
     fn focused_text_field(&self) -> Option<u64> {

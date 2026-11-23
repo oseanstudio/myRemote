@@ -62,7 +62,9 @@ Sign out and back in, then run the AppImage as your desktop user. If FUSE is una
 
 On macOS, connect in Control Center and click an editable field, including a password field in an app. myRemote signals the iPhone to show its keyboard and forwards text, including completed swipe-typed words when the iPhone offers QuickPath. This uses the same Accessibility permission as pointer control. myRemote leaves the clipboard alone, and the contents of the Mac's text field stay on the Mac.
 
-On macOS, **Foreground Media Controls** in the myRemote menu maps Play/Pause and TV to the active browser or supported media player. In the browser, Back presses an available **Skip Intro** button or sends the player's forward shortcut. In Jellyfin, set **Settings → Playback → Skip forward length** to **10 seconds**. Other players use their own shortcuts and seek lengths. Turn off **Foreground Media Controls** to restore the usual Remote button mappings.
+On macOS, **Foreground Media Controls** in the myRemote menu maps Play/Pause and TV to the active browser or supported media player. In the browser, Back presses an available **Skip Intro** button or sends the player's forward shortcut. Turn off **Foreground Media Controls** to restore the usual Remote button mappings.
+
+While a Jellyfin or YouTube video page is in the foreground, myRemote advertises the built-in Remote's skip controls and handles both directions. YouTube's shortcuts skip 10 seconds. In Jellyfin, set both **Skip forward length** and **Skip back length** to **10 seconds** in **Settings → Playback**. myRemote also reports subtitle availability when it can read the YouTube player's caption toggle.
 
 ## Configuration
 

@@ -4,6 +4,29 @@ pub enum TrackpadMode {
     Direction,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VideoSource {
+    Jellyfin,
+    YouTube,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaybackState {
+    pub source: VideoSource,
+    pub playing: Option<bool>,
+    pub captions: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlaybackAction {
+    SkipForward,
+    SkipBackward,
+    Play,
+    Pause,
+    ToggleCaptions,
+    SetCaptions(bool),
+}
+
 pub trait RemoteInput: Send + Sync + 'static {
     fn button(&self, name: &str);
     fn move_pointer(&self, dx: f64, dy: f64);
@@ -19,6 +42,16 @@ pub trait RemoteInput: Send + Sync + 'static {
         self.move_pointer(dx, dy);
     }
     fn end_drag(&self) {}
+    /// Whether to monitor the foreground player for native Remote controls.
+    fn playback_enabled(&self) -> bool {
+        false
+    }
+    fn playback_state(&self) -> Option<PlaybackState> {
+        None
+    }
+    fn playback_action(&self, _source: VideoSource, _action: PlaybackAction) -> bool {
+        false
+    }
     /// Identifies the focused text field without reading its value.
     fn focused_text_field(&self) -> Option<u64> {
         None
