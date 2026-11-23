@@ -287,6 +287,65 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         second.stop()
 
 
+async def exercise_reconnect(port, credentials, second_credentials, expect):
+    original = protocol(port, credentials)
+    replacement = protocol(port, credentials)
+    other = protocol(port, second_credentials)
+    try:
+        await original.start()
+        await other.start()
+        _, original_id = await start_remote(original)
+        await start_remote(other)
+        events = RemoteEvents(original, "_tiStarted", "_tiStopped")
+        await command(original, "_tiStart", {})
+        await command(original, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        expect(r"^Received click$")
+        field = keyboard_id(await events.expect("_tiStarted"))
+
+        await replacement.start()
+        await command(replacement, "_systemInfo", {"_clFl": 128}, FrameType.P_OPACK)
+        assert original.connection.connected
+        await command(replacement, "_tiC", {
+            "_tiV": 1,
+            "_tiD": get_rti_input_text_payload(field, "alternate connection"),
+        }, FrameType.P_OPACK)
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 20 characters)"
+
+        _, replacement_id = await start_remote(replacement)
+        assert original_id == replacement_id
+
+        async def wait_for_replacement():
+            while original.connection.connected:
+                await asyncio.sleep(0.01)
+
+        await asyncio.wait_for(wait_for_replacement(), timeout=1)
+        assert other.connection.connected
+
+        # A replaced socket's field must no longer accept edits.
+        keyboard_edit(replacement, get_rti_input_text_payload(field, "expired"))
+        new_field = keyboard_id((await command(replacement, "_tiStart", {}))["_c"])
+        assert new_field != field
+        keyboard_edit(replacement, get_rti_input_text_payload(new_field, "reconnected"))
+        await command(replacement, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 11 characters)"
+
+        replacement_events = RemoteEvents(replacement, "_tiStarted", "_tiStopped")
+        await command(replacement, "TVRCSessionStop", {})
+        await replacement_events.expect("_tiStopped")
+        await command(replacement, "TVRCSessionStart", {"ProtocolVersionKey": "1.2"})
+        reopened_field = keyboard_id(await replacement_events.expect("_tiStarted"))
+        assert reopened_field != new_field
+        keyboard_edit(replacement, get_rti_input_text_payload(reopened_field, "warm reopen"))
+        await command(replacement, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 11 characters)"
+        await command(other, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
+        expect(r"^Received button right$")
+    finally:
+        original.stop()
+        replacement.stop()
+        other.stop()
+
+
 async def exercise_gestures(port, credentials, second_credentials, expect):
     client = protocol(port, credentials)
     other = protocol(port, second_credentials)
@@ -520,6 +579,9 @@ async def exercise(binary, state):
 
     with receiver(binary, state) as (port, expect):
         await exercise_two_phones(port, credentials, second_credentials, expect)
+
+    with receiver(binary, state) as (port, expect):
+        await exercise_reconnect(port, credentials, second_credentials, expect)
 
     with receiver(binary, state) as (port, expect):
         await exercise_gestures(port, credentials, second_credentials, expect)

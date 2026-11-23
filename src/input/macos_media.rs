@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ffi::{c_char, c_void, CStr};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ptr::null;
@@ -152,40 +153,21 @@ impl BrowserVideo {
             unsafe { AXUIElementSetMessagingTimeout(system.0, 0.1) };
         }
         let pid = app.processIdentifier();
-        let mut candidate = None;
-        let window = focused_window(pid)?;
-        let page = find_element(retain(&window), |element| {
-            if !is_web_area(element) {
-                return false;
-            }
-            candidate = element
-                .attribute(c"AXURL")
-                .ok()
-                .and_then(|url| text(&url))
-                .and_then(|url| Some((video_source(&url)?, url)));
-            candidate.is_some()
+        let browser = OwnedCf::new(unsafe { AXUIElementCreateApplication(pid) })?;
+        let window = browser.attribute(c"AXFocusedWindow").ok()?;
+        let page =
+            focused_document(&browser).or_else(|| find_element(retain(&window), is_web_area))?;
+        let url =
+            attribute_text(&page, c"AXURL").or_else(|| attribute_text(&window, c"AXDocument"));
+        let jellyfin_title = [&page, &window].iter().any(|node| {
+            attribute_text(node, c"AXTitle")
+                .or_else(|| attribute_text(node, c"AXDescription"))
+                .is_some_and(|title| title.to_ascii_lowercase().contains("jellyfin"))
         });
-        let (page, source, url) = match (page, candidate) {
-            (Some(page), Some((source, url))) => (page, source, Some(url)),
-            _ => {
-                // Jellyfin can use a custom base URL or remain on an item
-                // route while its player is open. Recognize its player DOM
-                // markers in the front document as a second signal.
-                let page = find_element(window, is_web_area)?;
-                find_element(retain(&page), |e| {
-                    has_dom_class(
-                        e,
-                        &[
-                            "osdPositionSlider",
-                            "htmlvideoplayer",
-                            "videoOsdBottom-maincontrols",
-                        ],
-                    )
-                })?;
-                let url = page.attribute(c"AXURL").ok().and_then(|url| text(&url));
-                (page, VideoSource::Jellyfin, url)
-            }
-        };
+        let source = url
+            .as_deref()
+            .and_then(|url| video_source(url, jellyfin_title))
+            .or_else(|| jellyfin_player(&page, jellyfin_title).then_some(VideoSource::Jellyfin))?;
         let mut key = DefaultHasher::new();
         pid.hash(&mut key);
         url.hash(&mut key);
@@ -316,7 +298,7 @@ pub(super) fn playback_action(source: VideoSource, action: PlaybackAction) -> bo
     .unwrap_or(false)
 }
 
-fn video_source(url: &str) -> Option<VideoSource> {
+fn video_source(url: &str, jellyfin_title: bool) -> Option<VideoSource> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
@@ -341,12 +323,75 @@ fn video_source(url: &str) -> Option<VideoSource> {
         .then_some(VideoSource::YouTube);
     }
     let route = fragment.trim_start_matches(['!', '/']).split('?').next()?;
-    (path.split('/').any(|part| part == "web")
+    ((jellyfin_title || path.split('/').any(|part| part == "web"))
         && (matches!(route, "video" | "videoosd.html")
             || route.ends_with("/videoosd.html")
             || path.ends_with("/video")
             || path.ends_with("/videoosd.html")))
     .then_some(VideoSource::Jellyfin)
+}
+
+fn focused_document(app: &OwnedCf) -> Option<OwnedCf> {
+    let mut element = app.attribute(c"AXFocusedUIElement").ok()?;
+    let mut document = None;
+    for _ in 0..16 {
+        if is_web_area(&element)
+            && (document.is_none()
+                || attribute_text(&element, c"AXURL")
+                    .is_some_and(|url| url.starts_with("https://") || url.starts_with("http://")))
+        {
+            document = Some(retain(&element));
+        }
+        let Ok(parent) = element.attribute(c"AXParent") else {
+            break;
+        };
+        element = parent;
+    }
+    document
+}
+
+fn jellyfin_player(page: &OwnedCf, jellyfin_title: bool) -> bool {
+    let mut rewind = false;
+    let mut forward = false;
+    find_element(retain(page), |element| {
+        if flag(element, c"AXHidden") == Some(true) {
+            return false;
+        }
+        // Gecko exposes DOM identifiers and button labels, while WebKit and
+        // Chromium also expose the CSS classes of Jellyfin's player.
+        if element
+            .attribute(c"AXDOMIdentifier")
+            .is_ok_and(|id| id.is(c"videoOsdPage"))
+            || has_dom_class(
+                element,
+                &[
+                    "osdPositionSlider",
+                    "htmlvideoplayer",
+                    "videoOsdBottom-maincontrols",
+                ],
+            )
+        {
+            return true;
+        }
+        if element
+            .attribute(c"AXRole")
+            .is_ok_and(|role| role.is(c"AXButton"))
+        {
+            for attribute in [c"AXTitle", c"AXDescription", c"AXHelp"] {
+                let label = attribute_text(element, attribute).unwrap_or_default();
+                rewind |= label.eq_ignore_ascii_case("Rewind (J)")
+                    || jellyfin_title && label.ends_with(" (J)");
+                forward |= label.eq_ignore_ascii_case("Fast Forward (L)")
+                    || jellyfin_title && label.ends_with(" (L)");
+            }
+        }
+        rewind && forward
+    })
+    .is_some()
+}
+
+fn attribute_text(element: &OwnedCf, name: &CStr) -> Option<String> {
+    text(&element.attribute(name).ok()?)
 }
 
 fn text(value: &OwnedCf) -> Option<String> {
@@ -480,13 +525,13 @@ fn intro_button(pid: i32) -> Option<OwnedCf> {
 
 fn find_element(root: OwnedCf, mut matches: impl FnMut(&OwnedCf) -> bool) -> Option<OwnedCf> {
     let children = OwnedCf::string(c"AXChildren")?;
-    let mut pending = vec![root];
+    let mut pending = VecDeque::from([root]);
     let deadline = Instant::now() + Duration::from_millis(200);
     for _ in 0..200 {
         if Instant::now() >= deadline {
             break;
         }
-        let element = pending.pop()?;
+        let element = pending.pop_front()?;
         if matches(&element) {
             return Some(element);
         }
@@ -532,15 +577,22 @@ mod tests {
     #[test]
     fn video_detection_requires_a_player_route() {
         assert_eq!(
-            video_source("https://www.youtube.com/watch?v=demo"),
+            video_source("https://www.youtube.com/watch?v=demo", false),
             Some(VideoSource::YouTube)
         );
         assert_eq!(
-            video_source("http://example.test:8096/jellyfin/web/index.html#!/video"),
+            video_source(
+                "http://example.test:8096/jellyfin/web/index.html#!/video",
+                false
+            ),
             Some(VideoSource::Jellyfin)
         );
         assert_eq!(
-            video_source("https://video.test/web/#/video"),
+            video_source("https://video.test/web/#/video", false),
+            Some(VideoSource::Jellyfin)
+        );
+        assert_eq!(
+            video_source("https://video.test/custom/#/video", true),
             Some(VideoSource::Jellyfin)
         );
         for page in [
@@ -549,8 +601,9 @@ mod tests {
             "https://youtube.com.example.test/watch?v=demo",
             "https://youtube.com@example.test/watch?v=demo",
             "https://example.test/web/#/home",
+            "https://example.test/custom/#/video",
         ] {
-            assert_eq!(video_source(page), None, "{page}");
+            assert_eq!(video_source(page, false), None, "{page}");
         }
     }
 }

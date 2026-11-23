@@ -10,6 +10,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, info};
@@ -141,6 +142,11 @@ pub(crate) struct CompanionSession {
     setup_proved: bool,
     pending_verify: Option<PendingVerification>,
     cipher: Option<CompanionCipher>,
+    connection_number: u64,
+    accepted_at: Instant,
+    verified_at: Option<Instant>,
+    controller: Option<[u8; 32]>,
+    close_signal: Option<oneshot::Sender<()>>,
     remote: RemoteState,
     background_probe: bool,
     current_identifier: Option<String>,
@@ -166,8 +172,14 @@ impl CompanionSession {
         device_name: Arc<str>,
         mode: TrackpadMode,
         advertised_port: Option<u16>,
-    ) -> Self {
-        Self {
+    ) -> (Self, oneshot::Receiver<()>) {
+        let connection_number = pairing
+            .diagnostics
+            .connections
+            .fetch_add(1, Ordering::Relaxed)
+            + 1;
+        let (close_signal, replaced) = oneshot::channel();
+        let session = Self {
             writer,
             input,
             signing_key: SigningKey::from_bytes(&pairing.private_key),
@@ -179,6 +191,11 @@ impl CompanionSession {
             setup_proved: false,
             pending_verify: None,
             cipher: None,
+            connection_number,
+            accepted_at: Instant::now(),
+            verified_at: None,
+            controller: None,
+            close_signal: Some(close_signal),
             remote: RemoteState::Waiting,
             background_probe: false,
             current_identifier: None,
@@ -194,7 +211,8 @@ impl CompanionSession {
             suppress_select_until: None,
             volume: 0.5,
             muted: false,
-        }
+        };
+        (session, replaced)
     }
 
     pub(crate) fn is_verified(&self) -> bool {
@@ -213,13 +231,26 @@ impl CompanionSession {
             RemoteState::Connected | RemoteState::ReceivingInput => Some(Duration::from_secs(3600)),
             // A paired phone may reopen Remote on the same authenticated connection.
             RemoteState::Closed => Some(Duration::from_secs(3600)),
-            RemoteState::Waiting if self.is_verified() => Some(Duration::from_secs(10 * 60)),
+            RemoteState::Waiting if self.watches_keyboard_focus() => {
+                Some(Duration::from_secs(3600))
+            }
+            RemoteState::Waiting if self.is_verified() => Some(Duration::from_secs(60)),
             RemoteState::Waiting if self.setup.is_none() => Some(Duration::from_secs(15)),
             RemoteState::Waiting => None,
         }
     }
 
     pub(crate) fn report_disconnect(&self, error: &Error) {
+        let diagnostics = &self.pairing.diagnostics;
+        match error {
+            Error::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                diagnostics.read_timeouts.fetch_add(1, Ordering::Relaxed);
+            }
+            Error::Io(_) => {}
+            _ => {
+                diagnostics.protocol_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         if !self.is_verified() || self.background_probe && self.remote == RemoteState::Waiting {
             return;
         }
@@ -323,10 +354,17 @@ impl CompanionSession {
             }
             let payload = cipher.decrypt(payload, Some(header), None)?;
             // Non-control frames still use a nonce on the encrypted transport.
-            if frame == Some(FrameType::EOpack) {
+            if matches!(
+                frame,
+                Some(FrameType::UOpack | FrameType::EOpack | FrameType::POpack)
+            ) {
                 match opack::unpack(&payload) {
                     Ok((message, _)) => self.handle_control(&message).await?,
                     Err(error) => {
+                        self.pairing
+                            .diagnostics
+                            .protocol_errors
+                            .fetch_add(1, Ordering::Relaxed);
                         debug!("Skipping undecodable encrypted Companion message: {error}")
                     }
                 }
@@ -551,6 +589,10 @@ impl CompanionSession {
         });
         if verified.is_err() {
             self.pairing
+                .diagnostics
+                .verification_rejections
+                .fetch_add(1, Ordering::Relaxed);
+            self.pairing
                 .set_connection_status("iPhone credentials were rejected · pair again");
             return self
                 .auth_reply(
@@ -573,6 +615,10 @@ impl CompanionSession {
             &hkdf_expand("", "ClientEncrypt-main", &pending.shared),
             12,
         )?);
+        self.controller = Some(session_id.into());
+        self.verified_at = Some(Instant::now());
+        *self.pairing.diagnostics.last_verify_ms.lock().unwrap() =
+            Some(self.accepted_at.elapsed().as_millis());
         self.pairing
             .diagnostics
             .verified_connections
@@ -583,17 +629,28 @@ impl CompanionSession {
     }
 
     async fn handle_control(&mut self, data: &Value) -> Result<()> {
+        let is_event = match data.get("_t").and_then(Value::as_int) {
+            Some(1) => true,
+            Some(2) => false,
+            _ => return Ok(()),
+        };
         self.current_identifier = data
             .get("_i")
             .and_then(Value::as_str)
             .or_else(|| data.get("model").and_then(Value::as_str))
             .map(str::to_owned);
         let xid = data.get("_x").and_then(Value::as_int);
-        let is_event = data.get("_t").and_then(Value::as_int) == Some(1);
         let content = data.get("_c").unwrap_or(&Value::Null);
 
         match self.current_identifier.as_deref() {
             Some("_sessionStart") => {
+                if content
+                    .get("_srvT")
+                    .is_none_or(|service| service.as_str() == Some(REMOTE_SERVICE))
+                {
+                    self.claim_remote()?;
+                    self.start_remote();
+                }
                 self.send_response(
                     xid,
                     Some(Value::dict(vec![Value::kv(
@@ -603,9 +660,10 @@ impl CompanionSession {
                     0,
                 )
                 .await?;
-                self.start_remote();
             }
             Some("TVRCSessionStart") => {
+                self.claim_remote()?;
+                self.start_remote();
                 let version = content
                     .get("ProtocolVersionKey")
                     .and_then(Value::as_str)
@@ -619,8 +677,7 @@ impl CompanionSession {
                     0,
                 )
                 .await?;
-                self.start_remote();
-                self.send_media_state(xid).await?;
+                self.send_media_state(None).await?;
                 if self.playback.is_some() {
                     self.send_now_playing().await?;
                 }
@@ -631,10 +688,15 @@ impl CompanionSession {
                     self.current_identifier.as_deref(),
                     Some("_sessionStop" | "TVRCSessionStop")
                 ) {
-                    self.keyboard_subscribed = false;
+                    // Closing the TVRC UI leaves the Rapport RTI subscription
+                    // available when the same verified connection reopens.
+                    if self.current_identifier.as_deref() == Some("_sessionStop") {
+                        self.keyboard_subscribed = false;
+                    }
                     self.playback = None;
                     self.seek_hold = None;
-                    if self.keyboard.take().is_some() {
+                    if self.keyboard.is_some() {
+                        self.update_keyboard(None);
                         self.send_event("_tiStopped", None, None).await?;
                     }
                     self.stop_remote();
@@ -659,12 +721,14 @@ impl CompanionSession {
                 .await?;
             }
             Some("_hidC" | "HIDCommand") => {
+                self.claim_remote()?;
                 if !is_event {
                     self.send_response(xid, None, 0).await?;
                 }
                 self.handle_hid_command(content, xid).await?;
             }
             Some("_hidT" | "HIDTouch") => {
+                self.claim_remote()?;
                 let modern = self.current_identifier.as_deref() == Some("HIDTouch");
                 self.handle_touch(content, modern);
                 if !is_event {
@@ -676,13 +740,13 @@ impl CompanionSession {
                     for event in events.iter().filter_map(Value::as_str) {
                         match event {
                             "MediaControlStatus" => {
-                                self.send_event(event, xid, Some(self.media_flags()))
+                                self.send_event(event, None, Some(self.media_flags()))
                                     .await?
                             }
-                            "_iMC" => self.send_legacy_media_flags(xid).await?,
+                            "_iMC" => self.send_legacy_media_flags(None).await?,
                             "NowPlayingInfo" => self.send_now_playing().await?,
                             "SystemStatus" | "TVSystemStatus" => {
-                                self.send_event(event, xid, Some(awake())).await?
+                                self.send_event(event, None, Some(awake())).await?
                             }
                             _ => {}
                         }
@@ -719,21 +783,44 @@ impl CompanionSession {
                     self.send_response(xid, None, 0).await?;
                 }
             }
-            Some("_tiStart") if !is_event => {
+            Some("_tiStart") => {
+                self.pairing
+                    .diagnostics
+                    .keyboard_subscriptions
+                    .fetch_add(1, Ordering::Relaxed);
                 self.keyboard_subscribed = true;
-                let focused = self.focused_text_field().await;
-                self.update_keyboard(focused);
-                self.focus_missing = false;
-                let payload = self.keyboard.as_ref().map(KeyboardSession::focus_payload);
-                self.send_response(xid, payload, 0).await?;
+                if !is_event {
+                    if let Ok(focused) =
+                        tokio::time::timeout(Duration::from_millis(100), self.focused_text_field())
+                            .await
+                    {
+                        self.update_keyboard(focused);
+                        self.focus_missing = false;
+                    }
+                    let payload = self.keyboard.as_ref().map(KeyboardSession::focus_payload);
+                    if payload.is_some() {
+                        self.pairing
+                            .diagnostics
+                            .keyboard_focuses
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.send_response(xid, payload, 0).await?;
+                }
             }
-            Some("_tiStop") if !is_event => {
+            Some("_tiStop") => {
                 self.keyboard_subscribed = false;
-                self.keyboard = None;
-                self.send_response(xid, None, 0).await?;
+                self.update_keyboard(None);
+                if !is_event {
+                    self.send_response(xid, None, 0).await?;
+                }
             }
-            Some("_tiC") if is_event || data.get("_t").and_then(Value::as_int) == Some(2) => {
-                self.type_text(content).await;
+            Some("_tiC") => {
+                self.type_text(if matches!(content, Value::Null) {
+                    data
+                } else {
+                    content
+                })
+                .await;
                 if !is_event {
                     self.send_response(xid, None, 0).await?;
                 }
@@ -756,7 +843,7 @@ impl CompanionSession {
     }
 
     pub(crate) fn watches_keyboard_focus(&self) -> bool {
-        self.keyboard_subscribed && self.remote_started()
+        self.keyboard_subscribed && self.remote != RemoteState::Closed
     }
 
     pub(crate) fn watches_playback(&self) -> bool {
@@ -786,12 +873,14 @@ impl CompanionSession {
                 Some(VideoSource::YouTube) => 2,
                 None => 0,
             };
-            self.pairing
-                .diagnostics
-                .player
-                .store(player, Ordering::Relaxed);
             self.send_media_state(None).await?;
             self.send_now_playing().await?;
+            if player != 0 {
+                self.pairing
+                    .diagnostics
+                    .player
+                    .store(player, Ordering::Relaxed);
+            }
         }
         Ok(())
     }
@@ -842,7 +931,17 @@ impl CompanionSession {
 
     fn update_keyboard(&mut self, focus: Option<u64>) {
         if self.keyboard.as_ref().map(|keyboard| keyboard.field) != focus {
+            let controller = self
+                .controller
+                .expect("keyboard is only available after verification");
+            let mut fields = self.pairing.keyboard_fields.lock().unwrap();
+            if let Some(old) = self.keyboard.take() {
+                fields.remove(&(controller, old.id));
+            }
             self.keyboard = focus.map(KeyboardSession::new);
+            if let Some(keyboard) = &self.keyboard {
+                fields.insert((controller, keyboard.id), keyboard.field);
+            }
         }
     }
 
@@ -870,6 +969,10 @@ impl CompanionSession {
             if let Some(keyboard) = &self.keyboard {
                 let payload = keyboard.focus_payload();
                 self.send_event("_tiStarted", None, Some(payload)).await?;
+                self.pairing
+                    .diagnostics
+                    .keyboard_focuses
+                    .fetch_add(1, Ordering::Relaxed);
             }
         }
         Ok(())
@@ -880,23 +983,39 @@ impl CompanionSession {
         diagnostics
             .keyboard_messages
             .fetch_add(1, Ordering::Relaxed);
-        let Some(keyboard) = &self.keyboard else {
+        let Some(edit) = KeyboardSession::text_edit(content) else {
             return;
         };
-        let Some(edit) = keyboard.text_edit(content) else {
-            return;
-        };
-        diagnostics.keyboard_edits.fetch_add(1, Ordering::Relaxed);
+        let controller = self
+            .controller
+            .expect("keyboard is only available after verification");
+        // Rapport can carry text input on a separate connection verified with
+        // the same pairing. The phone must still present the offered field UUID.
+        let pairing = self.pairing.clone();
         let input = self.input.clone();
-        let field = keyboard.field;
         let applied = tokio::task::spawn_blocking(move || {
+            let field = pairing
+                .keyboard_fields
+                .lock()
+                .unwrap()
+                .get(&(controller, edit.target))
+                .copied();
+            let Some(field) = field else {
+                return false;
+            };
+            pairing
+                .diagnostics
+                .keyboard_edits
+                .fetch_add(1, Ordering::Relaxed);
             input.type_text(field, edit.backspaces, edit.deletes, &edit.text)
         })
         .await
         .unwrap_or(false);
         if applied {
             diagnostics.keyboard_posted.fetch_add(1, Ordering::Relaxed);
-            self.record_input();
+            if self.remote_started() {
+                self.record_input();
+            }
         }
     }
 
@@ -940,6 +1059,12 @@ impl CompanionSession {
             return Ok(());
         };
         self.record_input();
+        if button == "menu" {
+            self.pairing
+                .diagnostics
+                .back_presses
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if button == "select" {
             if self.mode == TrackpadMode::Direction || self.touch.is_none() {
                 self.select(
@@ -1077,6 +1202,10 @@ impl CompanionSession {
                     .and_then(Value::as_float)
                     .filter(|seconds| seconds.is_finite() && *seconds != 0.0)
                 {
+                    self.pairing
+                        .diagnostics
+                        .native_skips
+                        .fetch_add(1, Ordering::Relaxed);
                     let action = if seconds > 0.0 {
                         PlaybackAction::SkipForward
                     } else {
@@ -1136,8 +1265,35 @@ impl CompanionSession {
         }
     }
 
+    fn claim_remote(&mut self) -> Result<()> {
+        if self.close_signal.is_some() {
+            let controller = self.controller.expect("encrypted connection was verified");
+            if !self.pairing.claim_remote(
+                controller,
+                self.connection_number,
+                &mut self.close_signal,
+            ) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionAborted,
+                    "a newer Remote session is active",
+                )
+                .into());
+            }
+        }
+        Ok(())
+    }
+
     fn start_remote(&mut self) {
         if !self.remote_started() {
+            if let Some(verified_at) = self.verified_at.take() {
+                *self.pairing.diagnostics.last_open_ms.lock().unwrap() =
+                    Some(verified_at.elapsed().as_millis());
+            } else {
+                self.pairing
+                    .diagnostics
+                    .warm_reopens
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             self.pairing.remote_started();
             self.remote = RemoteState::Connected;
         }
@@ -1378,6 +1534,13 @@ impl Drop for CompanionSession {
     fn drop(&mut self) {
         self.clear_touch();
         self.stop_remote();
+        self.update_keyboard(None);
+        if self.close_signal.is_none() {
+            if let Some(controller) = self.controller {
+                self.pairing
+                    .release_remote(controller, self.connection_number);
+            }
+        }
     }
 }
 

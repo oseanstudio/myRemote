@@ -1,5 +1,6 @@
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -178,8 +179,8 @@ impl Receiver {
         ];
         let records = discovery_records(&name, &pairing, ports);
         let listeners = vec![
-            tokio::spawn(discovery_endpoint(mrp, false)),
-            tokio::spawn(discovery_endpoint(airplay, true)),
+            tokio::spawn(discovery_endpoint(mrp, false, pairing.clone())),
+            tokio::spawn(discovery_endpoint(airplay, true, pairing.clone())),
             tokio::spawn(companion_endpoint(
                 companion,
                 (!fixed_ports).then_some(ports[1]),
@@ -363,12 +364,18 @@ async fn relay_endpoint(listener: TcpListener, destination: SocketAddr) {
     }
 }
 
-async fn discovery_endpoint(listener: TcpListener, airplay: bool) {
+async fn discovery_endpoint(listener: TcpListener, airplay: bool, pairing: Arc<PairingState>) {
     let mut clients = JoinSet::new();
     loop {
         tokio::select! {
             Some(_) = clients.join_next(), if !clients.is_empty() => {}
             Ok((mut stream, _)) = listener.accept(), if clients.len() < MAX_CONNECTIONS => {
+                let counter = if airplay {
+                    &pairing.diagnostics.airplay_probes
+                } else {
+                    &pairing.diagnostics.media_probes
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
                 clients.spawn(async move {
                     if !airplay {
                         // Keep the discovery connection open while it is active.
@@ -427,13 +434,18 @@ async fn run_session(
     // Keep verified sockets usable across idle periods while letting the OS
     // reclaim dead connections when an iPhone changes networks.
     let keepalive = TcpKeepalive::new()
-        .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(10));
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(3));
     let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
     let (reader, writer) = stream.into_split();
     let mut reader = BufReader::with_capacity(16 * 1024, reader);
-    let mut session = CompanionSession::new(writer, input, pairing, name, mode, advertised_port);
-    let result = read_session(&mut reader, &mut session).await;
+    let (mut session, replaced) =
+        CompanionSession::new(writer, input, pairing, name, mode, advertised_port);
+    let result = tokio::select! {
+        biased;
+        _ = replaced => Ok(()),
+        result = read_session(&mut reader, &mut session) => result,
+    };
     if let Err(error) = &result {
         session.report_disconnect(error);
     }

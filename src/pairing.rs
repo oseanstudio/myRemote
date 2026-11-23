@@ -1,13 +1,15 @@
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::VerifyingKey;
 use rand::{rngs::OsRng, Rng, RngCore};
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::{Error, Result};
@@ -38,17 +40,40 @@ pub struct PairingState {
     pub(crate) identifier: String,
     pub(crate) mac: [u8; 6],
     pairing: Mutex<Pairing>,
+    remotes: Mutex<HashMap<[u8; 32], ActiveConnection>>,
+    pub(crate) keyboard_fields: Mutex<KeyboardFields>,
     pub(crate) diagnostics: Diagnostics,
 }
 
+struct ActiveConnection {
+    number: u64,
+    close: oneshot::Sender<()>,
+}
+
+type KeyboardFields = HashMap<([u8; 32], [u8; 16]), u64>;
+
 #[derive(Default)]
 pub(crate) struct Diagnostics {
+    pub connections: AtomicU64,
     pub verified_connections: AtomicU32,
+    pub verification_rejections: AtomicU32,
+    pub replaced_connections: AtomicU32,
+    pub warm_reopens: AtomicU32,
+    pub protocol_errors: AtomicU32,
+    pub read_timeouts: AtomicU32,
+    pub media_probes: AtomicU32,
+    pub airplay_probes: AtomicU32,
+    pub(crate) last_verify_ms: Mutex<Option<u128>>,
+    pub(crate) last_open_ms: Mutex<Option<u128>>,
     pub double_clicks: AtomicU32,
+    pub keyboard_subscriptions: AtomicU32,
+    pub keyboard_focuses: AtomicU32,
     pub keyboard_messages: AtomicU32,
     pub keyboard_edits: AtomicU32,
     pub keyboard_posted: AtomicU32,
     pub player: AtomicU8,
+    pub native_skips: AtomicU32,
+    pub back_presses: AtomicU32,
 }
 
 impl PairingState {
@@ -97,6 +122,8 @@ impl PairingState {
                 connected_remotes: 0,
                 remotes_with_input: 0,
             }),
+            remotes: Mutex::default(),
+            keyboard_fields: Mutex::default(),
             diagnostics: Diagnostics::default(),
         })
     }
@@ -109,14 +136,68 @@ impl PairingState {
             2 => "YouTube",
             _ => "None",
         };
+        let timing = |value: &Mutex<Option<u128>>| {
+            value
+                .lock()
+                .unwrap()
+                .map_or_else(|| "—".to_owned(), |ms| format!("{ms} ms"))
+        };
         format!(
-            "Verified connections: {}\nDouble-click events sent: {}\nKeyboard messages received: {}\nKeyboard edits decoded: {}\nKeyboard edits posted: {}\nLast player advertised: {player}",
+            "Companion sockets / verified: {} / {}\nStale sockets replaced / warm reopens: {} / {}\nLast socket → verified: {}\nLast verified → first Remote ready: {}\nVerify rejects / timeouts / protocol errors: {} / {} / {}\nMedia Remote / AirPlay probes: {} / {}\nKeyboard requests / fields offered: {} / {}\nKeyboard messages / decoded / posted: {} / {} / {}\nLast player advertised: {player}\nNative skip commands / Back presses: {} / {}\nDouble-click events sent: {}",
+            counters.connections.load(Ordering::Relaxed),
             read(&counters.verified_connections),
-            read(&counters.double_clicks),
+            read(&counters.replaced_connections),
+            read(&counters.warm_reopens),
+            timing(&counters.last_verify_ms),
+            timing(&counters.last_open_ms),
+            read(&counters.verification_rejections),
+            read(&counters.read_timeouts),
+            read(&counters.protocol_errors),
+            read(&counters.media_probes),
+            read(&counters.airplay_probes),
+            read(&counters.keyboard_subscriptions),
+            read(&counters.keyboard_focuses),
             read(&counters.keyboard_messages),
             read(&counters.keyboard_edits),
             read(&counters.keyboard_posted),
+            read(&counters.native_skips),
+            read(&counters.back_presses),
+            read(&counters.double_clicks),
         )
+    }
+
+    pub(crate) fn claim_remote(
+        &self,
+        controller: [u8; 32],
+        number: u64,
+        close: &mut Option<oneshot::Sender<()>>,
+    ) -> bool {
+        let mut remotes = self.remotes.lock().unwrap();
+        if let Some(active) = remotes.get(&controller) {
+            if active.number >= number {
+                return active.number == number;
+            }
+        }
+        let Some(close) = close.take() else {
+            return false;
+        };
+        if let Some(previous) = remotes.insert(controller, ActiveConnection { number, close }) {
+            self.diagnostics
+                .replaced_connections
+                .fetch_add(1, Ordering::Relaxed);
+            let _ = previous.close.send(());
+        }
+        true
+    }
+
+    pub(crate) fn release_remote(&self, controller: [u8; 32], number: u64) {
+        let mut remotes = self.remotes.lock().unwrap();
+        if remotes
+            .get(&controller)
+            .is_some_and(|active| active.number == number)
+        {
+            remotes.remove(&controller);
+        }
     }
 
     pub fn enable_pairing_on_request(&self) {

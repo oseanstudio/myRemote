@@ -9,10 +9,11 @@ use keyed_archive::{class, dictionary, uid};
 
 pub(crate) struct KeyboardSession {
     pub field: u64,
-    id: [u8; 16],
+    pub id: [u8; 16],
 }
 
 pub(crate) struct TextEdit {
+    pub target: [u8; 16],
     pub backspaces: u8,
     pub deletes: u8,
     pub text: String,
@@ -64,7 +65,7 @@ impl KeyboardSession {
         opack::Value::dict(vec![opack::Value::kv("_tiD", opack::Value::Bytes(bytes))])
     }
 
-    pub fn text_edit(&self, data: &opack::Value) -> Option<TextEdit> {
+    pub fn text_edit(data: &opack::Value) -> Option<TextEdit> {
         let bytes = data.get("_tiD")?.as_bytes()?;
         if bytes.len() > 16 * 1024
             || data
@@ -91,14 +92,10 @@ impl KeyboardSession {
             Value::Dictionary(uuid) => resolve(objects, uuid.get("NS.uuidbytes")?)?,
             value => value,
         };
-        let matches_session = uuid.as_data().is_some_and(|bytes| bytes == self.id)
-            || uuid
-                .as_string()
-                .and_then(|text| uuid::Uuid::parse_str(text).ok())
-                .is_some_and(|uuid| uuid.as_bytes() == &self.id);
-        if !matches_session {
-            return None;
-        }
+        let target = uuid
+            .as_data()
+            .and_then(|bytes| bytes.try_into().ok())
+            .or_else(|| Some(*uuid::Uuid::parse_str(uuid.as_string()?).ok()?.as_bytes()))?;
         let output = operations
             .get("keyboardOutput")
             .and_then(|value| resolve(objects, value))
@@ -121,6 +118,7 @@ impl KeyboardSession {
             return None;
         }
         Some(TextEdit {
+            target,
             backspaces,
             deletes,
             text: text.to_owned(),
