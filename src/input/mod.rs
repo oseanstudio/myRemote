@@ -46,6 +46,7 @@ struct PlaybackCache {
 
 struct PointerState {
     device: platform::Desktop,
+    #[cfg(not(target_os = "macos"))]
     remainder: (f64, f64),
     dragging: bool,
 }
@@ -58,6 +59,7 @@ impl Desktop {
         Ok(Self {
             state: Mutex::new(PointerState {
                 device: platform::Desktop::open()?,
+                #[cfg(not(target_os = "macos"))]
                 remainder: (0.0, 0.0),
                 dragging: false,
             }),
@@ -76,12 +78,20 @@ impl Desktop {
         if state.dragging != dragging {
             return;
         }
-        let x = state.remainder.0 + dx * self.speed;
-        let y = state.remainder.1 + dy * self.speed;
-        let (dx, dy) = (x.trunc() as i32, y.trunc() as i32);
-        state.remainder = (x.fract(), y.fract());
-        if dx != 0 || dy != 0 {
+        let (dx, dy) = (dx * self.speed, dy * self.speed);
+        #[cfg(target_os = "macos")]
+        if dx != 0.0 || dy != 0.0 {
             state.device.move_pointer(dx, dy, dragging);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let x = state.remainder.0 + dx;
+            let y = state.remainder.1 + dy;
+            let (dx, dy) = (x.trunc() as i32, y.trunc() as i32);
+            state.remainder = (x.fract(), y.fract());
+            if dx != 0 || dy != 0 {
+                state.device.move_pointer(dx, dy, dragging);
+            }
         }
     }
 }

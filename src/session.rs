@@ -815,12 +815,7 @@ impl CompanionSession {
                 }
             }
             Some("_tiC") => {
-                self.type_text(if matches!(content, Value::Null) {
-                    data
-                } else {
-                    content
-                })
-                .await;
+                self.type_text(content, data).await;
                 if !is_event {
                     self.send_response(xid, None, 0).await?;
                 }
@@ -978,14 +973,23 @@ impl CompanionSession {
         Ok(())
     }
 
-    async fn type_text(&mut self, content: &Value) {
+    async fn type_text(&mut self, content: &Value, message: &Value) {
         let diagnostics = &self.pairing.diagnostics;
         diagnostics
             .keyboard_messages
             .fetch_add(1, Ordering::Relaxed);
-        let Some(edit) = KeyboardSession::text_edit(content) else {
-            return;
+        *diagnostics.keyboard_version.lock().unwrap() = content
+            .get("_tiV")
+            .or_else(|| message.get("_tiV"))
+            .and_then(Value::as_int);
+        let edit = match KeyboardSession::text_edit(content, message) {
+            Ok(edit) => edit,
+            Err(error) => {
+                diagnostics.keyboard_failures[error as usize].fetch_add(1, Ordering::Relaxed);
+                return;
+            }
         };
+        diagnostics.keyboard_edits.fetch_add(1, Ordering::Relaxed);
         let controller = self
             .controller
             .expect("keyboard is only available after verification");
@@ -1005,7 +1009,7 @@ impl CompanionSession {
             };
             pairing
                 .diagnostics
-                .keyboard_edits
+                .keyboard_matched
                 .fetch_add(1, Ordering::Relaxed);
             input.type_text(field, edit.backspaces, edit.deletes, &edit.text)
         })

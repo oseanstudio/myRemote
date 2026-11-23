@@ -78,19 +78,13 @@ impl Player {
     fn shortcut(self, action: &str) -> Option<(u16, u64)> {
         const CMD: u64 = 1 << 20;
         const CTRL: u64 = 1 << 18;
-        const SHIFT: u64 = 1 << 17;
         const SPACE: u16 = 49;
         const F: u16 = 3;
-        const L: u16 = 37;
-        const RIGHT: u16 = 124;
         Some(match (action, self) {
             ("play_pause", _) => (SPACE, 0),
             ("home", Self::QuickTime) => (F, CMD),
             ("home", Self::AppleTv) => (F, CTRL | CMD),
             ("home", _) => (F, 0),
-            ("menu", Self::Browser) => (L, 0),
-            ("menu", Self::Mpv | Self::AppleTv) => (RIGHT, 0),
-            ("menu", Self::Vlc) => (RIGHT, SHIFT),
             _ => return None,
         })
     }
@@ -107,20 +101,22 @@ pub(super) fn handle(action: &str) -> bool {
             .bundleIdentifier()
             .and_then(|bundle| Player::identify(&bundle.to_string()))
             .or_else(|| BrowserVideo::from_app(app.clone()).map(|_| Player::Browser))?;
-        let (key, flags) = player.shortcut(action)?;
         if Desktop::focused_text_field().is_some() {
             // A browser search box should keep its normal Escape behavior.
             return Some(action != "menu");
         }
         let pid = app.processIdentifier();
-        if action == "menu" && player == Player::Browser {
-            if let Some(button) = intro_button(pid) {
-                let press = OwnedCf::string(c"AXPress")?;
-                if app.isActive() && unsafe { AXUIElementPerformAction(button.0, press.0) } == 0 {
-                    return Some(true);
-                }
+        if action == "menu" {
+            if player != Player::Browser {
+                return None;
             }
+            let button = intro_button(pid)?;
+            let press = OwnedCf::string(c"AXPress")?;
+            return Some(
+                app.isActive() && unsafe { AXUIElementPerformAction(button.0, press.0) } == 0,
+            );
         }
+        let (key, flags) = player.shortcut(action)?;
         if app.isActive() {
             post_key(key, flags, &[]);
         }
@@ -559,7 +555,7 @@ mod tests {
         let browser = Player::identify("com.apple.Safari").unwrap();
         assert_eq!(browser.shortcut("play_pause"), Some((49, 0)));
         assert_eq!(browser.shortcut("home"), Some((3, 0)));
-        assert_eq!(browser.shortcut("menu"), Some((37, 0)));
+        assert_eq!(browser.shortcut("menu"), None);
         assert!(Player::identify("com.spotify.client").is_none());
         assert!(
             Player::identify("app.zen-browser.zen").is_some_and(|player| player == Player::Browser)

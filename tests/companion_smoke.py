@@ -257,6 +257,28 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         })
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
 
+        # A wrapped archive can carry the field UUID alongside the operations
+        # and an NSDictionary with a boxed deletion count and attributed commit.
+        wrapper = len(payload["$objects"])
+        payload["$objects"].append({
+            "textOperations": payload["$top"]["textOperations"],
+            "sessionUUID": operations.pop("targetSessionUUID"),
+        })
+        payload["$top"] = {"inputOperation": plistlib.UID(wrapper)}
+        text_value = keyboard_output["textToCommit"]
+        box = len(payload["$objects"])
+        payload["$objects"].extend([{"NS.intval": 6}, {"NSString": text_value}])
+        keyboard_output.clear()
+        keyboard_output.update({
+            "NS.keys": ["deletionCount", "textToCommit"],
+            "NS.objects": [plistlib.UID(box), plistlib.UID(box + 1)],
+        })
+        await command(second, "_tiC", {
+            "_tiV": 2,
+            "_tiD": plistlib.dumps(payload, fmt=plistlib.FMT_BINARY),
+        })
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (6 backspaces, 0 deletes, 6 characters)"
+
         await command(first, "_sessionStop", {"_sid": (first_session << 32) | 456})
         await first_events.expect("_tiStopped")
         keyboard_edit(first, get_rti_input_text_payload(first_id, "closed"))

@@ -19,6 +19,16 @@ pub(crate) struct TextEdit {
     pub text: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum KeyboardEditError {
+    Envelope = 0,
+    Archive,
+    Operation,
+    Target,
+    Output,
+    NoEdit,
+}
+
 impl KeyboardSession {
     pub fn new(field: u64) -> Self {
         let mut id = [0; 16];
@@ -65,59 +75,111 @@ impl KeyboardSession {
         opack::Value::dict(vec![opack::Value::kv("_tiD", opack::Value::Bytes(bytes))])
     }
 
-    pub fn text_edit(data: &opack::Value) -> Option<TextEdit> {
-        let bytes = data.get("_tiD")?.as_bytes()?;
-        if bytes.len() > 16 * 1024
-            || data
-                .get("_tiV")
-                .is_some_and(|version| version.as_int() != Some(1))
-        {
-            return None;
+    pub fn text_edit(
+        content: &opack::Value,
+        message: &opack::Value,
+    ) -> Result<TextEdit, KeyboardEditError> {
+        use KeyboardEditError::*;
+
+        // The authenticated message identifier and recognized archive
+        // structure identify the operation across RTI version numbers.
+        let bytes = content
+            .get("_tiD")
+            .or_else(|| message.get("_tiD"))
+            .unwrap_or(content)
+            .as_bytes()
+            .ok_or(Envelope)?;
+        if bytes.len() > 48 * 1024 || !bytes.starts_with(b"bplist00") {
+            return Err(Archive);
         }
         // Bound the expanded event stream as binary-plist references can reuse
         // objects many times. Decode data only, with no Objective-C unarchiving.
-        let archive = Value::from_events(BinaryReader::new(Cursor::new(bytes)).take(512))
-            .inspect_err(|_| tracing::debug!("Ignoring an invalid keyboard archive"))
-            .ok()?;
-        let root = archive.as_dictionary()?;
-        let objects = root.get("$objects")?.as_array()?;
-        let top = root.get("$top")?.as_dictionary()?;
-        let operations = resolve(
-            objects,
-            top.get("textOperations").or_else(|| top.get("root"))?,
-        )?
-        .as_dictionary()?;
-        let target = resolve(objects, operations.get("targetSessionUUID")?)?;
-        let uuid = match target {
-            Value::Dictionary(uuid) => resolve(objects, uuid.get("NS.uuidbytes")?)?,
-            value => value,
-        };
-        let target = uuid
+        let archive = Value::from_events(BinaryReader::new(Cursor::new(bytes)).take(4096))
+            .map_err(|_| Archive)?;
+        let root = archive.as_dictionary().ok_or(Archive)?;
+        let objects = root
+            .get("$objects")
+            .and_then(Value::as_array)
+            .ok_or(Archive)?;
+        let top = root
+            .get("$top")
+            .and_then(Value::as_dictionary)
+            .ok_or(Archive)?;
+        let root = ["textOperations", "inputOperation", "root"]
+            .into_iter()
+            .find_map(|key| property(objects, top, key).and_then(Value::as_dictionary))
+            .or_else(|| {
+                top.values().find_map(|value| {
+                    let dict = resolve(objects, value)?.as_dictionary()?;
+                    let class = property(objects, dict, "$class")?.as_dictionary()?;
+                    matches!(
+                        class.get("$classname")?.as_string()?,
+                        "RTITextOperations" | "RTIInputOperation"
+                    )
+                    .then_some(dict)
+                })
+            })
+            .ok_or(Operation)?;
+        let operations = property(objects, root, "textOperations")
+            .and_then(Value::as_dictionary)
+            .unwrap_or(root);
+        let target_reference = [operations, root, top]
+            .into_iter()
+            .find_map(|dict| {
+                property(objects, dict, "targetSessionUUID")
+                    .or_else(|| property(objects, dict, "sessionUUID"))
+            })
+            .ok_or(Target)?;
+        let target_value = target_reference
+            .as_dictionary()
+            .and_then(|dict| property(objects, dict, "NS.uuidbytes"))
+            .unwrap_or(target_reference);
+        let target = target_value
             .as_data()
             .and_then(|bytes| bytes.try_into().ok())
-            .or_else(|| Some(*uuid::Uuid::parse_str(uuid.as_string()?).ok()?.as_bytes()))?;
-        let output = operations
-            .get("keyboardOutput")
-            .and_then(|value| resolve(objects, value))
-            .and_then(Value::as_dictionary);
+            .or_else(|| {
+                Some(
+                    *uuid::Uuid::parse_str(target_value.as_string()?)
+                        .ok()?
+                        .as_bytes(),
+                )
+            })
+            .ok_or(Target)?;
+        let output = property(objects, operations, "keyboardOutput")
+            .and_then(Value::as_dictionary)
+            .unwrap_or(operations);
         // A text assertion refers to the phone's empty synthetic document.
         // Applying it to the real field could erase text typed elsewhere.
-        let backspaces = deletion_count(objects, output, "deletionCount")?;
-        let deletes = deletion_count(objects, output, "forwardDeletionCount")?;
-        let text = [
+        let mut backspaces = deletion_count(objects, output, "deletionCount").ok_or(Output)?;
+        let mut deletes = deletion_count(objects, output, "forwardDeletionCount").ok_or(Output)?;
+        let mut text = [
             "insertionText",
             "textToCommit",
             "insertionTextAfterSelection",
         ]
         .into_iter()
-        .filter_map(|key| read_string(objects, output?.get(key)?))
+        .filter_map(|key| read_string(objects, property(objects, output, key)?))
         .find(|text| !text.is_empty())
-        .or_else(|| read_string(objects, operations.get("attributedInsertionText")?))
+        .or_else(|| {
+            read_string(
+                objects,
+                property(objects, operations, "attributedInsertionText")?,
+            )
+        })
         .unwrap_or("");
-        if text.len() > 8 * 1024 || backspaces == 0 && deletes == 0 && text.is_empty() {
-            return None;
+        if backspaces == 0 && deletes == 0 && text.is_empty() {
+            match property(objects, operations, "editingActionSelector").and_then(Value::as_string)
+            {
+                Some("deleteBackward:") => backspaces = 1,
+                Some("deleteForward:") => deletes = 1,
+                Some("insertNewline:") => text = "\n",
+                _ => return Err(NoEdit),
+            }
         }
-        Some(TextEdit {
+        if text.len() > 8 * 1024 {
+            return Err(Output);
+        }
+        Ok(TextEdit {
             target,
             backspaces,
             deletes,
@@ -127,26 +189,44 @@ impl KeyboardSession {
 }
 
 fn read_string<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a str> {
-    let value = resolve(objects, value)?;
-    let text = match value {
-        Value::Dictionary(attrs) => resolve(
-            objects,
-            attrs.get("NSString").or_else(|| attrs.get("NS.string"))?,
-        )?,
-        text => text,
-    };
-    text.as_string()
+    let mut text = value;
+    for _ in 0..4 {
+        let Some(attrs) = text.as_dictionary() else {
+            return text.as_string();
+        };
+        text = property(objects, attrs, "NSString")
+            .or_else(|| property(objects, attrs, "NS.string"))?;
+    }
+    None
 }
 
-fn deletion_count(objects: &[Value], output: Option<&Dictionary>, key: &str) -> Option<u8> {
-    match output.and_then(|output| output.get(key)) {
+fn deletion_count(objects: &[Value], output: &Dictionary, key: &str) -> Option<u8> {
+    match property(objects, output, key) {
         None => Some(0),
-        Some(value) if value.as_uid().is_some_and(|uid| uid.get() == 0) => Some(0),
         Some(value) => {
-            let count = resolve(objects, value)?.as_unsigned_integer()?;
+            let count = value.as_unsigned_integer().or_else(|| {
+                property(objects, value.as_dictionary()?, "NS.intval")?.as_unsigned_integer()
+            })?;
             (count <= 64).then_some(count as u8)
         }
     }
+}
+
+fn property<'a>(objects: &'a [Value], dict: &'a Dictionary, key: &str) -> Option<&'a Value> {
+    if let Some(value) = dict.get(key) {
+        return resolve(objects, value);
+    }
+    // NSKeyedArchiver can encode NSDictionary entries as parallel arrays.
+    let keys = resolve(objects, dict.get("NS.keys")?)?.as_array()?;
+    let values = resolve(objects, dict.get("NS.objects")?)?.as_array()?;
+    keys.iter().zip(values).find_map(|(name, value)| {
+        let name = resolve(objects, name)?.as_string()?;
+        if name == key {
+            resolve(objects, value)
+        } else {
+            None
+        }
+    })
 }
 
 fn resolve<'a>(objects: &'a [Value], value: &'a Value) -> Option<&'a Value> {

@@ -10,10 +10,35 @@ use unicode_segmentation::UnicodeSegmentation;
 type Event = *mut c_void;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct Point {
     x: f64,
     y: f64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DisplayBounds {
+    origin: Point,
+    size: Point,
+}
+
+impl DisplayBounds {
+    fn contains(self, point: Point) -> bool {
+        (self.origin.x..self.origin.x + self.size.x).contains(&point.x)
+            && (self.origin.y..self.origin.y + self.size.y).contains(&point.y)
+    }
+
+    fn clamp(self, point: Point) -> Point {
+        Point {
+            x: point
+                .x
+                .clamp(self.origin.x, self.origin.x + self.size.x - 1.0),
+            y: point
+                .y
+                .clamp(self.origin.y, self.origin.y + self.size.y - 1.0),
+        }
+    }
 }
 
 #[link(name = "ApplicationServices", kind = "framework")]
@@ -67,6 +92,8 @@ unsafe extern "C" {
     fn CGEventPost(tap: u32, event: Event);
     fn CGEventSetFlags(event: Event, flags: u64);
     fn CGEventSetIntegerValueField(event: Event, field: u32, value: i64);
+    fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
+    fn CGDisplayBounds(display: u32) -> DisplayBounds;
     fn CGPreflightPostEventAccess() -> bool;
     fn CGRequestPostEventAccess() -> bool;
 }
@@ -85,6 +112,7 @@ pub struct Desktop {
     mouse_number: i64,
     drag_number: Option<i64>,
     pointer: Option<(Instant, Point)>,
+    displays: Vec<DisplayBounds>,
 }
 
 pub(super) struct OwnedCf(pub(super) *const c_void);
@@ -238,6 +266,7 @@ impl Desktop {
             mouse_number: 0,
             drag_number: None,
             pointer: None,
+            displays: Vec::new(),
         })
     }
 
@@ -297,19 +326,36 @@ impl Desktop {
         }
     }
 
-    pub fn move_pointer(&mut self, dx: i32, dy: i32, dragging: bool) {
-        if !can_post_input() {
-            return;
-        }
-        if let Some((sampled_at, point)) = self.pointer_sample() {
-            let next = Point {
-                x: point.x + f64::from(dx),
-                y: point.y + f64::from(dy),
-            };
+    pub fn move_pointer(&mut self, dx: f64, dy: f64, dragging: bool) {
+        let now = Instant::now();
+        let point = match self.recent_pointer() {
+            Some(point) => point,
+            None => {
+                if !can_post_input() {
+                    return;
+                }
+                let Some(point) = pointer_location() else {
+                    return;
+                };
+                self.displays = active_displays();
+                point
+            }
+        };
+        let next = desktop_destination(
+            &self.displays,
+            point,
+            Point {
+                x: point.x + dx,
+                y: point.y + dy,
+            },
+        );
+        if next != point {
             let kind = if dragging { 6 } else { 5 };
             if post_mouse(kind, next, 0, self.drag_number, None) {
-                self.pointer = Some((sampled_at, next));
+                self.pointer = Some((now, next));
             }
+        } else {
+            self.pointer = Some((now, point));
         }
     }
 
@@ -317,7 +363,7 @@ impl Desktop {
         if !can_post_input() {
             return;
         }
-        if let Some((_, point)) = self.pointer_sample() {
+        if let Some(point) = self.pointer_sample() {
             let number = self.next_mouse_event();
             for kind in [1, 2] {
                 post_mouse(kind, point, 0, Some(number), Some(count));
@@ -327,7 +373,7 @@ impl Desktop {
 
     pub fn right_click(&mut self) {
         if can_post_input() {
-            if let Some((_, point)) = self.pointer_sample() {
+            if let Some(point) = self.pointer_sample() {
                 let number = self.next_mouse_event();
                 for kind in [3, 4] {
                     post_mouse(kind, point, 1, Some(number), Some(1));
@@ -340,7 +386,7 @@ impl Desktop {
         if !can_post_input() {
             return false;
         }
-        let Some((_, point)) = self.pointer_sample() else {
+        let Some(point) = self.pointer_sample() else {
             return false;
         };
         let number = self.next_mouse_event();
@@ -354,7 +400,7 @@ impl Desktop {
 
     pub fn end_drag(&mut self) {
         let number = self.drag_number.take();
-        if let Some((_, point)) = self.pointer_sample() {
+        if let Some(point) = self.pointer_sample() {
             post_mouse(2, point, 0, number, Some(1));
         }
     }
@@ -364,13 +410,16 @@ impl Desktop {
         self.mouse_number
     }
 
-    fn pointer_sample(&self) -> Option<(Instant, Point)> {
-        // During a short burst, Quartz may not have applied the previous move
-        // yet. Accumulate every delta and periodically resync for local input
-        // and screen edges.
+    fn recent_pointer(&self) -> Option<Point> {
+        // Quartz can briefly report an earlier position after posting a move.
+        // Accumulate a continuous gesture from the last position we posted.
         self.pointer
-            .filter(|(sampled, _)| sampled.elapsed() < Duration::from_millis(16))
-            .or_else(|| pointer_location().map(|point| (Instant::now(), point)))
+            .filter(|(posted, _)| posted.elapsed() < Duration::from_millis(48))
+            .map(|(_, point)| point)
+    }
+
+    fn pointer_sample(&self) -> Option<Point> {
+        self.recent_pointer().or_else(pointer_location)
     }
 
     pub fn volume() -> Option<f64> {
@@ -406,6 +455,34 @@ impl Desktop {
             tracing::warn!("cannot set macOS output volume");
         }
     }
+}
+
+fn active_displays() -> Vec<DisplayBounds> {
+    let mut displays = [0; 32];
+    let mut count = 0;
+    if unsafe { CGGetActiveDisplayList(displays.len() as u32, displays.as_mut_ptr(), &mut count) }
+        != 0
+    {
+        return Vec::new();
+    }
+    displays
+        .into_iter()
+        .take(count as usize)
+        .map(|display| unsafe { CGDisplayBounds(display) })
+        .filter(|bounds| bounds.size.x >= 1.0 && bounds.size.y >= 1.0)
+        .collect()
+}
+
+fn desktop_destination(displays: &[DisplayBounds], current: Point, next: Point) -> Point {
+    if displays.iter().any(|display| display.contains(next)) {
+        return next;
+    }
+    // Keep edge overshoot out of the accumulated position. Otherwise it would
+    // take several movements in the opposite direction to leave a screen edge.
+    displays
+        .iter()
+        .find(|display| display.contains(current))
+        .map_or(next, |display| display.clamp(next))
 }
 
 fn pointer_location() -> Option<Point> {
@@ -511,7 +588,7 @@ fn media_key(key: isize) {
 
 #[cfg(test)]
 mod tests {
-    use super::post_text_graphemes;
+    use super::{desktop_destination, post_text_graphemes, DisplayBounds, Point};
 
     #[test]
     fn text_events_preserve_spaces_and_combined_characters() {
@@ -520,5 +597,36 @@ mod tests {
             events.push(String::from_utf16(units).unwrap());
         });
         assert_eq!(events, ["e\u{301}", " ", "👩‍💻", "\n"]);
+    }
+
+    #[test]
+    fn pointer_keeps_fractional_motion_and_crosses_adjacent_displays() {
+        let main = DisplayBounds {
+            origin: Point { x: 0.0, y: 0.0 },
+            size: Point {
+                x: 1920.0,
+                y: 1080.0,
+            },
+        };
+        let left = DisplayBounds {
+            origin: Point {
+                x: -1440.0,
+                y: 30.0,
+            },
+            size: Point {
+                x: 1440.0,
+                y: 900.0,
+            },
+        };
+        let position = Point { x: 0.0, y: 100.0 };
+        let adjacent = Point { x: -0.75, y: 100.5 };
+        assert_eq!(
+            desktop_destination(&[main, left], position, adjacent),
+            adjacent
+        );
+        assert_eq!(
+            desktop_destination(&[main], position, adjacent),
+            Point { x: 0.0, y: 100.5 }
+        );
     }
 }
