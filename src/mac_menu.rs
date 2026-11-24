@@ -21,9 +21,8 @@ use crate::{
 
 const STATUS: isize = 1;
 const PAIR: isize = 2;
-const TOGGLE: isize = 3;
+const START_RECEIVER: isize = 3;
 const UPDATE_STATUS: isize = 4;
-const UPDATE_NOW: isize = 5;
 const AUTO_CHECK: isize = 6;
 const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
@@ -57,22 +56,25 @@ define_class!(
             let discovery = active.as_ref().and_then(|receiver| receiver.bonjour.as_ref())
                 .map(mac_bonjour::Bonjour::status);
             let status = match discovery {
-                Some(mac_bonjour::Status::Starting) => "Starting Bonjour discovery…",
-                Some(mac_bonjour::Status::Reconnecting) => "Reconnecting Bonjour discovery…",
-                Some(mac_bonjour::Status::Ready) => "Receiver ready on the local network",
-                Some(mac_bonjour::Status::LocalNetworkPermission) => "Local Network permission needed",
-                Some(mac_bonjour::Status::Failed) => "Bonjour discovery could not start",
-                None if active.is_some() => "Receiver listening",
-                None if self.ivars().error.borrow().is_some() => "Receiver could not start",
-                None => "Receiver stopped",
+                Some(mac_bonjour::Status::Starting) => Some("Starting Bonjour discovery…"),
+                Some(mac_bonjour::Status::Reconnecting) => Some("Reconnecting Bonjour discovery…"),
+                Some(mac_bonjour::Status::LocalNetworkPermission) => Some("Local Network permission needed"),
+                Some(mac_bonjour::Status::Failed) => Some("Bonjour discovery could not start"),
+                None if self.ivars().error.borrow().is_some() => Some("Receiver could not start"),
+                Some(mac_bonjour::Status::Ready) | None => None,
             };
             if let Some(item) = menu.itemWithTag(STATUS) {
-                item.setTitle(&NSString::from_str(status));
+                item.setHidden(status.is_none());
+                if let Some(status) = status {
+                    item.setTitle(&NSString::from_str(status));
+                }
             }
             if let Some(item) = menu.itemWithTag(CONNECTION) {
-                item.setHidden(active.is_none());
-                if let Some(receiver) = active.as_ref() {
-                    item.setTitle(&NSString::from_str(receiver.state.connection_status()));
+                let status = active.as_ref().map(|receiver| receiver.state.connection_status())
+                    .filter(|&status| status != "Waiting for iPhone");
+                item.setHidden(status.is_none());
+                if let Some(status) = status {
+                    item.setTitle(&NSString::from_str(status));
                 }
             }
             if let Some(item) = menu.itemWithTag(MEDIA_CONTROLS) {
@@ -84,9 +86,8 @@ define_class!(
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
             }
-            if let Some(item) = menu.itemWithTag(TOGGLE) {
-                item.setTitle(if active.is_some() { objc2_foundation::ns_string!("Stop Receiver") }
-                              else { objc2_foundation::ns_string!("Start Receiver") });
+            if let Some(item) = menu.itemWithTag(START_RECEIVER) {
+                item.setHidden(active.is_some());
             }
             if let Some(item) = menu.itemWithTag(ACCESSIBILITY) {
                 item.setHidden(!self.needs_accessibility());
@@ -97,12 +98,14 @@ define_class!(
                     Some(mac_bonjour::Status::LocalNetworkPermission | mac_bonjour::Status::Failed)
                 ));
             }
-            let updater = self.ivars().updater.borrow();
+            let mut updater = self.ivars().updater.borrow_mut();
+            updater.refresh_for_menu();
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
-                item.setTitle(&NSString::from_str(updater.status()));
-            }
-            if let Some(item) = menu.itemWithTag(UPDATE_NOW) {
-                item.setEnabled(!updater.busy());
+                let status = updater.status();
+                item.setHidden(status.is_empty());
+                if !status.is_empty() {
+                    item.setTitle(&NSString::from_str(status));
+                }
             }
             if let Some(item) = menu.itemWithTag(AUTO_CHECK) {
                 item.setState(isize::from(updater.checking()));
@@ -137,18 +140,17 @@ define_class!(
             self.show_pairing();
         }
 
-        #[unsafe(method(myRemoteToggle:))]
-        fn toggle(&self, _sender: &NSMenuItem) {
+        #[unsafe(method(myRemoteStartReceiver:))]
+        fn start_receiver(&self, _sender: &NSMenuItem) {
             if self.ivars().active.borrow().is_some() {
-                self.stop();
+                return;
+            }
+            self.start();
+            let error = self.ivars().error.borrow().clone();
+            if let Some(error) = error {
+                self.alert("Unable to start myRemote", &error);
             } else {
-                self.start();
-                let error = self.ivars().error.borrow().clone();
-                if let Some(error) = error {
-                    self.alert("Unable to start myRemote", &error);
-                } else {
-                    self.request_accessibility(true);
-                }
+                self.request_accessibility(true);
             }
         }
 
@@ -358,11 +360,16 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         controller.add_item(&menu, &format!("myRemote {VERSION}"), None, 0);
-        controller.add_item(&menu, "Receiver stopped", None, STATUS);
-        controller.add_item(&menu, "Waiting for iPhone", None, CONNECTION);
+        controller.add_item(&menu, "", None, STATUS);
+        controller.add_item(&menu, "", None, CONNECTION);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
-        controller.add_item(&menu, "Start Receiver", Some(sel!(myRemoteToggle:)), TOGGLE);
+        controller.add_item(
+            &menu,
+            "Retry Starting Receiver",
+            Some(sel!(myRemoteStartReceiver:)),
+            START_RECEIVER,
+        );
         controller.add_item(
             &menu,
             "Foreground Media Controls",
@@ -388,13 +395,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             LOCAL_NETWORK,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        controller.add_item(&menu, "Updates", None, UPDATE_STATUS);
-        controller.add_item(
-            &menu,
-            "Update Now",
-            Some(sel!(myRemoteUpdateNow:)),
-            UPDATE_NOW,
-        );
+        controller.add_item(&menu, "", None, UPDATE_STATUS);
+        controller.add_item(&menu, "Update Now", Some(sel!(myRemoteUpdateNow:)), 0);
         controller.add_item(
             &menu,
             "Check for Updates Automatically",

@@ -21,7 +21,9 @@ pub use install::{
 };
 
 const REPO: &str = "oseanstudio/myRemote";
-const INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+const INTERVAL: Duration = Duration::from_secs(60 * 60);
+const MENU_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const MANUAL_STATUS_DURATION: Duration = Duration::from_secs(15);
 const MAX_PACKAGE: u64 = 100 * 1024 * 1024;
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -64,18 +66,25 @@ struct Download {
 }
 
 enum Finished {
-    Checked(ResultMessage<Option<Download>>, bool),
-    Prepared(ResultMessage<install::Ready>, bool),
+    Checked(ResultMessage<Option<Download>>),
+    Prepared(ResultMessage<install::Ready>),
 }
 
 type ResultMessage<T> = std::result::Result<T, String>;
+
+struct UpdateTask {
+    result: Receiver<Finished>,
+    manual: bool,
+}
 
 pub struct Updater {
     path: Option<PathBuf>,
     preferences: Preferences,
     next_check: Instant,
-    task: Option<Receiver<Finished>>,
+    next_menu_check: Instant,
+    task: Option<UpdateTask>,
     status: String,
+    status_expires: Option<Instant>,
 }
 
 impl Updater {
@@ -101,12 +110,15 @@ impl Updater {
         } else {
             Duration::from_secs(5)
         };
+        let next_check = Instant::now() + delay;
         Self {
             path,
             preferences,
-            next_check: Instant::now() + delay,
+            next_check,
+            next_menu_check: next_check,
             task: None,
-            status: previous_error.unwrap_or_else(|| "Ready to check for updates".to_owned()),
+            status: previous_error.unwrap_or_default(),
+            status_expires: None,
         }
     }
 
@@ -116,11 +128,24 @@ impl Updater {
     pub fn automatic(&self) -> bool {
         self.preferences.install
     }
-    pub fn busy(&self) -> bool {
+    fn busy(&self) -> bool {
         self.task.is_some()
     }
     pub fn status(&self) -> &str {
-        &self.status
+        if self
+            .status_expires
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            ""
+        } else {
+            &self.status
+        }
+    }
+
+    pub fn refresh_for_menu(&mut self) {
+        if self.checking() && !self.busy() && Instant::now() >= self.next_menu_check {
+            self.check(false);
+        }
     }
 
     pub fn toggle_checks(&mut self) {
@@ -143,7 +168,13 @@ impl Updater {
     }
 
     pub fn update_now(&mut self) {
-        if !self.busy() {
+        if let Some(task) = self.task.as_mut() {
+            // An explicit update request also applies to a check already in progress.
+            task.manual = true;
+            if self.status.is_empty() {
+                self.status = "Checking GitHub for updates…".into();
+            }
+        } else {
             self.check(true);
         }
     }
@@ -151,23 +182,24 @@ impl Updater {
     /// Poll on the UI thread. Returns true when the app should exit for installation.
     pub fn poll(&mut self) -> bool {
         if let Some(task) = self.task.as_ref() {
-            match task.try_recv() {
+            match task.result.try_recv() {
                 Ok(finished) => {
+                    let manual = task.manual;
                     self.task = None;
                     self.next_check = Instant::now() + INTERVAL;
                     match finished {
-                        Finished::Checked(Ok(Some(download)), manual)
-                            if manual || self.automatic() =>
-                        {
+                        Finished::Checked(Ok(Some(download))) if manual || self.automatic() => {
                             self.prepare(download, manual);
                         }
-                        Finished::Checked(Ok(Some(download)), _) => {
+                        Finished::Checked(Ok(Some(download))) => {
                             self.status = format!("Version {} is available", download.version);
                         }
-                        Finished::Checked(Ok(None), _) => {
-                            self.status = "You have the latest version".into();
+                        Finished::Checked(Ok(None)) if manual => {
+                            self.status = "No update found".into();
+                            self.status_expires = Some(Instant::now() + MANUAL_STATUS_DURATION);
                         }
-                        Finished::Prepared(Ok(ready), manual) if manual || self.automatic() => {
+                        Finished::Checked(Ok(None)) => self.status.clear(),
+                        Finished::Prepared(Ok(ready)) if manual || self.automatic() => {
                             match install::launch(ready) {
                                 Ok(()) => return true,
                                 Err(err) => {
@@ -175,10 +207,10 @@ impl Updater {
                                 }
                             }
                         }
-                        Finished::Prepared(Ok(_), _) => {
+                        Finished::Prepared(Ok(_)) => {
                             self.status = "Automatic installation paused".into()
                         }
-                        Finished::Checked(Err(error), _) | Finished::Prepared(Err(error), _) => {
+                        Finished::Checked(Err(error)) | Finished::Prepared(Err(error)) => {
                             self.status = error;
                         }
                     }
@@ -207,29 +239,39 @@ impl Updater {
                 self.preferences = preferences;
                 self.next_check = Instant::now() + Duration::from_secs(5);
             }
-            Err(err) => self.status = format!("Could not save update settings: {err}"),
+            Err(err) => {
+                self.status_expires = None;
+                self.status = format!("Could not save update settings: {err}");
+            }
         }
     }
 
     fn check(&mut self, manual: bool) {
-        self.status = "Checking GitHub for updates…".into();
-        self.next_check = Instant::now() + INTERVAL;
+        let was_transient = self.status_expires.take().is_some();
+        if manual {
+            self.status = "Checking GitHub for updates…".into();
+        } else if was_transient {
+            self.status.clear();
+        }
+        let now = Instant::now();
+        self.next_check = now + INTERVAL;
+        self.next_menu_check = now + MENU_CHECK_INTERVAL;
         let (tx, rx) = mpsc::channel();
-        self.task = Some(rx);
+        self.task = Some(UpdateTask { result: rx, manual });
         std::thread::spawn(move || {
             let result = latest().map_err(|error| format!("Could not check for updates: {error}"));
-            let _ = tx.send(Finished::Checked(result, manual));
+            let _ = tx.send(Finished::Checked(result));
         });
     }
 
     fn prepare(&mut self, download: Download, manual: bool) {
         self.status = format!("Downloading myRemote {}…", download.version);
         let (tx, rx) = mpsc::channel();
-        self.task = Some(rx);
+        self.task = Some(UpdateTask { result: rx, manual });
         std::thread::spawn(move || {
             let result =
                 prepare(download).map_err(|error| format!("Could not prepare update: {error}"));
-            let _ = tx.send(Finished::Prepared(result, manual));
+            let _ = tx.send(Finished::Prepared(result));
         });
     }
 }
@@ -252,7 +294,12 @@ fn latest() -> Result<Option<Download>> {
         1024 * 1024,
         20,
     )
-    .args(["--header", "Accept: application/vnd.github+json"])
+    .args([
+        "--header",
+        "Accept: application/vnd.github+json",
+        "--header",
+        "Cache-Control: no-cache",
+    ])
     .output()?;
     if !output.status.success() {
         return Err("GitHub release request failed".into());
@@ -446,5 +493,56 @@ mod tests {
         for value in [None, Some("sha512:aa"), Some("sha256:abcd")] {
             assert!(parse_digest(value).is_err());
         }
+    }
+
+    #[test]
+    fn update_status_hides_idle_results_and_shows_new_releases() {
+        let future = Instant::now() + INTERVAL;
+        let mut updater = Updater {
+            path: None,
+            preferences: Preferences::default(),
+            next_check: future,
+            next_menu_check: future,
+            task: None,
+            status: String::new(),
+            status_expires: None,
+        };
+        let (sender, result) = mpsc::channel();
+        updater.task = Some(UpdateTask {
+            result,
+            manual: false,
+        });
+        sender.send(Finished::Checked(Ok(None))).unwrap();
+        assert!(!updater.poll());
+        assert_eq!(updater.status(), "");
+
+        let (sender, result) = mpsc::channel();
+        updater.task = Some(UpdateTask {
+            result,
+            manual: false,
+        });
+        updater.update_now();
+        sender.send(Finished::Checked(Ok(None))).unwrap();
+        assert!(!updater.poll());
+        assert_eq!(updater.status(), "No update found");
+        updater.status_expires = Some(Instant::now());
+        assert_eq!(updater.status(), "");
+
+        let (sender, result) = mpsc::channel();
+        updater.task = Some(UpdateTask {
+            result,
+            manual: false,
+        });
+        updater.status_expires = None;
+        sender
+            .send(Finished::Checked(Ok(Some(Download {
+                version: Version::new(2, 0, 0),
+                asset: "app.zip",
+                size: 1000,
+                digest: [1; 32],
+            }))))
+            .unwrap();
+        assert!(!updater.poll());
+        assert_eq!(updater.status(), "Version 2.0.0 is available");
     }
 }

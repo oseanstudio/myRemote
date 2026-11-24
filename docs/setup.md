@@ -9,7 +9,7 @@ myRemote is an MIT-licensed desktop receiver for the **Apple TV Remote** already
 3. Open **Control Center → Apple TV Remote** on the iPhone. If it’s missing, edit Control Center and add **Remote**. Select **myRemote · COMPUTERNAME** in the picker and enter the code shown on the computer. On Linux, open the tray menu to see the code.
 4. To retry pairing, choose **Pair iPhone…** from myRemote’s menu and select the computer again on your iPhone.
 
-The phone can reconnect after a server restart. Run the receiver on another computer and repeat the pairing steps to add it to the same picker. Use **Stop Receiver** to pause the service or **Quit myRemote** to close the app. From a terminal, press **Ctrl+C**.
+The phone can reconnect after a server restart. Run the receiver on another computer and repeat the pairing steps to add it to the same picker. Use **Quit myRemote** to close the app. From a terminal, press **Ctrl+C**.
 
 To use two iPhones at once, pair each one individually. They share the same desktop pointer and keyboard focus, and either phone can disconnect while the other keeps working.
 
@@ -31,7 +31,7 @@ If your iPhone connects but the controls do nothing, press Back on the iPhone an
 
 ### Updates
 
-**Check for Updates Automatically** is on by default. myRemote checks GitHub shortly after launch and every six hours. **Update Now** checks, downloads, verifies, installs, and relaunches myRemote when a newer release is available. Enable **Install Updates Automatically** to do the same whenever a check finds an update. Turning off automatic checks also turns off automatic installation.
+**Check for Updates Automatically** is on by default. myRemote checks GitHub shortly after launch and every hour. Opening the Mac menu also checks if at least five minutes have passed since the last check. **Update Now** checks, downloads, verifies, installs, and relaunches myRemote when a newer release is available. Enable **Install Updates Automatically** to do the same whenever a check finds an update. Turning off automatic checks also turns off automatic installation.
 
 Install myRemote in a writable folder to enable replacement. On macOS, move the app out of the DMG first. On Linux, launch the AppImage itself and have `curl` installed. An update briefly interrupts the receiver and preserves pairing and settings.
 

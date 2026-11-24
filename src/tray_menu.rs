@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::runtime::Runtime;
 use tray_icon::{
     menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
-    Icon, TrayIconBuilder,
+    Icon, TrayIconBuilder, TrayIconEvent,
 };
 
 use crate::{shutdown_signal, start_receiver, update::Updater, ActiveReceiver, Options, VERSION};
@@ -19,12 +19,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
 
     let menu = Menu::new();
     let version = MenuItem::new(format!("myRemote {VERSION}"), false, None);
-    let status = MenuItem::new("Receiver stopped", false, None);
+    let startup_error = MenuItem::new("", false, None);
     let pair = MenuItem::new("Pair iPhone…", false, None);
     let code = MenuItem::new("Pairing closed", false, None);
-    let toggle = MenuItem::new("Start Receiver", true, None);
+    let retry = MenuItem::new("Retry Starting Receiver", true, None);
     let mut updater = Updater::new(&options);
-    let update_status = MenuItem::new(updater.status(), false, None);
+    let update_status = MenuItem::new("", false, None);
     let update_now = MenuItem::new("Update Now", true, None);
     let check_updates = CheckMenuItem::new(
         "Check for Updates Automatically",
@@ -41,13 +41,10 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let quit = MenuItem::new("Quit myRemote", true, None);
     menu.append_items(&[
         &version,
-        &status,
         &PredefinedMenuItem::separator(),
         &pair,
         &code,
-        &toggle,
         &PredefinedMenuItem::separator(),
-        &update_status,
         &update_now,
         &check_updates,
         &install_updates,
@@ -57,7 +54,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let _icon = TrayIconBuilder::new()
         .with_tooltip(format!("myRemote {VERSION}"))
         .with_icon(make_icon()?)
-        .with_menu(Box::new(menu))
+        .with_menu(Box::new(menu.clone()))
         .with_menu_on_left_click(true)
         .build()?;
 
@@ -70,7 +67,10 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             }
         }
     });
-    let mut active = start(&options, &runtime, &status, &pair, &toggle);
+    let mut active = start(&options, &runtime, &startup_error, &pair);
+    if active.is_none() {
+        menu.insert_items(&[&startup_error, &retry], 1)?;
+    }
     if options.pair {
         if let Some(active) = active.as_ref() {
             active.state.enable_pairing();
@@ -80,24 +80,26 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     #[cfg(windows)]
     let message_loop = windows_loop::MessageLoop::new()?;
     let mut displayed_code = None;
-    let mut displayed_update = updater.status().to_owned();
-    let mut update_busy = false;
+    let mut displayed_update = String::new();
     let mut pending_event = None;
     let events = MenuEvent::receiver();
+    let tray_events = TrayIconEvent::receiver();
     while !quit_requested.load(Ordering::Relaxed) {
+        while let Ok(event) = tray_events.try_recv() {
+            if matches!(event, TrayIconEvent::Click { .. }) {
+                updater.refresh_for_menu();
+            }
+        }
         while let Some(event) = pending_event.take().or_else(|| events.try_recv().ok()) {
             if event.id == *quit.id() {
                 quit_requested.store(true, Ordering::Relaxed);
                 break;
             }
-            if event.id == *toggle.id() {
-                if let Some(receiver) = active.take() {
-                    runtime.block_on(receiver.stop());
-                    status.set_text("Receiver stopped");
-                    pair.set_enabled(false);
-                    toggle.set_text("Start Receiver");
-                } else {
-                    active = start(&options, &runtime, &status, &pair, &toggle);
+            if event.id == *retry.id() && active.is_none() {
+                active = start(&options, &runtime, &startup_error, &pair);
+                if active.is_some() {
+                    menu.remove(&startup_error)?;
+                    menu.remove(&retry)?;
                 }
             }
             if event.id == *pair.id() {
@@ -139,13 +141,22 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         if updater.poll() {
             break;
         }
-        if displayed_update != updater.status() {
-            displayed_update = updater.status().to_owned();
-            update_status.set_text(&displayed_update);
-        }
-        if update_busy != updater.busy() {
-            update_busy = updater.busy();
-            update_now.set_enabled(!update_busy);
+        let status = updater.status();
+        if displayed_update != status {
+            if status.is_empty() {
+                menu.remove(&update_status)?;
+            } else {
+                update_status.set_text(status);
+                if displayed_update.is_empty() {
+                    let index = menu
+                        .items()
+                        .iter()
+                        .position(|item| item.id() == update_now.id())
+                        .expect("Update Now is always in the tray menu");
+                    menu.insert(&update_status, index)?;
+                }
+            }
+            displayed_update = status.to_owned();
         }
         #[cfg(windows)]
         if !message_loop.dispatch()? {
@@ -167,13 +178,10 @@ fn start(
     runtime: &Runtime,
     status: &MenuItem,
     pair: &MenuItem,
-    toggle: &MenuItem,
 ) -> Option<ActiveReceiver> {
     match runtime.block_on(start_receiver(options)) {
         Ok(receiver) => {
-            status.set_text(format!("Listening on {}", receiver.ip));
             pair.set_enabled(true);
-            toggle.set_text("Stop Receiver");
             Some(receiver)
         }
         Err(error) => {
