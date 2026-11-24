@@ -22,6 +22,7 @@ pub(crate) struct TextEdit {
     pub marked: Option<String>,
     pub suggestion: Option<AcceptedSuggestion>,
     unmark: bool,
+    clear: bool,
 }
 
 pub(crate) struct AcceptedSuggestion {
@@ -34,11 +35,14 @@ pub(crate) struct KeyboardField {
     marked: String,
 }
 
-pub(crate) struct KeyboardInput {
-    pub backspaces: u8,
-    pub deletes: u8,
-    pub text: String,
-    pub suggestion: Option<AcceptedSuggestion>,
+pub(crate) enum KeyboardInput {
+    Clear,
+    Suggestion(AcceptedSuggestion, String),
+    Text {
+        backspaces: u8,
+        deletes: u8,
+        text: String,
+    },
 }
 
 impl KeyboardField {
@@ -50,14 +54,13 @@ impl KeyboardField {
     }
 
     pub fn apply(&mut self, edit: TextEdit) -> Option<KeyboardInput> {
+        if edit.clear {
+            self.marked.clear();
+            return Some(KeyboardInput::Clear);
+        }
         if let Some(suggestion) = edit.suggestion {
             self.marked = edit.marked.unwrap_or_default();
-            return Some(KeyboardInput {
-                backspaces: 0,
-                deletes: 0,
-                text: edit.insertion,
-                suggestion: Some(suggestion),
-            });
+            return Some(KeyboardInput::Suggestion(suggestion, edit.insertion));
         }
         let mut backspaces = edit.backspaces;
         let mut text = edit.insertion;
@@ -89,11 +92,10 @@ impl KeyboardField {
         if let Some(marked) = edit.marked {
             self.marked = marked;
         }
-        (backspaces != 0 || edit.deletes != 0 || !text.is_empty()).then_some(KeyboardInput {
+        (backspaces != 0 || edit.deletes != 0 || !text.is_empty()).then_some(KeyboardInput::Text {
             backspaces,
             deletes: edit.deletes,
             text,
-            suggestion: None,
         })
     }
 }
@@ -226,8 +228,6 @@ impl KeyboardSession {
         let output = property(objects, operations, "keyboardOutput")
             .and_then(Value::as_dictionary)
             .unwrap_or(operations);
-        // A text assertion refers to the phone's empty synthetic document.
-        // Applying it to the real field could erase text typed elsewhere.
         let mut backspaces = deletion_count(objects, output, "deletionCount").ok_or(Output)?;
         let mut deletes = deletion_count(objects, output, "forwardDeletionCount").ok_or(Output)?;
         let mut insertion = ["insertionText", "insertionTextAfterSelection"]
@@ -260,6 +260,23 @@ impl KeyboardSession {
         });
         let mut unmark = property(objects, output, "unmarkIfNecessary").and_then(Value::as_boolean)
             == Some(true);
+        let action =
+            property(objects, operations, "editingActionSelector").and_then(Value::as_string);
+        // A standalone empty assertion in RTITextOperations is the clear
+        // command. Other assertions or assertions accompanying edits are not
+        // instructions to replace the field.
+        let clear = backspaces == 0
+            && deletes == 0
+            && insertion.is_empty()
+            && commit.is_none_or(str::is_empty)
+            && marked.is_none_or(str::is_empty)
+            && suggestion.is_none()
+            && action.is_none()
+            && archiver == Some("RTIKeyedArchiver")
+            && class_name(objects, operations) == Some("RTITextOperations")
+            && property(objects, operations, "textToAssert")
+                .and_then(|value| read_string(objects, value))
+                == Some("");
         if backspaces == 0
             && deletes == 0
             && insertion.is_empty()
@@ -267,9 +284,9 @@ impl KeyboardSession {
             && marked.is_none()
             && suggestion.is_none()
             && !unmark
+            && !clear
         {
-            match property(objects, operations, "editingActionSelector").and_then(Value::as_string)
-            {
+            match action {
                 Some("deleteBackward:") => backspaces = 1,
                 Some("deleteForward:") => deletes = 1,
                 Some("insertNewline:") => insertion = "\n",
@@ -294,6 +311,7 @@ impl KeyboardSession {
             marked: marked.map(str::to_owned),
             suggestion,
             unmark,
+            clear,
         })
     }
 }

@@ -392,6 +392,15 @@ impl Desktop {
         Self::post_text(backspaces, deletes, text)
     }
 
+    pub fn clear_text(field: u64) -> bool {
+        const COMMAND: u64 = 1 << 20;
+        // Use the focused text control's regular editing path so browsers
+        // get input events and secure fields do not need to expose a value.
+        Self::focused_text_field() == Some(field)
+            && post_key(0, COMMAND, &[]) // Command-A
+            && post_key(51, 0, &[]) // Delete
+    }
+
     pub fn accept_suggestion(field: u64, typed: &str, word: &str, following: &str) -> bool {
         let Some(focus) = focused_field().filter(|focus| focus.id == field) else {
             return false;

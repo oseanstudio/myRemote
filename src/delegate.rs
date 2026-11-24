@@ -61,6 +61,10 @@ pub trait RemoteInput: Send + Sync + 'static {
     fn type_text(&self, _field: u64, _backspaces: u8, _deletes: u8, _text: &str) -> bool {
         false
     }
+    /// Clears the advertised editable field if it still has focus.
+    fn clear_text(&self, _field: u64) -> bool {
+        false
+    }
     /// Applies a word accepted by the phone's keyboard and any accompanying separator.
     fn accept_suggestion(&self, field: u64, _typed: &str, word: &str, following: &str) -> bool {
         self.type_text(field, 0, 0, &format!("{word}{following}"))

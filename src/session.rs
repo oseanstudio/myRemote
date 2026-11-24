@@ -21,7 +21,7 @@ use crate::delegate::{RemoteInput, TrackpadMode};
 use crate::error::{Error, Result};
 use crate::opack::{self, Value};
 use crate::pairing::PairingState;
-use crate::remote_keyboard::{KeyboardField, KeyboardSession};
+use crate::remote_keyboard::{KeyboardField, KeyboardInput, KeyboardSession};
 use crate::remote_media;
 use crate::srp::SrpServer;
 use crate::tlv::{self, tags};
@@ -35,6 +35,7 @@ const TAP_MAX_DISTANCE: f64 = 60.0; // below this a touch sequence counts as a t
 const DOUBLE_TAP_WINDOW: Duration = Duration::from_millis(500);
 const SELECT_ECHO_WINDOW: Duration = Duration::from_millis(90);
 const RIGHT_CLICK_HOLD: Duration = Duration::from_millis(500);
+const RIGHT_CLICK_MOVE_DISTANCE: f64 = 40.0;
 const DRAG_HOLD: Duration = Duration::from_millis(200);
 const DRAG_IDLE_LIMIT: Duration = Duration::from_secs(10);
 const DRAG_MOVE_DISTANCE: f64 = 24.0;
@@ -92,6 +93,12 @@ struct ActiveTouch {
     right_clicked: bool,
 }
 
+impl ActiveTouch {
+    fn can_right_click(&self) -> bool {
+        !self.second_tap && !self.right_clicked && self.distance < RIGHT_CLICK_MOVE_DISTANCE
+    }
+}
+
 #[derive(Clone, Copy)]
 struct TapTime {
     received: Instant,
@@ -117,6 +124,11 @@ struct Click {
     time: TapTime,
     sources: u8,
     double: bool,
+}
+
+enum SelectPress {
+    Down(Instant),
+    RightClicked,
 }
 
 struct SeekHold {
@@ -223,6 +235,7 @@ pub(crate) struct CompanionSession {
     seek_hold: Option<SeekHold>,
     next_event_id: u32,
     touch: Option<ActiveTouch>,
+    select_pressed: Option<SelectPress>,
     last_click: Option<Click>,
     suppress_select_until: Option<Instant>,
     volume: f64,
@@ -274,6 +287,7 @@ impl CompanionSession {
             seek_hold: None,
             next_event_id: 0x8000_0000 | rand::random::<u32>(),
             touch: None,
+            select_pressed: None,
             last_click: None,
             suppress_select_until: None,
             volume: 0.5,
@@ -1149,20 +1163,16 @@ impl CompanionSession {
                 };
                 (field.id, keystrokes)
             };
-            if let Some(suggestion) = keystrokes.suggestion {
-                input.accept_suggestion(
-                    field,
-                    &suggestion.typed,
-                    &suggestion.word,
-                    &keystrokes.text,
-                )
-            } else {
-                input.type_text(
-                    field,
-                    keystrokes.backspaces,
-                    keystrokes.deletes,
-                    &keystrokes.text,
-                )
+            match keystrokes {
+                KeyboardInput::Clear => input.clear_text(field),
+                KeyboardInput::Suggestion(suggestion, following) => {
+                    input.accept_suggestion(field, &suggestion.typed, &suggestion.word, &following)
+                }
+                KeyboardInput::Text {
+                    backspaces,
+                    deletes,
+                    text,
+                } => input.type_text(field, backspaces, deletes, &text),
             }
         })
         .await
@@ -1204,9 +1214,6 @@ impl CompanionSession {
         } else {
             ("_hidC", "_hBtS")
         };
-        if content.get(state_key).and_then(Value::as_int) != Some(2) {
-            return Ok(());
-        }
         let Some(button) = content
             .get(command_key)
             .and_then(Value::as_int)
@@ -1214,6 +1221,18 @@ impl CompanionSession {
         else {
             return Ok(());
         };
+        match content.get(state_key).and_then(Value::as_int) {
+            Some(1) if button == "select" && self.mode == TrackpadMode::Mouse => {
+                if self.touch.is_none() {
+                    self.select_pressed
+                        .get_or_insert_with(|| SelectPress::Down(Instant::now()));
+                    self.record_input();
+                }
+                return Ok(());
+            }
+            Some(2) => {}
+            _ => return Ok(()),
+        }
         self.record_input();
         if button == "menu" {
             self.pairing
@@ -1222,15 +1241,24 @@ impl CompanionSession {
                 .fetch_add(1, Ordering::Relaxed);
         }
         if button == "select" {
+            let now = Instant::now();
+            let press = self.select_pressed.take();
             if self.mode == TrackpadMode::Direction || self.touch.is_none() {
-                self.select(
-                    None,
-                    TapTime {
-                        received: Instant::now(),
-                        phone_ns: None,
-                    },
-                    false,
-                );
+                match press {
+                    Some(SelectPress::RightClicked) => self.suppress_click_echo(now),
+                    Some(SelectPress::Down(pressed)) if now - pressed >= RIGHT_CLICK_HOLD => {
+                        self.right_click();
+                        self.suppress_click_echo(now);
+                    }
+                    _ => self.select(
+                        None,
+                        TapTime {
+                            received: now,
+                            phone_ns: None,
+                        },
+                        false,
+                    ),
+                }
             }
         } else if matches!(button, "play_pause" | "home" | "menu") && self.input.playback_enabled()
         {
@@ -1516,17 +1544,24 @@ impl CompanionSession {
         self.suppress_select_until = Some(now + SELECT_ECHO_WINDOW);
     }
 
+    fn right_click(&self) {
+        self.input.right_click();
+        self.pairing
+            .diagnostics
+            .right_clicks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn touch_deadline(&self) -> Option<Instant> {
+        if let Some(SelectPress::Down(start)) = self.select_pressed {
+            return Some(start + RIGHT_CLICK_HOLD);
+        }
         let touch = self.touch.as_ref()?;
         if touch.dragging {
             Some(touch.updated + DRAG_IDLE_LIMIT)
         } else if touch.second_tap && !touch.drag_attempted {
             Some(touch.started.received + DRAG_HOLD)
-        } else if self.mode == TrackpadMode::Mouse
-            && !touch.second_tap
-            && !touch.right_clicked
-            && touch.distance < DRAG_MOVE_DISTANCE
-        {
+        } else if self.mode == TrackpadMode::Mouse && touch.can_right_click() {
             Some(touch.started.received + RIGHT_CLICK_HOLD)
         } else {
             None
@@ -1534,7 +1569,10 @@ impl CompanionSession {
     }
 
     pub(crate) fn touch_timer(&mut self) {
-        if self.touch.as_ref().is_some_and(|touch| touch.dragging) {
+        if matches!(self.select_pressed, Some(SelectPress::Down(_))) {
+            self.select_pressed = Some(SelectPress::RightClicked);
+            self.right_click();
+        } else if self.touch.as_ref().is_some_and(|touch| touch.dragging) {
             self.clear_touch();
         } else if let Some(touch) = &mut self.touch {
             if touch.second_tap {
@@ -1542,12 +1580,13 @@ impl CompanionSession {
                 touch.dragging = self.input.start_drag();
             } else {
                 touch.right_clicked = true;
-                self.input.right_click();
+                self.right_click();
             }
         }
     }
 
     fn clear_touch(&mut self) {
+        self.select_pressed = None;
         if self.touch.take().is_some_and(|touch| touch.dragging) {
             self.input.end_drag();
             self.suppress_click_echo(Instant::now());
@@ -1599,6 +1638,10 @@ impl CompanionSession {
         };
         match phase {
             TouchPhase::Began => {
+                // A touch stream takes over from the Select button so the
+                // same physical hold cannot trigger a second right click.
+                let right_clicked =
+                    matches!(self.select_pressed.take(), Some(SelectPress::RightClicked));
                 if self.touch.is_some() {
                     self.clear_touch();
                 }
@@ -1612,7 +1655,7 @@ impl CompanionSession {
                     second_tap,
                     drag_attempted: false,
                     dragging: false,
-                    right_clicked: false,
+                    right_clicked,
                 });
             }
             TouchPhase::Moved | TouchPhase::Ended => {
@@ -1634,6 +1677,12 @@ impl CompanionSession {
                         touch.drag_attempted = true;
                     }
                 }
+                let right_click = self.mode == TrackpadMode::Mouse
+                    && elapsed >= RIGHT_CLICK_HOLD
+                    && touch.can_right_click();
+                if right_click {
+                    touch.right_clicked = true;
+                }
                 if point != touch.last {
                     let (dx, dy) = (x - touch.last.0, y - touch.last.1);
                     if touch.dragging {
@@ -1647,6 +1696,9 @@ impl CompanionSession {
                 }
                 if phase == TouchPhase::Moved {
                     touch.last = point;
+                    if right_click {
+                        self.right_click();
+                    }
                     return;
                 }
                 let touch = self.touch.take().unwrap();
@@ -1654,13 +1706,9 @@ impl CompanionSession {
                     self.input.end_drag();
                     self.suppress_click_echo(now);
                 } else if touch.right_clicked {
-                    self.suppress_click_echo(now);
-                } else if self.mode == TrackpadMode::Mouse
-                    && !touch.second_tap
-                    && touch.distance < DRAG_MOVE_DISTANCE
-                    && elapsed >= RIGHT_CLICK_HOLD
-                {
-                    self.input.right_click();
+                    if right_click {
+                        self.right_click();
+                    }
                     self.suppress_click_echo(now);
                 } else if touch.distance < TAP_MAX_DISTANCE
                     && !touch.drag_attempted

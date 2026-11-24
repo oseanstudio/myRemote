@@ -193,6 +193,12 @@ impl RemoteInput for Desktop {
     }
 
     #[cfg(target_os = "macos")]
+    fn clear_text(&self, field: u64) -> bool {
+        let _keyboard = self.keyboard.lock().unwrap();
+        platform::Desktop::clear_text(field)
+    }
+
+    #[cfg(target_os = "macos")]
     fn accept_suggestion(&self, field: u64, typed: &str, word: &str, following: &str) -> bool {
         let _keyboard = self.keyboard.lock().unwrap();
         platform::Desktop::accept_suggestion(field, typed, word, following)
@@ -318,6 +324,14 @@ impl RemoteInput for DryRun {
             "Received keyboard edit ({backspaces} backspaces, {deletes} deletes, {} characters)",
             text.chars().count()
         );
+        true
+    }
+
+    fn clear_text(&self, field: u64) -> bool {
+        if self.focused_text_field() != Some(field) {
+            return false;
+        }
+        println!("Received keyboard clear");
         true
     }
 }

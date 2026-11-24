@@ -377,10 +377,29 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
             "targetSessionUUID"
         ] = plistlib.UID(250)
         keyboard_edit(first, plistlib.dumps(invalid_target, fmt=plistlib.FMT_BINARY))
+        # An assertion for another phone's UUID must not clear this field.
+        keyboard_edit(first, get_rti_clear_text_payload(second_id))
+        clear = plistlib.loads(get_rti_clear_text_payload(first_id))
+        objects = clear["$objects"]
+        operations = objects[clear["$top"]["textOperations"].data]
+        assertion = operations["textToAssert"].data
+        objects[assertion] = "existing text"
+        keyboard_edit(first, plistlib.dumps(clear, fmt=plistlib.FMT_BINARY))
+        keyboard_edit(first, MARKED_WORD)
         keyboard_edit(first, get_rti_clear_text_payload(first_id))
+        keyboard_edit(first, get_rti_input_text_payload(first_id, " "))
         keyboard_edit(first, get_rti_input_text_payload(first_id, "é🙂"))
         await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard clear"
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 1 characters)"
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 2 characters)"
+
+        # Apple's targetless version-one format uses the armed field scope.
+        objects[assertion] = ""
+        del operations["targetSessionUUID"]
+        keyboard_edit(first, plistlib.dumps(clear, fmt=plistlib.FMT_BINARY))
+        await command(first, "FetchAttentionState", {})
+        expect(r"^Received keyboard clear$")
 
         payload = plistlib.loads(get_rti_input_text_payload(second_id, ""))
         operations = payload["$objects"][payload["$top"]["textOperations"].data]
@@ -452,6 +471,8 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         assert replacement_id != second_id
         # An edit without a UUID must never carry over into the new field.
         keyboard_edit(second, SESSION_KEYBOARD_EDIT)
+        keyboard_edit(second, plistlib.dumps(clear, fmt=plistlib.FMT_BINARY))
+        keyboard_edit(second, get_rti_clear_text_payload(second_id))
         keyboard_edit(second, get_rti_input_text_payload(second_id, "old focus"))
         keyboard_edit(second, get_rti_input_text_payload(replacement_id, "new focus"))
         await command(second, "FetchAttentionState", {})
@@ -585,6 +606,22 @@ async def exercise_gestures(port, credentials, second_credentials, expect):
         await flush_input()
         assert expect(r"^Received (.*)$")[1] == "right-click"
         touch(3)
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+
+        # A hold remains eligible with small drift and a continuous stream
+        # of updates. Phone timestamps make the sequence deterministic.
+        touch_event(client, 1, CoordinateX=120, CoordinateY=120, Nanoseconds=2_000_000_000)
+        touch_event(client, 2, CoordinateX=150, CoordinateY=120, Nanoseconds=2_250_000_000)
+        touch_event(client, 5, CoordinateX=150, CoordinateY=120, Nanoseconds=2_550_000_000)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "pointer motion (30.0, 0.0)"
+        assert expect(r"^Received (.*)$")[1] == "right-click"
+        touch(3, x=150)
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+
+        # Some layouts send a held Select without starting a touch stream.
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 1})
+        assert expect(r"^Received (.*)$")[1] == "right-click"
         await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
 
         tap()
