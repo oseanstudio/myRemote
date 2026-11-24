@@ -41,6 +41,7 @@ type NearbyDiagnostic = JoinHandle<io::Result<Option<String>>>;
 struct State {
     options: Options,
     runtime: Runtime,
+    menu: Retained<NSMenu>,
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     accessibility_approval: RefCell<Option<ApprovalWatch>>,
@@ -178,9 +179,10 @@ define_class!(
             self.request_accessibility(false);
         }
 
-        #[unsafe(method(myRemotePollAccessibility:))]
-        fn poll_accessibility(&self, _timer: &NSTimer) {
+        #[unsafe(method(myRemotePollMenu:))]
+        fn poll_menu(&self, _timer: &NSTimer) {
             self.poll_accessibility_setup();
+            self.poll_nearby_diagnostic();
         }
 
         #[unsafe(method(myRemoteLocalNetwork:))]
@@ -254,13 +256,17 @@ define_class!(
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
                 return;
             }
-            self.poll_nearby_diagnostic();
         }
     }
 );
 
 impl MenuController {
-    fn new(mtm: MainThreadMarker, options: Options, runtime: Runtime) -> Retained<Self> {
+    fn new(
+        mtm: MainThreadMarker,
+        options: Options,
+        runtime: Runtime,
+        menu: Retained<NSMenu>,
+    ) -> Retained<Self> {
         let updater = RefCell::new(Updater::new(&options));
         let approval = if options.dry_run {
             None
@@ -281,6 +287,7 @@ impl MenuController {
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
+            menu,
             active: RefCell::new(None),
             error: RefCell::new(None),
             accessibility_approval: RefCell::new(approval),
@@ -425,6 +432,8 @@ impl MenuController {
             .nearby_diagnostic
             .take()
             .expect("completed diagnostic");
+        // Dismiss the menu if it is tracking so the result can appear immediately.
+        state.menu.cancelTracking();
         match state.runtime.block_on(capture) {
             Ok(Ok(Some(report))) => {
                 let alert = self.make_alert("Nearby Discovery Diagnostic", &report);
@@ -524,8 +533,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     autoreleasepool(|_| {
         let app = NSApplication::sharedApplication(mtm);
         app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-        let controller = MenuController::new(mtm, options, runtime);
         let menu = NSMenu::new(mtm);
+        let controller = MenuController::new(mtm, options, runtime, menu.clone());
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
         controller.add_item(
@@ -592,7 +601,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.start();
         // Wait for AppKit's event loop before asking macOS to show a permission prompt.
         // Each selector targets the live controller and takes one NSTimer argument.
-        let (prompt_timer, accessibility_timer, poll_timer) = unsafe {
+        let (prompt_timer, menu_timer, poll_timer) = unsafe {
             let prompt = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.0,
                 &controller,
@@ -600,14 +609,14 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
                 None,
                 false,
             );
-            let accessibility = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+            let menu = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
                 0.25,
                 &controller,
-                sel!(myRemotePollAccessibility:),
+                sel!(myRemotePollMenu:),
                 None,
                 true,
             );
-            NSRunLoop::mainRunLoop().addTimer_forMode(&accessibility, NSRunLoopCommonModes);
+            NSRunLoop::mainRunLoop().addTimer_forMode(&menu, NSRunLoopCommonModes);
             let poll = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.25,
                 &controller,
@@ -615,14 +624,14 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
                 None,
                 true,
             );
-            (prompt, accessibility, poll)
+            (prompt, menu, poll)
         };
         if controller.ivars().options.pair {
             controller.show_pairing();
         }
         app.run();
         prompt_timer.invalidate();
-        accessibility_timer.invalidate();
+        menu_timer.invalidate();
         poll_timer.invalidate();
         controller.stop();
         controller.ivars().accessibility_approval.take();

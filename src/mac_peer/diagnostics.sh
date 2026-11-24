@@ -35,33 +35,47 @@ summarize() {
 }
 
 capture() (
-    # Non-promiscuous and mDNS only. Packet text goes straight to the counters.
-    /usr/sbin/tcpdump -i awdl0 -p -nn -l -t -vv -s 0 'udp port 5353' &
+    duration=$1
+    shift
+    "$@" &
     capture_pid=$!
-    trap 'kill -INT %1 2>/dev/null || :; wait "$capture_pid" || :; exit 1' HUP INT TERM
-    for ((second = 0; second < 30; second++)); do
-        kill -0 %1 2>/dev/null || break
+    trap 'kill -KILL %1 2>/dev/null || :; exit 1' HUP INT TERM
+    for ((second = 0; second < duration; second++)); do
+        if ! kill -0 %1 2>/dev/null; then
+            wait "$capture_pid"
+            return
+        fi
         /bin/sleep 1
     done
-    # A job spec only addresses the tcpdump child tracked by this shell.
-    kill -INT %1 2>/dev/null || :
+
+    # TERM lets tcpdump flush normally. A blocked capture gets one second before
+    # KILL. The job spec addresses only the child tracked by this shell.
+    if kill -TERM %1 2>/dev/null; then
+        /bin/sleep 1
+        kill -KILL %1 2>/dev/null || :
+        status=0
+        wait "$capture_pid" || status=$?
+        case "$status" in
+            0|137|143) return 0 ;;
+            *) return "$status" ;;
+        esac
+    fi
     wait "$capture_pid"
 )
 
-if [[ ${1:-} == --summarize && $# == 2 ]]; then
-    summarize "$2"
-    exit
-fi
-
-interface=$(/sbin/ifconfig awdl0) || {
-    echo "No address on awdl0" >&2
-    exit 1
+diagnostic() {
+    interface=$(/sbin/ifconfig awdl0) || {
+        echo "No address on awdl0" >&2
+        return 1
+    }
+    addresses=$(printf '%s\n' "$interface" | /usr/bin/awk '
+        $1 == "inet" || $1 == "inet6" {sub(/%.*/, "", $2); print $2}
+    ')
+    if [[ -z $addresses ]]; then
+        echo "No address on awdl0" >&2
+        return 1
+    fi
+    # Non-promiscuous and mDNS only. Packet text goes straight to the counters.
+    capture 30 /usr/sbin/tcpdump -i awdl0 --immediate-mode -p -nn -l -t -vv -s 0 'udp port 5353' |
+        summarize "$addresses"
 }
-addresses=$(printf '%s\n' "$interface" | /usr/bin/awk '
-    $1 == "inet" || $1 == "inet6" {sub(/%.*/, "", $2); print $2}
-')
-if [[ -z $addresses ]]; then
-    echo "No address on awdl0" >&2
-    exit 1
-fi
-capture | summarize "$addresses"

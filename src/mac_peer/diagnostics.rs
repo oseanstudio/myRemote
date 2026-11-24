@@ -1,9 +1,12 @@
 use std::io;
 use std::process::Stdio;
+use std::time::Duration;
 
 use tokio::process::Command;
+use tokio::time::timeout;
 
-const CAPTURE: &str = include_str!("diagnostics.sh");
+const CAPTURE: &str = concat!(include_str!("diagnostics.sh"), "\ndiagnostic\n");
+const DIAGNOSTIC_DEADLINE: Duration = Duration::from_secs(75);
 const AUTHORIZE: &str = r#"
 on run argv
     set commandText to "/usr/bin/env -i LC_ALL=C /bin/bash -c " & quoted form of (item 1 of argv)
@@ -16,14 +19,21 @@ end run
 pub async fn capture() -> io::Result<Option<String>> {
     // Only the embedded script crosses the privilege boundary. It runs with a clean
     // environment and prints four counts without writing a packet capture to disk.
-    let result = Command::new("/usr/bin/osascript")
+    let mut authorize = Command::new("/usr/bin/osascript");
+    authorize
         .env_clear()
         .current_dir("/")
         .args(["-e", AUTHORIZE, CAPTURE])
         .stdin(Stdio::null())
-        .kill_on_drop(true)
-        .output()
-        .await?;
+        .kill_on_drop(true);
+    let result = timeout(DIAGNOSTIC_DEADLINE, authorize.output())
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "The check timed out. Start it again and approve the macOS administrator prompt if it appears.",
+            )
+        })??;
     if !result.status.success() {
         let error = String::from_utf8_lossy(&result.stderr);
         if error.contains("(-128)") {
@@ -65,8 +75,9 @@ mod tests {
 
     #[test]
     fn summarizes_only_the_expected_packets() {
+        let script = concat!(include_str!("diagnostics.sh"), "\nsummarize \"$1\"\n");
         let mut test = Command::new("/bin/bash")
-            .args(["-c", CAPTURE, "nearby", "--summarize", "fe80::1"])
+            .args(["-c", script, "nearby", "fe80::1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -85,6 +96,32 @@ IP6 (hlim 255, next-header UDP)\n\
         assert!(formatted.contains("Companion queries from peers: 1"));
         assert!(formatted.contains("Nearby replies or announcements from this Mac: 1"));
         assert!(report(b"5 1 1 1 unexpected").is_err());
+    }
+
+    #[tokio::test]
+    async fn returns_counts_when_the_capture_ignores_termination() {
+        let script = concat!(
+            include_str!("diagnostics.sh"),
+            r#"
+capture 1 /bin/bash -c '
+    trap "" TERM
+    printf "%s\n" "fe80::2.5353 > ff02::fb.5353: 0 PTR (QM)? _companion-link._tcp.local."
+    exec /bin/sleep 30
+' | summarize "fe80::1"
+"#,
+        );
+        let output = timeout(
+            Duration::from_secs(6),
+            tokio::process::Command::new("/bin/bash")
+                .args(["-c", script])
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("capture must close even when the child ignores TERM")
+        .unwrap();
+        assert!(output.status.success(), "{:?}", output.stderr);
+        assert_eq!(output.stdout, b"1 1 0 0\n");
     }
 
     #[test]
