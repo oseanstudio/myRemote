@@ -259,6 +259,38 @@ async def exercise_tv_remote(client, expect):
     assert legacy["_c"]["_vol"] == 0.25
 
 
+async def exercise_scroll_strip(client, expect):
+    await command(client, "HIDTouchStart", {"Width": 400, "Height": 500, "TouchFlags": 0})
+    touch_event(client, 1, CoordinateX=360, CoordinateY=250)
+    # Resting a finger in the strip must not start a right-click or drag.
+    await asyncio.sleep(0.55)
+    touch_event(client, 2, CoordinateX=320, CoordinateY=225)
+    touch_event(client, 3, CoordinateX=200, CoordinateY=200)
+    await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+
+    # Starting just outside the strip keeps the swipe as pointer movement,
+    # even after crossing the strip's boundary.
+    touch_event(client, 1, CoordinateX=339, CoordinateY=200)
+    touch_event(client, 2, CoordinateX=359, CoordinateY=245)
+    touch_event(client, 3, CoordinateX=379, CoordinateY=270)
+
+    # Renegotiating the surface restores the standard-size strip. Missing
+    # lift coordinates must not repeat the last scroll delta.
+    await command(client, "HIDTouchStart", {"Width": 1000, "Height": 1000, "TouchFlags": 0})
+    touch_event(client, 1, CoordinateX=870, CoordinateY=500)
+    touch_event(client, 2, CoordinateX=910, CoordinateY=530)
+    touch_event(client, 3)
+    touch_event(client, 1, CoordinateX=900, CoordinateY=500)
+    touch_event(client, 4)
+    touch_event(client, 2, CoordinateX=910, CoordinateY=550)
+    await command(client, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
+
+    for received in ("vertical scroll (-50.0)", "vertical scroll (-50.0)",
+                     "pointer motion (20.0, 45.0)", "pointer motion (20.0, 25.0)",
+                     "vertical scroll (30.0)", "button right"):
+        assert expect(r"^Received (.*)$")[1] == received
+
+
 class RemoteEvents:
     def __init__(self, client, *names):
         self.events = asyncio.Queue()
@@ -819,6 +851,7 @@ async def exercise(binary, state):
             assert await start_remote(client) == (identity, session_id)
             assert identity[1] == identity[2]
             await exercise_tv_remote(client, expect)
+            await exercise_scroll_strip(client, expect)
             await command(client, "TVRCSessionStop", {})
             assert await start_remote(client) == (identity, session_id)
             await command(client, "_sessionStop", {"_sid": (session_id << 32) | 456})
@@ -840,6 +873,10 @@ async def exercise(binary, state):
             expect(r"^Received pointer motion \(70.0, 15.0\)$")
             await command(client, "_hidC", {"_hidC": 6, "_hBtS": 2})
             expect(r"^Received click$")
+            await command(client, "_touchStart", {"_width": 500.0, "_height": 500.0})
+            for phase, x, y in [(1, 450, 300), (3, 440, 320), (4, 440, 320)]:
+                await command(client, "_hidT", {"_tPh": phase, "_cx": x, "_cy": y})
+            assert expect(r"^Received (.*)$")[1] == "vertical scroll (40.0)"
         finally:
             client.stop()
 

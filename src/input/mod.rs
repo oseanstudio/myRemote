@@ -26,6 +26,11 @@ mod platform;
 #[path = "windows.rs"]
 mod platform;
 
+#[cfg(target_os = "macos")]
+const SCROLL_SCALE: f64 = 1.0; // pixels per touch unit
+#[cfg(not(target_os = "macos"))]
+const SCROLL_SCALE: f64 = 4.0; // 120 units per wheel detent
+
 pub struct Desktop {
     state: Mutex<PointerState>,
     speed: f64,
@@ -48,6 +53,7 @@ struct PointerState {
     device: platform::Desktop,
     #[cfg(not(target_os = "macos"))]
     remainder: (f64, f64),
+    scroll_remainder: f64,
     dragging: bool,
 }
 
@@ -61,6 +67,7 @@ impl Desktop {
                 device: platform::Desktop::open()?,
                 #[cfg(not(target_os = "macos"))]
                 remainder: (0.0, 0.0),
+                scroll_remainder: 0.0,
                 dragging: false,
             }),
             speed,
@@ -114,6 +121,19 @@ impl RemoteInput for Desktop {
 
     fn move_pointer(&self, dx: f64, dy: f64) {
         self.pointer_move(dx, dy, false);
+    }
+
+    fn scroll_vertical(&self, delta: f64) {
+        let mut state = self.state.lock().unwrap();
+        if state.dragging {
+            return;
+        }
+        let total = state.scroll_remainder + delta * SCROLL_SCALE;
+        state.scroll_remainder = total.fract();
+        let units = total as i32;
+        if units != 0 {
+            state.device.scroll_vertical(units);
+        }
     }
 
     fn click(&self) {
@@ -258,6 +278,10 @@ impl RemoteInput for DryRun {
 
     fn move_pointer(&self, dx: f64, dy: f64) {
         println!("Received pointer motion ({dx:.1}, {dy:.1})");
+    }
+
+    fn scroll_vertical(&self, delta: f64) {
+        println!("Received vertical scroll ({delta:.1})");
     }
 
     fn click(&self) {

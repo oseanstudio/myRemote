@@ -31,6 +31,9 @@ pub enum PlaybackAction {
 pub trait RemoteInput: Send + Sync + 'static {
     fn button(&self, name: &str);
     fn move_pointer(&self, dx: f64, dy: f64);
+    /// Scroll vertically from a touch delta scaled to a 1000-unit surface.
+    /// A positive delta scrolls toward the top of the page.
+    fn scroll_vertical(&self, _delta: f64) {}
     fn click(&self);
     fn double_click(&self) {
         self.click();

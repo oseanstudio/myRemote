@@ -30,6 +30,8 @@ use crate::{FrameType, PlaybackAction, PlaybackState, VideoSource};
 pub const DEVICE_MODEL: &str = "AppleTV14,1";
 pub(crate) const SOURCE_VERSION: &str = "715.2";
 const REMOTE_SERVICE: &str = "com.apple.tvremoteservices";
+const DEFAULT_TOUCH_SIZE: f64 = 1000.0;
+const SCROLL_STRIP_START: f64 = 0.85;
 const SWIPE_MIN_DISTANCE: f64 = 150.0; // touchpad units; the surface is 1000x1000
 const TAP_MAX_DISTANCE: f64 = 60.0; // below this a touch sequence counts as a tap
 const MULTI_TAP_WINDOW: Duration = Duration::from_millis(500);
@@ -90,6 +92,7 @@ struct ActiveTouch {
     drag_attempted: bool,
     dragging: bool,
     right_clicked: bool,
+    scrolling: bool,
 }
 
 impl ActiveTouch {
@@ -254,6 +257,8 @@ pub(crate) struct CompanionSession {
     media_commands: Option<MediaCommands>,
     seek_hold: Option<SeekHold>,
     next_event_id: u32,
+    touch_width: f64,
+    touch_height: f64,
     touch: Option<ActiveTouch>,
     select_pressed: Option<SelectPress>,
     last_click: Option<Click>,
@@ -306,6 +311,8 @@ impl CompanionSession {
             media_commands: None,
             seek_hold: None,
             next_event_id: 0x8000_0000 | rand::random::<u32>(),
+            touch_width: DEFAULT_TOUCH_SIZE,
+            touch_height: DEFAULT_TOUCH_SIZE,
             touch: None,
             select_pressed: None,
             last_click: None,
@@ -810,12 +817,22 @@ impl CompanionSession {
                 self.send_response(xid, None, 0).await?;
             }
             Some("_touchStart" | "HIDTouchStart") => {
-                let key = if self.current_identifier.as_deref() == Some("HIDTouchStart") {
-                    "Identifier"
-                } else {
-                    "_i"
-                };
+                let (key, width, height) =
+                    if self.current_identifier.as_deref() == Some("HIDTouchStart") {
+                        ("Identifier", "Width", "Height")
+                    } else {
+                        ("_i", "_width", "_height")
+                    };
                 self.clear_touch();
+                let size = |key| {
+                    content
+                        .get(key)
+                        .and_then(Value::as_float)
+                        .filter(|value| (1.0..=4000.0).contains(value))
+                        .unwrap_or(DEFAULT_TOUCH_SIZE)
+                };
+                self.touch_width = size(width);
+                self.touch_height = size(height);
                 self.send_response(
                     xid,
                     Some(Value::dict(vec![Value::kv(key, Value::Int(1))])),
@@ -1600,7 +1617,9 @@ impl CompanionSession {
             _ => {}
         }
         let touch = self.touch.as_ref()?;
-        if touch.dragging {
+        if touch.scrolling {
+            None
+        } else if touch.dragging {
             Some(touch.updated + DRAG_IDLE_LIMIT)
         } else if touch.drag_pending() {
             Some(touch.started.received + DRAG_HOLD)
@@ -1637,9 +1656,12 @@ impl CompanionSession {
 
     fn clear_touch(&mut self) {
         let button_drag = matches!(self.select_pressed.take(), Some(SelectPress::Dragging(_)));
-        let touch_drag = self.touch.take().is_some_and(|touch| touch.dragging);
-        if button_drag || touch_drag {
+        let touch = self.touch.take();
+        let dragging = button_drag || touch.as_ref().is_some_and(|touch| touch.dragging);
+        if dragging {
             self.input.end_drag();
+        }
+        if dragging || touch.is_some_and(|touch| touch.scrolling) {
             self.suppress_click_echo(Instant::now());
         }
     }
@@ -1695,6 +1717,12 @@ impl CompanionSession {
                 if self.touch.is_some() {
                     self.clear_touch();
                 }
+                let dragging = matches!(press, Some(SelectPress::Dragging(_)));
+                let right_clicked = matches!(press, Some(SelectPress::Consumed));
+                let scrolling = self.mode == TrackpadMode::Mouse
+                    && !dragging
+                    && !right_clicked
+                    && (self.touch_width * SCROLL_STRIP_START..=self.touch_width).contains(&x);
                 self.touch = Some(ActiveTouch {
                     origin: point,
                     last: point,
@@ -1703,14 +1731,28 @@ impl CompanionSession {
                     distance: 0.0,
                     click_count: self.click_count(time),
                     drag_attempted: false,
-                    dragging: matches!(press, Some(SelectPress::Dragging(_))),
-                    right_clicked: matches!(press, Some(SelectPress::Consumed)),
+                    dragging,
+                    right_clicked,
+                    scrolling,
                 });
             }
             TouchPhase::Moved | TouchPhase::Ended => {
                 let Some(touch) = &mut self.touch else {
                     return;
                 };
+                if touch.scrolling {
+                    let dy = y.clamp(0.0, self.touch_height)
+                        - touch.last.1.clamp(0.0, self.touch_height);
+                    if dy != 0.0 {
+                        self.input
+                            .scroll_vertical(dy * (DEFAULT_TOUCH_SIZE / self.touch_height));
+                    }
+                    touch.last = point;
+                    if phase == TouchPhase::Ended {
+                        self.clear_touch();
+                    }
+                    return;
+                }
                 let dx = x - touch.origin.0;
                 let dy = y - touch.origin.1;
                 let distance = dx.abs().max(dy.abs());

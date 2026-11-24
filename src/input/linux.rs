@@ -23,6 +23,7 @@ const KEYS: &[(&str, KeyCode)] = &[
 pub struct Desktop {
     keyboard: VirtualDevice,
     mouse: VirtualDevice,
+    wheel_remainder: i32,
 }
 
 impl Desktop {
@@ -50,9 +51,15 @@ impl Desktop {
             .with_relative_axes(&AttributeSet::from_iter([
                 RelativeAxisCode::REL_X,
                 RelativeAxisCode::REL_Y,
+                RelativeAxisCode::REL_WHEEL,
+                RelativeAxisCode::REL_WHEEL_HI_RES,
             ]))?
             .build()?;
-        Ok(Self { keyboard, mouse })
+        Ok(Self {
+            keyboard,
+            mouse,
+            wheel_remainder: 0,
+        })
     }
 
     pub fn button(&mut self, name: &str) {
@@ -92,6 +99,19 @@ impl Desktop {
                 InputEvent::new(2, RelativeAxisCode::REL_Y.0, dy),
             ],
         );
+    }
+
+    pub fn scroll_vertical(&mut self, units: i32) {
+        const UNITS_PER_DETENT: i32 = 120;
+        let total = self.wheel_remainder + units;
+        let detents = total / UNITS_PER_DETENT;
+        self.wheel_remainder = total % UNITS_PER_DETENT;
+        let events = [
+            InputEvent::new(2, RelativeAxisCode::REL_WHEEL_HI_RES.0, units),
+            InputEvent::new(2, RelativeAxisCode::REL_WHEEL.0, detents),
+        ];
+        let event_count = if detents == 0 { 1 } else { 2 };
+        emit(&mut self.mouse, &events[..event_count]);
     }
 
     pub fn volume(&self) -> Option<f64> {

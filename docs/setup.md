@@ -53,6 +53,7 @@ Sign out and back in, then run the AppImage as your desktop user. If FUSE is una
 | iPhone Remote | Desktop |
 | --- | --- |
 | Touch surface | Move the mouse pointer. Tap to click, double-tap to double-click, and hold for a right-click. Tap once, then hold the second tap and move to drag. |
+| Right edge of the touch surface | Start a vertical swipe in the rightmost 15% to scroll. The strip has no visible divider, and swipes that start outside it move the pointer. |
 | Direction buttons | Arrow keys. Start with `--mode dpad` to also map touch swipes to arrows and taps to Enter. |
 | Back | Escape |
 | TV button | Home key |

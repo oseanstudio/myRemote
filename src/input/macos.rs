@@ -115,6 +115,14 @@ unsafe extern "C" {
     fn CGEventCreateKeyboardEvent(source: *mut c_void, key: u16, down: bool) -> Event;
     fn CGEventKeyboardSetUnicodeString(event: Event, length: usize, text: *const u16);
     fn CGEventCreateMouseEvent(source: *mut c_void, kind: u32, point: Point, button: u32) -> Event;
+    fn CGEventCreateScrollWheelEvent2(
+        source: *mut c_void,
+        unit: u32,
+        count: u32,
+        wheel1: i32,
+        wheel2: i32,
+        wheel3: i32,
+    ) -> Event;
     fn CGEventPost(tap: u32, event: Event);
     fn CGEventSetFlags(event: Event, flags: u64);
     fn CGEventSetIntegerValueField(event: Event, field: u32, value: i64);
@@ -520,6 +528,15 @@ impl Desktop {
             for kind in [1, 2] {
                 post_mouse(kind, point, 0, Some(number), Some(count));
             }
+        }
+    }
+
+    pub fn scroll_vertical(&mut self, pixels: i32) {
+        const PIXEL: u32 = 0;
+        if can_post_input() {
+            post_owned(unsafe {
+                CGEventCreateScrollWheelEvent2(null_mut(), PIXEL, 1, pixels, 0, 0)
+            });
         }
     }
 

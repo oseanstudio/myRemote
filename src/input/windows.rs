@@ -58,6 +58,19 @@ impl Desktop {
         send(&[mouse(MOUSEEVENTF_MOVE, dx, dy)]);
     }
 
+    pub fn scroll_vertical(&mut self, units: i32) {
+        send(&[INPUT {
+            r#type: INPUT_MOUSE,
+            Anonymous: INPUT_0 {
+                mi: MOUSEINPUT {
+                    dwFlags: MOUSEEVENTF_WHEEL,
+                    mouseData: units as u32,
+                    ..Default::default()
+                },
+            },
+        }]);
+    }
+
     pub fn click(&mut self, _count: i64) {
         send(&[
             mouse(MOUSEEVENTF_LEFTDOWN, 0, 0),
