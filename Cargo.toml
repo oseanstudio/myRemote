@@ -1,6 +1,6 @@
 [package]
 name = "myremote"
-version = "2.7.0"
+version = "2.8.0"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -43,7 +43,7 @@ libc = "0.2"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = [
     "std", "libc", "NSAlert", "NSApplication", "NSButton", "NSCell", "NSControl",
-    "NSImage", "NSMenu", "NSMenuItem", "NSResponder", "NSRunningApplication", "NSStatusBar",
+    "NSImage", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder", "NSRunningApplication", "NSStatusBar",
     "NSStatusBarButton", "NSStatusItem", "NSView", "NSWorkspace", "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [

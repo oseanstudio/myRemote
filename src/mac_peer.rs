@@ -1,4 +1,6 @@
 //! Opt-in peer-to-peer transport using macOS Network.framework.
+pub mod diagnostics;
+
 use std::ffi::{c_char, c_void, CString};
 use std::io;
 use std::ptr::{null, NonNull};

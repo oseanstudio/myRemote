@@ -6,13 +6,14 @@ use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
 use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAlert, NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSWorkspace,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSImage,
+    NSMenu, NSMenuDelegate, NSMenuItem, NSPasteboard, NSStatusBar, NSWorkspace,
 };
 use objc2_foundation::{
-    NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL,
+    NSArray, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL,
 };
 use tokio::runtime::Runtime;
+use tokio::task::JoinHandle;
 
 use crate::{
     input,
@@ -32,6 +33,10 @@ const LOCAL_NETWORK: isize = 9;
 const CONNECTION: isize = 14;
 const NEARBY: isize = 15;
 const NEARBY_STATUS: isize = 16;
+const NEARBY_DIAGNOSTIC: isize = 17;
+const NEARBY_DIAGNOSTIC_TITLE: &str = "Run Nearby Diagnostic…";
+
+type NearbyDiagnostic = JoinHandle<io::Result<Option<String>>>;
 
 struct State {
     options: Options,
@@ -44,6 +49,7 @@ struct State {
     nearby_preference: Option<PathBuf>,
     nearby: RefCell<Option<mac_peer::Nearby>>,
     nearby_failed: Cell<bool>,
+    nearby_diagnostic: RefCell<Option<NearbyDiagnostic>>,
     updater: RefCell<Updater>,
 }
 
@@ -109,6 +115,13 @@ define_class!(
                 let failed = self.ivars().nearby_failed.get()
                     || self.ivars().nearby.borrow().as_ref().is_some_and(mac_peer::Nearby::unavailable);
                 item.setHidden(!nearby_supported || !failed);
+            }
+            if let Some(item) = menu.itemWithTag(NEARBY_DIAGNOSTIC) {
+                let running = self.ivars().nearby_diagnostic.borrow().is_some();
+                item.setHidden(!nearby_supported || !self.ivars().nearby_enabled.get());
+                item.setEnabled(!running);
+                let title = if running { "Nearby Diagnostic in Progress…" } else { NEARBY_DIAGNOSTIC_TITLE };
+                item.setTitle(&NSString::from_str(title));
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
@@ -197,6 +210,27 @@ define_class!(
             self.refresh_nearby();
         }
 
+        #[unsafe(method(myRemoteRunNearbyDiagnostic:))]
+        fn run_nearby_diagnostic(&self, _sender: &NSMenuItem) {
+            let state = self.ivars();
+            if !state.nearby_enabled.get() || state.nearby_diagnostic.borrow().is_some() {
+                return;
+            }
+            let alert = self.make_alert(
+                "Nearby Discovery Diagnostic",
+                "After you approve the macOS prompt, open the Apple TV Remote device picker on your iPhone. This Mac will count direct Wi‑Fi discovery traffic for 30 seconds and show a summary you can copy.",
+            );
+            alert.addButtonWithTitle(objc2_foundation::ns_string!("Start"));
+            alert.addButtonWithTitle(objc2_foundation::ns_string!("Cancel"));
+            if alert.runModal() == NSAlertFirstButtonReturn
+                && state.nearby_enabled.get()
+                && state.nearby_diagnostic.borrow().is_none()
+            {
+                let task = state.runtime.spawn(mac_peer::diagnostics::capture());
+                state.nearby_diagnostic.replace(Some(task));
+            }
+        }
+
         #[unsafe(method(myRemoteQuit:))]
         fn quit(&self, _sender: &NSMenuItem) {
             self.stop();
@@ -218,7 +252,9 @@ define_class!(
             if self.ivars().updater.borrow_mut().poll() {
                 self.stop();
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
+                return;
             }
+            self.poll_nearby_diagnostic();
         }
     }
 );
@@ -253,6 +289,7 @@ impl MenuController {
             nearby_preference,
             nearby: RefCell::new(None),
             nearby_failed: Cell::new(false),
+            nearby_diagnostic: RefCell::new(None),
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -365,9 +402,53 @@ impl MenuController {
 
     fn stop(&self) {
         let state = self.ivars();
+        if let Some(capture) = state.nearby_diagnostic.take() {
+            capture.abort();
+        }
         state.nearby.take();
         if let Some(active) = state.active.take() {
             state.runtime.block_on(active.stop());
+        }
+    }
+
+    fn poll_nearby_diagnostic(&self) {
+        let state = self.ivars();
+        if !state
+            .nearby_diagnostic
+            .borrow()
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return;
+        }
+        let capture = state
+            .nearby_diagnostic
+            .take()
+            .expect("completed diagnostic");
+        match state.runtime.block_on(capture) {
+            Ok(Ok(Some(report))) => {
+                let alert = self.make_alert("Nearby Discovery Diagnostic", &report);
+                alert.addButtonWithTitle(objc2_foundation::ns_string!("Copy Summary"));
+                alert.addButtonWithTitle(objc2_foundation::ns_string!("Close"));
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    let text = NSString::from_str(&report);
+                    let pasteboard = NSPasteboard::generalPasteboard();
+                    pasteboard.clearContents();
+                    pasteboard
+                        .writeObjects(&NSArray::from_slice(&[ProtocolObject::from_ref(&*text)]));
+                }
+            }
+            Ok(Ok(None)) => {}
+            Ok(Err(error)) => {
+                self.alert("Nearby Diagnostic Could Not Complete", &error.to_string())
+            }
+            Err(error) => {
+                tracing::debug!("Nearby diagnostic task stopped: {error}");
+                self.alert(
+                    "Nearby Diagnostic Could Not Complete",
+                    "The diagnostic was interrupted.",
+                );
+            }
         }
     }
 
@@ -391,11 +472,15 @@ impl MenuController {
     }
 
     fn alert(&self, title: &str, text: &str) {
+        self.make_alert(title, text).runModal();
+    }
+
+    fn make_alert(&self, title: &str, text: &str) -> Retained<NSAlert> {
         let alert = NSAlert::new(self.mtm());
         alert.setMessageText(&NSString::from_str(title));
         alert.setInformativeText(&NSString::from_str(text));
         NSApplication::sharedApplication(self.mtm()).activate();
-        alert.runModal();
+        alert
     }
 
     fn add_item(&self, menu: &NSMenu, title: &str, action: Option<Sel>, tag: isize) {
@@ -457,6 +542,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             "Nearby iPhone (Beta)",
             Some(sel!(myRemoteToggleNearby:)),
             NEARBY,
+        );
+        controller.add_item(
+            &menu,
+            NEARBY_DIAGNOSTIC_TITLE,
+            Some(sel!(myRemoteRunNearbyDiagnostic:)),
+            NEARBY_DIAGNOSTIC,
         );
         controller.add_item(&menu, "Nearby iPhone unavailable", None, NEARBY_STATUS);
         controller.add_item(

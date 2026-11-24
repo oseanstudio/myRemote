@@ -79,6 +79,8 @@ The receiver uses Bonjour for discovery. On macOS, it advertises through the sys
 
 On macOS, **Nearby iPhone (Beta)** in the menu enables experimental peer-to-peer Wi‑Fi alongside normal discovery. Keep Wi‑Fi and Bluetooth turned on on both devices. To test without a shared network, disconnect both devices from their Wi‑Fi networks while leaving the radios on, unplug Ethernet if connected, and open Apple TV Remote on the nearby iPhone. Look for the name ending in **· Nearby**. If prompted, use **Pair iPhone…** on the Mac. Apple TV Remote discovery and reconnection over this link need testing on an iPhone.
 
+If the iPhone does not find myRemote, choose **Run Nearby Diagnostic…** with the beta enabled. Start the check, approve the macOS administrator prompt if it appears, and open the Apple TV Remote device picker during the 30-second check. **Copy Summary** copies only packet counts for troubleshooting.
+
 The menu app opens a two-minute pairing window when a phone requests a code. The code is shown only on the target computer, and pairing closes once the phone is enrolled. The server verifies each paired controller and encrypts the input session. To revoke access, stop myRemote and run `myremote --forget-phones` with the same `--state-dir` override, if used. If the iPhone still shows outdated credentials, remove the old device from the picker if available, reopen Control Center, and pair again.
 
 ## Tailscale command-line setup
