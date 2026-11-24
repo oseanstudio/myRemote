@@ -67,6 +67,7 @@ pub(crate) struct Diagnostics {
     pub(crate) last_verify_ms: Mutex<Option<u128>>,
     pub(crate) last_open_ms: Mutex<Option<u128>>,
     pub double_clicks: AtomicU32,
+    pub triple_clicks: AtomicU32,
     pub right_clicks: AtomicU32,
     pub keyboard_subscriptions: AtomicU32,
     pub keyboard_focuses: AtomicU32,
@@ -158,7 +159,7 @@ impl PairingState {
             .map_or_else(|| "—".to_owned(), |version| version.to_string());
         let failed = |error: KeyboardEditError| read(&counters.keyboard_failures[error as usize]);
         format!(
-            "Companion sockets / verified: {} / {}\nStale sockets replaced / warm reopens: {} / {}\nLast socket → verified: {}\nLast verified → first Remote ready: {}\nVerify rejects / timeouts / protocol errors: {} / {} / {}\nMedia Remote / AirPlay probes: {} / {}\nKeyboard requests / fields offered: {} / {}\nKeyboard messages / decoded / matched / posted: {} / {} / {} / {}\nKeyboard composition updates / suggestions: {} / {}\nKeyboard envelope / archive / operation errors: {} / {} / {}\nKeyboard target / output errors / no edit: {} / {} / {}\nKeyboard session-scoped / scope rejected: {} / {}\nLast keyboard version: {keyboard_version}\nLast player advertised: {player}\nNative skip commands / Back presses: {} / {}\nDouble-click / right-click events sent: {} / {}",
+            "Companion sockets / verified: {} / {}\nStale sockets replaced / warm reopens: {} / {}\nLast socket → verified: {}\nLast verified → first Remote ready: {}\nVerify rejects / timeouts / protocol errors: {} / {} / {}\nMedia Remote / AirPlay probes: {} / {}\nKeyboard requests / fields offered: {} / {}\nKeyboard messages / decoded / matched / posted: {} / {} / {} / {}\nKeyboard composition updates / suggestions: {} / {}\nKeyboard envelope / archive / operation errors: {} / {} / {}\nKeyboard target / output errors / no edit: {} / {} / {}\nKeyboard session-scoped / scope rejected: {} / {}\nLast keyboard version: {keyboard_version}\nLast player advertised: {player}\nNative skip commands / Back presses: {} / {}\nDouble-click / triple-click / right-click events sent: {} / {} / {}",
             counters.connections.load(Ordering::Relaxed),
             read(&counters.verified_connections),
             read(&counters.replaced_connections),
@@ -189,6 +190,7 @@ impl PairingState {
             read(&counters.native_skips),
             read(&counters.back_presses),
             read(&counters.double_clicks),
+            read(&counters.triple_clicks),
             read(&counters.right_clicks),
         )
     }

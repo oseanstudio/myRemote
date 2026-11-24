@@ -576,19 +576,21 @@ async def exercise_gestures(port, credentials, second_credentials, expect):
         await start_remote(client)
         await start_remote(other)
 
-        tap()
-        tap()
         # Some versions send HID Select as well as the touch sequence.
-        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
-        assert expect(r"^Received (.*)$")[1] == "click"
-        assert expect(r"^Received (.*)$")[1] == "double-click"
-
-        # Some Remote layouts send only HID Select. A native double tap
-        # must work on this path as well as the touch-event path.
-        for _ in range(2):
+        for _ in range(3):
+            tap()
             await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
         assert expect(r"^Received (.*)$")[1] == "click"
         assert expect(r"^Received (.*)$")[1] == "double-click"
+        assert expect(r"^Received (.*)$")[1] == "triple-click"
+
+        # Button-only layouts still emit a native multi-click sequence.
+        for _ in range(3):
+            for state in (1, 2):
+                await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": state})
+        assert expect(r"^Received (.*)$")[1] == "click"
+        assert expect(r"^Received (.*)$")[1] == "double-click"
+        assert expect(r"^Received (.*)$")[1] == "triple-click"
 
         touch_event(client, 1, CoordinateX=120, CoordinateY=120, Nanoseconds=1_000_000_000)
         touch_event(client, 3, Nanoseconds=1_050_000_000)
@@ -602,6 +604,7 @@ async def exercise_gestures(port, credentials, second_credentials, expect):
         await flush_input()
         assert expect(r"^Received (.*)$")[1] == "double-click"
 
+        await asyncio.sleep(0.55)
         touch(1)
         await flush_input()
         assert expect(r"^Received (.*)$")[1] == "right-click"
@@ -634,6 +637,42 @@ async def exercise_gestures(port, credentials, second_credentials, expect):
         await flush_input()
         assert expect(r"^Received (.*)$")[1] == "drag motion (42.0, 15.0)"
         expect(r"^Received drag end$")
+
+        # Movement during the second hold stays on its target until the
+        # button goes down. Both deltas then become drag motion.
+        tap()
+        touch_event(client, 1, CoordinateX=120, CoordinateY=120, Nanoseconds=3_000_000_000)
+        touch_event(client, 2, CoordinateX=151, CoordinateY=120, Nanoseconds=3_060_000_000)
+        touch_event(client, 2, CoordinateX=162, CoordinateY=135, Nanoseconds=3_190_000_000)
+        touch_event(client, 3, Nanoseconds=3_240_000_000)
+        await flush_input()
+        for received in ("click", "drag start", "drag motion (31.0, 0.0)",
+                         "drag motion (11.0, 15.0)", "drag end"):
+            assert expect(r"^Received (.*)$")[1] == received
+
+        # A quick, larger swipe after a tap still produces ordinary motion.
+        tap()
+        touch_event(client, 1, CoordinateX=120, CoordinateY=120, Nanoseconds=4_000_000_000)
+        touch_event(client, 2, CoordinateX=151, CoordinateY=120, Nanoseconds=4_040_000_000)
+        touch_event(client, 2, CoordinateX=195, CoordinateY=120, Nanoseconds=4_080_000_000)
+        touch_event(client, 3, Nanoseconds=4_110_000_000)
+        await flush_input()
+        assert expect(r"^Received (.*)$")[1] == "click"
+        assert expect(r"^Received (.*)$")[1] == "pointer motion (75.0, 0.0)"
+
+        # A held Select can start the drag before touch coordinates arrive.
+        tap()
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 1})
+        assert expect(r"^Received (.*)$")[1] == "click"
+        assert expect(r"^Received (.*)$")[1] == "drag start"
+        touch(1)
+        touch(2, x=162, y=135)
+        await command(client, "HIDCommand", {"HIDCommand": 6, "HIDButtonState": 2})
+        touch(2, x=175, y=135)
+        touch(3, x=175, y=135)
+        await flush_input()
+        for received in ("drag motion (42.0, 15.0)", "drag motion (13.0, 0.0)", "drag end"):
+            assert expect(r"^Received (.*)$")[1] == received
 
         tap()
         touch(1)

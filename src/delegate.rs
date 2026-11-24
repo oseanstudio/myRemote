@@ -35,6 +35,9 @@ pub trait RemoteInput: Send + Sync + 'static {
     fn double_click(&self) {
         self.click();
     }
+    fn triple_click(&self) {
+        self.click();
+    }
     fn right_click(&self) {}
     fn start_drag(&self) -> bool {
         false

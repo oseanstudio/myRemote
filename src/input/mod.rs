@@ -94,6 +94,13 @@ impl Desktop {
             }
         }
     }
+
+    fn click_count(&self, count: i64) {
+        let mut state = self.state.lock().unwrap();
+        if !state.dragging {
+            state.device.click(count);
+        }
+    }
 }
 
 impl RemoteInput for Desktop {
@@ -110,17 +117,15 @@ impl RemoteInput for Desktop {
     }
 
     fn click(&self) {
-        let mut state = self.state.lock().unwrap();
-        if !state.dragging {
-            state.device.click(1);
-        }
+        self.click_count(1);
     }
 
     fn double_click(&self) {
-        let mut state = self.state.lock().unwrap();
-        if !state.dragging {
-            state.device.click(2);
-        }
+        self.click_count(2);
+    }
+
+    fn triple_click(&self) {
+        self.click_count(3);
     }
 
     fn right_click(&self) {
@@ -264,6 +269,10 @@ impl RemoteInput for DryRun {
 
     fn double_click(&self) {
         println!("Received double-click");
+    }
+
+    fn triple_click(&self) {
+        println!("Received triple-click");
     }
 
     fn right_click(&self) {

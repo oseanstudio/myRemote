@@ -503,7 +503,7 @@ impl Desktop {
         );
         if next != point {
             let kind = if dragging { 6 } else { 5 };
-            if post_mouse(kind, next, 0, self.drag_number, None) {
+            if post_mouse(kind, next, 0, self.drag_number, dragging.then_some(1)) {
                 self.pointer = Some((Instant::now(), next));
             }
         } else {
