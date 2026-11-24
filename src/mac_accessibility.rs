@@ -312,16 +312,24 @@ fn record_release(state_dir: &Path, version: &str) -> io::Result<bool> {
         .truncate(false)
         .open(state_dir.join("accessibility-release"))?;
     installed.try_lock()?;
-    let mut last_release = String::new();
-    installed.read_to_string(&mut last_release)?;
-    if last_release == version {
-        return Ok(false);
-    }
-    installed.rewind()?;
-    installed.write_all(version.as_bytes())?;
-    installed.set_len(version.len() as u64)?;
-    installed.sync_data()?;
-    Ok(true)
+    let recorded = (|| -> io::Result<bool> {
+        let mut last_release = String::new();
+        installed.read_to_string(&mut last_release)?;
+        if last_release == version {
+            return Ok(false);
+        }
+        installed.rewind()?;
+        installed.write_all(version.as_bytes())?;
+        installed.set_len(version.len() as u64)?;
+        installed.sync_data()?;
+        Ok(true)
+    })();
+    // Release the lock explicitly in case a concurrently spawned child inherited
+    // the file description before close-on-exec takes effect.
+    let unlocked = installed.unlock();
+    let recorded = recorded?;
+    unlocked?;
+    Ok(recorded)
 }
 
 #[cfg(test)]
