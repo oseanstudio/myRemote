@@ -9,7 +9,8 @@ mod platform;
 
 #[cfg(target_os = "macos")]
 pub use platform::{
-    accessibility_is_trusted, can_post_input, request_accessibility_entry, request_input_permission,
+    accessibility_is_trusted, can_post_input, probe_accessibility, request_accessibility_entry,
+    request_input_permission,
 };
 #[cfg(target_os = "macos")]
 #[path = "macos_media.rs"]

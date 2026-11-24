@@ -359,6 +359,20 @@ pub fn accessibility_is_trusted() -> bool {
     unsafe { AXIsProcessTrusted() }
 }
 
+pub fn probe_accessibility() -> bool {
+    // Ask for the focused application's AX object without reading its contents.
+    const AX_API_DISABLED: i32 = -25211;
+    let Some(system) = OwnedCf::new(unsafe { AXUIElementCreateSystemWide() }) else {
+        return accessibility_is_trusted();
+    };
+    unsafe { AXUIElementSetMessagingTimeout(system.0, 0.1) };
+    match system.attribute(c"AXFocusedApplication") {
+        Ok(_) => true,
+        Err(AX_API_DISABLED) => false,
+        Err(_) => accessibility_is_trusted(),
+    }
+}
+
 pub fn request_accessibility_entry() -> bool {
     // The dictionary refers only to process-lifetime Core Foundation constants.
     unsafe {

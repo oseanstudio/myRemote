@@ -1,6 +1,6 @@
 [package]
 name = "myremote"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -45,7 +45,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
     "NSStatusBarButton", "NSStatusItem", "NSView", "NSWorkspace", "objc2-core-foundation",
 ] }
 objc2-foundation = { version = "0.3", default-features = false, features = [
-    "std", "NSGeometry", "NSString", "NSTimer", "NSURL",
+    "std", "NSGeometry", "NSRunLoop", "NSString", "NSTimer", "NSURL",
 ] }
 
 [target.'cfg(windows)'.dependencies]

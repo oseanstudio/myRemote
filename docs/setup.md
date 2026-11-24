@@ -31,7 +31,7 @@ If your iPhone connects but the controls do nothing, press Back on the iPhone an
 
 ### Updates
 
-myRemote checks GitHub in the background once every 24 hours while it is running. On Mac, a download icon appears to the left of the app name when an update is available. Hover to see the new version and click to install it. On Windows and Linux, choose **Update to…** in the tray menu.
+myRemote checks GitHub in the background once every 24 hours while it is running. On Mac, click the update icon to the left of the app name to check now and install any available update. The icon changes to a download arrow when a release is available. Hover over it to see the version. On Windows and Linux, use the update action in the tray menu.
 
 Install myRemote in a writable folder to enable replacement. On macOS, move the app out of the DMG first. On Linux, launch the AppImage itself and have `curl` installed. An update briefly interrupts the receiver and preserves pairing and settings.
 

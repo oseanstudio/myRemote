@@ -1,13 +1,15 @@
 use std::env;
+use std::ffi::{c_char, c_int, CStr};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::process::Command;
 use tokio::runtime::Runtime;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch, Notify};
 use tokio::task::JoinHandle;
 use tokio::time::{sleep, timeout};
 
@@ -19,6 +21,38 @@ const FAST_WATCH_TIME: Duration = Duration::from_secs(5 * 60);
 const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const BUNDLE_ID: &str = "com.oseanstudio.myremote";
+const PRIVACY_CHANGED: &CStr = c"com.apple.tcc.access.changed";
+
+unsafe extern "C" {
+    fn notify_register_check(name: *const c_char, token: *mut c_int) -> u32;
+    fn notify_check(token: c_int, changed: *mut c_int) -> u32;
+    fn notify_cancel(token: c_int) -> u32;
+}
+
+struct PrivacyChanges(c_int);
+
+impl PrivacyChanges {
+    fn subscribe(name: &CStr) -> Option<Self> {
+        let mut token = 0;
+        if unsafe { notify_register_check(name.as_ptr(), &mut token) } != 0 {
+            return None;
+        }
+        let subscription = Self(token);
+        subscription.changed(); // The first check reports a change even before a notification.
+        Some(subscription)
+    }
+
+    fn changed(&self) -> bool {
+        let mut changed = 0;
+        unsafe { notify_check(self.0, &mut changed) == 0 && changed != 0 }
+    }
+}
+
+impl Drop for PrivacyChanges {
+    fn drop(&mut self) {
+        unsafe { notify_cancel(self.0) };
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Permission {
@@ -29,7 +63,15 @@ pub enum Permission {
 
 impl Permission {
     pub fn current() -> Self {
-        if !input::accessibility_is_trusted() {
+        Self::from_accessibility(input::accessibility_is_trusted())
+    }
+
+    fn live() -> Self {
+        Self::from_accessibility(input::probe_accessibility())
+    }
+
+    fn from_accessibility(allowed: bool) -> Self {
+        if !allowed {
             Self::Missing
         } else if input::can_post_input() {
             Self::PostEvents
@@ -68,54 +110,94 @@ pub fn run_probe() -> Option<ExitCode> {
     if !env::args_os().nth(1).is_some_and(|arg| arg == PROBE_ARG) {
         return None;
     }
-    println!("{}", Permission::current().label());
+    println!("{}", Permission::live().label());
     Some(ExitCode::SUCCESS)
 }
 
 pub struct ApprovalWatch {
-    baseline: Permission,
+    changes: Option<PrivacyChanges>,
+    wake: Arc<Notify>,
+    observed: watch::Receiver<Permission>,
     granted: oneshot::Receiver<Permission>,
-    fresh: Permission,
+    detected_grant: Option<Permission>,
     worker: JoinHandle<()>,
 }
 
 impl ApprovalWatch {
-    pub fn start(bundle: PathBuf, runtime: &Runtime, baseline: Permission) -> Self {
+    pub fn start(bundle: PathBuf, runtime: &Runtime, initial: Permission) -> Self {
+        let changes = PrivacyChanges::subscribe(PRIVACY_CHANGED);
+        let wake = Arc::new(Notify::new());
+        let worker_wake = wake.clone();
+        let (report, observed) = watch::channel(initial);
         let (notify, granted) = oneshot::channel();
+        let mut progress = ApprovalProgress {
+            last: initial,
+            relaunched: Permission::previous_relaunch(),
+        };
+        let mut in_process = progress;
         let worker = runtime.spawn(async move {
-            let started = Instant::now();
-            loop {
-                let interval = if started.elapsed() < FAST_WATCH_TIME {
-                    PROBE_INTERVAL
-                } else {
-                    SLOW_PROBE_INTERVAL
-                };
+            let mut active_until = Instant::now() + FAST_WATCH_TIME;
+            let grant = loop {
+                // This can catch a live grant even if Launch Services is slow or unavailable.
+                if let Some(grant) = in_process.observe(Permission::live()) {
+                    break grant;
+                }
                 match probe_fresh_process(&bundle).await {
-                    Ok(permission) if permission > baseline => {
-                        let _ = notify.send(permission);
-                        break;
+                    Ok(permission) => {
+                        if permission < progress.last {
+                            active_until = Instant::now() + FAST_WATCH_TIME;
+                        }
+                        if let Some(grant) = progress.observe(permission) {
+                            break grant;
+                        }
+                        report.send_replace(permission);
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         tracing::debug!("Could not check Accessibility in a fresh process: {error}")
                     }
                 }
-                sleep(interval).await;
-            }
+                let interval =
+                    if progress.last < Permission::PostEvents && Instant::now() < active_until {
+                        PROBE_INTERVAL
+                    } else {
+                        SLOW_PROBE_INTERVAL
+                    };
+                tokio::select! {
+                    _ = sleep(interval) => {}
+                    _ = worker_wake.notified() => {
+                        active_until = Instant::now() + FAST_WATCH_TIME;
+                    }
+                }
+            };
+            let _ = notify.send(grant);
         });
         Self {
-            baseline,
+            changes,
+            wake,
+            observed,
             granted,
-            fresh: Permission::Missing,
+            detected_grant: None,
             worker,
         }
     }
 
+    pub fn permission(&self) -> Permission {
+        *self.observed.borrow()
+    }
+
+    pub fn check_now(&self) {
+        self.wake.notify_one();
+    }
+
     pub fn granted(&mut self) -> Option<Permission> {
-        if let Ok(permission) = self.granted.try_recv() {
-            self.fresh = permission;
+        if self.changes.as_ref().is_some_and(PrivacyChanges::changed) {
+            // A notification can concern any app. Only a successful probe can trigger a relaunch.
+            self.check_now();
         }
-        new_grant(self.baseline, Permission::current(), self.fresh)
+        if let Ok(permission) = self.granted.try_recv() {
+            self.detected_grant = Some(permission);
+        }
+        self.detected_grant
     }
 }
 
@@ -125,9 +207,21 @@ impl Drop for ApprovalWatch {
     }
 }
 
-fn new_grant(baseline: Permission, current: Permission, fresh: Permission) -> Option<Permission> {
-    let granted = current.max(fresh);
-    (granted > baseline).then_some(granted)
+#[derive(Clone, Copy)]
+struct ApprovalProgress {
+    last: Permission,
+    relaunched: Permission,
+}
+
+impl ApprovalProgress {
+    fn observe(&mut self, permission: Permission) -> Option<Permission> {
+        let gained = permission > self.last.max(self.relaunched);
+        self.last = permission;
+        if permission >= self.relaunched {
+            self.relaunched = Permission::Missing;
+        }
+        gained.then_some(permission)
+    }
 }
 
 async fn probe_fresh_process(bundle: &Path) -> io::Result<Permission> {
@@ -235,24 +329,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn privacy_notification_wakes_a_waiting_check() {
+        unsafe extern "C" {
+            fn notify_post(name: *const c_char) -> u32;
+        }
+        let name = std::ffi::CString::new(format!(
+            "com.oseanstudio.myremote.test.{}",
+            std::process::id()
+        ))
+        .unwrap();
+        let changes = PrivacyChanges::subscribe(&name).unwrap();
+        assert!(!changes.changed());
+        assert_eq!(unsafe { notify_post(name.as_ptr()) }, 0);
+        let until = Instant::now() + Duration::from_secs(2);
+        while !changes.changed() {
+            assert!(Instant::now() < until);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn watches_both_grants_without_relaunching_twice_for_the_same_permission() {
         use Permission::*;
 
-        assert_eq!(new_grant(Missing, Missing, Missing), None);
-        assert_eq!(
-            new_grant(Missing, Missing, Accessibility),
-            Some(Accessibility)
-        );
-        assert_eq!(new_grant(Accessibility, Accessibility, Accessibility), None);
-        assert_eq!(
-            new_grant(Accessibility, Accessibility, PostEvents),
-            Some(PostEvents)
-        );
-        assert_eq!(
-            new_grant(Accessibility, PostEvents, Missing),
-            Some(PostEvents)
-        );
-        assert_eq!(new_grant(PostEvents, Accessibility, PostEvents), None);
+        let mut waiting = ApprovalProgress {
+            last: Missing,
+            relaunched: Missing,
+        };
+        assert_eq!(waiting.observe(Missing), None);
+        assert_eq!(waiting.observe(Accessibility), Some(Accessibility));
+
+        let mut reopened = ApprovalProgress {
+            last: Missing,
+            relaunched: Accessibility,
+        };
+        assert_eq!(reopened.observe(Missing), None);
+        assert_eq!(reopened.observe(Accessibility), None);
+        assert_eq!(reopened.observe(PostEvents), Some(PostEvents));
+    }
+
+    #[test]
+    fn grant_after_a_running_app_loses_permissions_triggers_relaunch() {
+        use Permission::*;
+
+        let mut running = ApprovalProgress {
+            last: PostEvents,
+            relaunched: PostEvents,
+        };
+        assert_eq!(running.observe(PostEvents), None);
+        assert_eq!(running.observe(Missing), None);
+        assert_eq!(running.observe(PostEvents), Some(PostEvents));
     }
 
     #[test]

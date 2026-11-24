@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
@@ -7,7 +7,9 @@ use objc2_app_kit::{
     NSAlert, NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
     NSMenuItem, NSStatusBar, NSWorkspace,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer, NSURL};
+use objc2_foundation::{
+    NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL,
+};
 use tokio::runtime::Runtime;
 
 use crate::{
@@ -33,6 +35,7 @@ struct State {
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     accessibility_approval: RefCell<Option<ApprovalWatch>>,
+    post_events_requested: Cell<bool>,
     updater: RefCell<Updater>,
 }
 
@@ -90,19 +93,18 @@ define_class!(
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
-                let label = updater.has_update().then(|| NSString::from_str(updater.action_title()));
-                let icon = label.as_ref().and_then(|label| {
-                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                        objc2_foundation::ns_string!("arrow.down.circle.fill"),
-                        Some(label),
-                    )
-                });
+                let (symbol, label) = if updater.has_update() {
+                    (objc2_foundation::ns_string!("arrow.down.circle.fill"), updater.action_title())
+                } else {
+                    (objc2_foundation::ns_string!("arrow.clockwise"), "Check for Updates…")
+                };
+                let label = NSString::from_str(label);
+                let icon = NSImage::imageWithSystemSymbolName_accessibilityDescription(symbol, Some(&label));
                 if let Some(icon) = icon.as_ref() {
                     icon.setTemplate(true);
                 }
                 item.setImage(icon.as_deref());
-                item.setToolTip(label.as_deref());
-                item.setEnabled(label.is_some());
+                item.setToolTip(Some(&label));
             }
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
                 let status = updater.status();
@@ -139,9 +141,14 @@ define_class!(
             self.request_accessibility(true);
         }
 
-        #[unsafe(method(myRemoteCheckAccessibility:))]
-        fn check_accessibility(&self, _timer: &NSTimer) {
+        #[unsafe(method(myRemotePromptAccessibility:))]
+        fn prompt_accessibility(&self, _timer: &NSTimer) {
             self.request_accessibility(false);
+        }
+
+        #[unsafe(method(myRemotePollAccessibility:))]
+        fn poll_accessibility(&self, _timer: &NSTimer) {
+            self.poll_accessibility_setup();
         }
 
         #[unsafe(method(myRemoteLocalNetwork:))]
@@ -162,9 +169,6 @@ define_class!(
 
         #[unsafe(method(myRemotePollUpdates:))]
         fn poll_updates(&self, _timer: &NSTimer) {
-            if self.poll_accessibility_setup() {
-                return;
-            }
             let pin = self.ivars().active.borrow().as_ref()
                 .and_then(|receiver| receiver.state.take_requested_code());
             if let Some(pin) = pin {
@@ -181,12 +185,20 @@ define_class!(
 impl MenuController {
     fn new(mtm: MainThreadMarker, options: Options, runtime: Runtime) -> Retained<Self> {
         let updater = RefCell::new(Updater::new(&options));
+        let approval = if options.dry_run {
+            None
+        } else {
+            update::app_bundle_path()
+                .ok()
+                .map(|bundle| ApprovalWatch::start(bundle, &runtime, Permission::current()))
+        };
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
-            accessibility_approval: RefCell::new(None),
+            accessibility_approval: RefCell::new(approval),
+            post_events_requested: Cell::new(false),
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -207,7 +219,15 @@ impl MenuController {
     }
 
     fn needs_accessibility(&self) -> bool {
-        !self.ivars().options.dry_run && Permission::current() != Permission::PostEvents
+        !self.ivars().options.dry_run && self.accessibility_permission() != Permission::PostEvents
+    }
+
+    fn accessibility_permission(&self) -> Permission {
+        self.ivars()
+            .accessibility_approval
+            .borrow()
+            .as_ref()
+            .map_or_else(Permission::current, ApprovalWatch::permission)
     }
 
     fn request_accessibility(&self, manual: bool) {
@@ -215,46 +235,50 @@ impl MenuController {
         if state.options.dry_run {
             return;
         }
-        let current = Permission::current();
-        if current == Permission::PostEvents {
-            return;
-        }
-        let baseline = if manual {
-            current
-        } else {
-            current.max(Permission::previous_relaunch())
-        };
-        if baseline < Permission::PostEvents {
-            let mut approval = state.accessibility_approval.borrow_mut();
-            if manual || approval.is_none() {
-                if let Ok(bundle) = update::app_bundle_path() {
-                    *approval = Some(ApprovalWatch::start(bundle, &state.runtime, baseline));
-                }
+        if manual {
+            if let Some(approval) = state.accessibility_approval.borrow().as_ref() {
+                approval.check_now();
             }
         }
-        if (current == Permission::Accessibility || input::request_accessibility_entry())
-            && !input::can_post_input()
-        {
+        match self.accessibility_permission() {
+            Permission::Missing if input::request_accessibility_entry() => {
+                self.request_post_events(manual);
+            }
+            Permission::Accessibility => self.request_post_events(manual),
+            Permission::Missing | Permission::PostEvents => {}
+        }
+    }
+
+    fn request_post_events(&self, manual: bool) {
+        let requested = &self.ivars().post_events_requested;
+        if (manual || !requested.get()) && !input::can_post_input() {
+            requested.set(true);
             input::request_input_permission();
         }
     }
 
-    fn poll_accessibility_setup(&self) -> bool {
-        let mut approval = self.ivars().accessibility_approval.borrow_mut();
-        let Some(permission) = approval.as_mut().and_then(ApprovalWatch::granted) else {
-            return false;
+    fn poll_accessibility_setup(&self) {
+        let (grant, permission) = {
+            let mut approval = self.ivars().accessibility_approval.borrow_mut();
+            let Some(approval) = approval.as_mut() else {
+                return;
+            };
+            (approval.granted(), approval.permission())
         };
-        match update::prepare_accessibility_relaunch(permission) {
+        let Some(grant) = grant else {
+            if permission == Permission::Accessibility {
+                self.request_post_events(false);
+            }
+            return;
+        };
+        match update::prepare_accessibility_relaunch(grant) {
             Ok(()) => {
-                approval.take();
-                drop(approval);
+                self.ivars().accessibility_approval.take();
                 self.stop();
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
-                true
             }
             Err(error) => {
                 tracing::warn!("Unable to relaunch myRemote: {error}");
-                false
             }
         }
     }
@@ -387,20 +411,24 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
         item.setMenu(Some(&menu));
         controller.start();
-        if controller.ivars().options.pair {
-            controller.show_pairing();
-        }
         // Wait for AppKit's event loop before asking macOS to show a permission prompt.
-        // Both selectors target the live controller and take one NSTimer argument.
-        let (accessibility_timer, poll_timer) = unsafe {
-            let accessibility =
-                NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
-                    0.0,
-                    &controller,
-                    sel!(myRemoteCheckAccessibility:),
-                    None,
-                    false,
-                );
+        // Each selector targets the live controller and takes one NSTimer argument.
+        let (prompt_timer, accessibility_timer, poll_timer) = unsafe {
+            let prompt = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
+                0.0,
+                &controller,
+                sel!(myRemotePromptAccessibility:),
+                None,
+                false,
+            );
+            let accessibility = NSTimer::timerWithTimeInterval_target_selector_userInfo_repeats(
+                0.25,
+                &controller,
+                sel!(myRemotePollAccessibility:),
+                None,
+                true,
+            );
+            NSRunLoop::mainRunLoop().addTimer_forMode(&accessibility, NSRunLoopCommonModes);
             let poll = NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(
                 0.25,
                 &controller,
@@ -408,9 +436,13 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
                 None,
                 true,
             );
-            (accessibility, poll)
+            (prompt, accessibility, poll)
         };
+        if controller.ivars().options.pair {
+            controller.show_pairing();
+        }
         app.run();
+        prompt_timer.invalidate();
         accessibility_timer.invalidate();
         poll_timer.invalidate();
         controller.stop();
