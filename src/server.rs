@@ -20,6 +20,9 @@ use crate::{Error, PairingState, RemoteInput, Result, TrackpadMode};
 
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 32;
+const COMPANION_FLAGS: u32 = 0x36782;
+#[cfg(target_os = "macos")]
+const COMPANION_AWDL_CONNECT: u32 = 0x800;
 pub const TAILNET_PORTS: [u16; 3] = [49152, 49153, 49154];
 #[cfg(target_os = "macos")]
 pub const PEER_AIRPLAY_SERVICE: &str = "_airplay-p2p._tcp";
@@ -62,7 +65,14 @@ impl PeerTarget {
     }
 
     pub fn records(&self) -> [DiscoveryRecord; 4] {
-        let [media, companion, airplay] = discovery_records(&self.name, &self.pairing, [0; 3]);
+        // Rapport's AWDL browser requires the connect flag on _companion-link._tcp.
+        let [media, mut companion, airplay] = discovery_records(
+            &self.name,
+            &self.pairing,
+            [0; 3],
+            COMPANION_FLAGS | COMPANION_AWDL_CONNECT,
+        );
+        companion.txt.push(("rpNm".into(), self.name.to_string()));
         // Both AirPlay discovery records use the same pairing identity and capabilities.
         let peer_airplay = DiscoveryRecord {
             service_type: PEER_AIRPLAY_SERVICE.to_owned(),
@@ -244,7 +254,7 @@ impl Receiver {
             companion.local_addr()?.port(),
             airplay.local_addr()?.port(),
         ];
-        let records = discovery_records(&name, &pairing, ports);
+        let records = discovery_records(&name, &pairing, ports, COMPANION_FLAGS);
         let listeners = vec![
             tokio::spawn(discovery_endpoint(mrp, false, pairing.clone())),
             tokio::spawn(discovery_endpoint(airplay, true, pairing.clone())),
@@ -349,6 +359,7 @@ fn discovery_records(
     name: &str,
     identity: &PairingState,
     [media_port, companion_port, airplay_port]: [u16; 3],
+    companion_flags: u32,
 ) -> [DiscoveryRecord; 3] {
     let mac = identity.mac.map(|byte| format!("{byte:02X}")).join(":");
     let unique = identity.identifier.replace('-', "");
@@ -365,6 +376,7 @@ fn discovery_records(
     let rp_ad = alias("rpAD:", 6);
     let rp_hi = alias("rpHI:", 6);
     let airplay_key = alias("pk:", 16).to_ascii_lowercase();
+    let companion_flags = format!("0x{companion_flags:X}");
     let mrp = [
         ("Name", name),
         ("UniqueIdentifier", unique.as_str()),
@@ -379,7 +391,7 @@ fn discovery_records(
         ("rpHN", rp_hn.as_str()),
         ("rpVr", SOURCE_VERSION),
         ("rpMd", DEVICE_MODEL),
-        ("rpFl", "0x36782"),
+        ("rpFl", companion_flags.as_str()),
         ("rpAD", rp_ad.as_str()),
         ("rpHI", rp_hi.as_str()),
         ("rpBA", mac.as_str()),

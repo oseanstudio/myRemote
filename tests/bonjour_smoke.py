@@ -25,7 +25,7 @@ async def find(process, pattern):
     raise AssertionError(f"Process ended before printing {pattern}")
 
 
-async def lookup(name, service, expected_port):
+async def lookup(name, service, expected_port, txt_pattern=None):
     browser = await asyncio.create_subprocess_exec(
         "/usr/bin/dns-sd", "-L", name, service, "local.",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -33,6 +33,8 @@ async def lookup(name, service, expected_port):
     try:
         result = await asyncio.wait_for(find(browser, r"can be reached at [^\s]+:(\d+)"), 15)
         assert int(result[1]) == expected_port, (service, result[1], expected_port)
+        if txt_pattern and not re.search(txt_pattern, result.string):
+            await asyncio.wait_for(find(browser, txt_pattern), 5)
     finally:
         await stop(browser)
 
@@ -64,11 +66,15 @@ async def smoke(binary, directory):
             find(server, r"^Nearby ports" + endpoints + r"\s+AirPlay peer discovery (\d+)"), 12,
         )
         ports = await asyncio.wait_for(find(server, r"^TCP ports" + endpoints), 10)
-        for instance, match in [(name, ports), (name + " · Nearby", nearby)]:
+        for instance, match, flags in [
+            (name, ports, "0x36782"),
+            (name + " · Nearby", nearby, "0x36F82"),
+        ]:
             for service, port in zip(
                 ["_mediaremotetv._tcp", "_companion-link._tcp", "_airplay._tcp"], match.groups()
             ):
-                await lookup(instance, service, int(port))
+                txt_pattern = rf"(?i)\brpFl={flags}\b" if service == "_companion-link._tcp" else None
+                await lookup(instance, service, int(port), txt_pattern)
         peer_port = int(nearby[4])
         await lookup(await browse_peer_airplay(name), "_airplay-p2p._tcp", peer_port)
         reader, writer = await asyncio.open_connection("127.0.0.1", peer_port)
@@ -92,4 +98,4 @@ async def smoke(binary, directory):
 if __name__ == "__main__":
     with TemporaryDirectory(prefix="myremote-bonjour-") as directory:
         asyncio.run(smoke(Path(sys.argv[1]).resolve(strict=True), directory))
-    print("Apple Bonjour resolved all LAN and Nearby services, including _airplay-p2p._tcp.")
+    print("Apple Bonjour resolved all services and verified the Nearby Companion AWDL connect flag.")
