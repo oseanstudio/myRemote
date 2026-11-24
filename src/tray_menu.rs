@@ -27,12 +27,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let update_status = MenuItem::new("", false, None);
     let mut displayed_update_title = updater.action_title().to_owned();
     let update_now = MenuItem::new(&displayed_update_title, true, None);
-    let check_updates = CheckMenuItem::new(
-        "Check for Updates Automatically",
-        true,
-        updater.checking(),
-        None,
-    );
     let install_updates = CheckMenuItem::new(
         "Install Updates Automatically",
         true,
@@ -42,12 +36,9 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let quit = MenuItem::new("Quit myRemote", true, None);
     menu.append_items(&[
         &version,
-        &PredefinedMenuItem::separator(),
         &pair,
         &code,
-        &PredefinedMenuItem::separator(),
         &update_now,
-        &check_updates,
         &install_updates,
         &PredefinedMenuItem::separator(),
         &quit,
@@ -111,14 +102,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             if event.id == *update_now.id() {
                 updater.update_now();
             }
-            if event.id == *check_updates.id() {
-                updater.toggle_checks();
-                check_updates.set_checked(updater.checking());
-                install_updates.set_checked(updater.automatic());
-            }
             if event.id == *install_updates.id() {
                 updater.toggle_installation();
-                check_updates.set_checked(updater.checking());
                 install_updates.set_checked(updater.automatic());
             }
         }

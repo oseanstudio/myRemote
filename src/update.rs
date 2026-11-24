@@ -28,20 +28,10 @@ const MAX_PACKAGE: u64 = 100 * 1024 * 1024;
 const UPDATE_NOW: &str = "Update Now";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Preferences {
-    check: bool,
     install: bool,
-}
-
-impl Default for Preferences {
-    fn default() -> Self {
-        Self {
-            check: true,
-            install: false,
-        }
-    }
 }
 
 #[derive(Deserialize)]
@@ -125,9 +115,6 @@ impl Updater {
         }
     }
 
-    pub fn checking(&self) -> bool {
-        self.preferences.check
-    }
     pub fn automatic(&self) -> bool {
         self.preferences.install
     }
@@ -150,25 +137,14 @@ impl Updater {
     }
 
     pub fn refresh_for_menu(&mut self) {
-        if self.checking() && !self.busy() && Instant::now() >= self.next_menu_check {
+        if !self.busy() && Instant::now() >= self.next_menu_check {
             self.check(false);
         }
     }
 
-    pub fn toggle_checks(&mut self) {
-        let check = !self.checking();
-        self.save(Preferences {
-            check,
-            install: check && self.automatic(),
-        });
-    }
-
     pub fn toggle_installation(&mut self) {
         let install = !self.automatic();
-        self.save(Preferences {
-            check: install || self.checking(),
-            install,
-        });
+        self.save(Preferences { install });
         if self.automatic() {
             self.next_check = Instant::now();
         }
@@ -234,7 +210,7 @@ impl Updater {
                 }
             }
         }
-        if !self.busy() && self.checking() && Instant::now() >= self.next_check {
+        if !self.busy() && Instant::now() >= self.next_check {
             self.check(false);
         }
         false
@@ -450,23 +426,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_default_to_checks_and_remember_both_choices() {
+    fn install_preference_is_opt_in_and_reads_existing_settings() {
         let defaults = Preferences::default();
-        assert!(defaults.check);
         assert!(!defaults.install);
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("updates.json");
-        save_preferences(&path, defaults).unwrap();
-        save_preferences(
-            &path,
-            Preferences {
-                check: true,
-                install: true,
-            },
-        )
-        .unwrap();
+        let legacy: Preferences =
+            serde_json::from_str(r#"{"check":false,"install":true}"#).unwrap();
+        assert!(legacy.install);
+        save_preferences(&path, legacy).unwrap();
         let saved: Preferences = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(saved.check && saved.install);
+        assert!(saved.install);
     }
 
     #[test]

@@ -31,7 +31,7 @@ If your iPhone connects but the controls do nothing, press Back on the iPhone an
 
 ### Updates
 
-**Check for Updates Automatically** is on by default. myRemote checks GitHub shortly after launch and every hour. Opening the Mac menu also checks if at least five minutes have passed since the last check. **Update Now** shows the available version when an update is found. Click it to check, download, verify, install, and relaunch myRemote. Enable **Install Updates Automatically** to do the same whenever a check finds an update. Turning off automatic checks also turns off automatic installation.
+myRemote checks GitHub shortly after launch and every hour. Opening the Mac menu also checks if at least five minutes have passed since the last check. **Update Now** shows the available version when an update is found. Click it to check, download, verify, install, and relaunch myRemote. Enable **Install Updates Automatically** to do the same whenever a check finds an update.
 
 Install myRemote in a writable folder to enable replacement. On macOS, move the app out of the DMG first. On Linux, launch the AppImage itself and have `curl` installed. An update briefly interrupts the receiver and preserves pairing and settings.
 
@@ -66,8 +66,6 @@ On macOS, connect in Control Center and click an editable field, including a pas
 On macOS, Play/Pause and TV control playback and fullscreen in the active browser or supported media player.
 
 While a Jellyfin or YouTube video page is in the foreground, myRemote uses macOS Accessibility to identify the player and advertise the built-in Remote's skip controls. This works with browsers that expose the foreground web page, including Zen. YouTube's shortcuts skip 10 seconds. In Jellyfin, set both **Skip forward length** and **Skip back length** to **10 seconds** in **Settings → Playback**. myRemote also reports subtitle availability when it can read the YouTube player's caption toggle.
-
-**Remote Diagnostics…** in the Mac menu shows connection timings, the last player advertised to the iPhone, and counts for decoding, matching, and posting keyboard edits. The keyboard report shows protocol versions and counts.
 
 ## Configuration
 

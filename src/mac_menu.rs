@@ -23,12 +23,10 @@ const PAIR: isize = 2;
 const START_RECEIVER: isize = 3;
 const UPDATE_STATUS: isize = 4;
 const UPDATE_ACTION: isize = 5;
-const AUTO_CHECK: isize = 6;
 const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
 const LOCAL_NETWORK: isize = 9;
 const CONNECTION: isize = 14;
-const DIAGNOSTICS: isize = 16;
 
 struct State {
     options: Options,
@@ -76,9 +74,6 @@ define_class!(
                     item.setTitle(&NSString::from_str(status));
                 }
             }
-            if let Some(item) = menu.itemWithTag(DIAGNOSTICS) {
-                item.setEnabled(active.is_some());
-            }
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
             }
@@ -106,9 +101,6 @@ define_class!(
                     item.setTitle(&NSString::from_str(status));
                 }
             }
-            if let Some(item) = menu.itemWithTag(AUTO_CHECK) {
-                item.setState(isize::from(updater.checking()));
-            }
             if let Some(item) = menu.itemWithTag(AUTO_INSTALL) {
                 item.setState(isize::from(updater.automatic()));
             }
@@ -116,15 +108,6 @@ define_class!(
     }
 
     impl MenuController {
-        #[unsafe(method(myRemoteDiagnostics:))]
-        fn diagnostics(&self, _sender: &NSMenuItem) {
-            let report = self.ivars().active.borrow().as_ref()
-                .map(|active| active.state.remote_diagnostics());
-            if let Some(report) = report {
-                self.alert("Remote Diagnostics", &report);
-            }
-        }
-
         #[unsafe(method(myRemotePair:))]
         fn pair(&self, _sender: &NSMenuItem) {
             self.show_pairing();
@@ -168,11 +151,6 @@ define_class!(
         #[unsafe(method(myRemoteUpdateNow:))]
         fn update_now(&self, _sender: &NSMenuItem) {
             self.ivars().updater.borrow_mut().update_now();
-        }
-
-        #[unsafe(method(myRemoteAutoCheck:))]
-        fn toggle_checks(&self, _sender: &NSMenuItem) {
-            self.ivars().updater.borrow_mut().toggle_checks();
         }
 
         #[unsafe(method(myRemoteAutoInstall:))]
@@ -361,7 +339,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.add_item(&menu, &format!("myRemote {VERSION}"), None, 0);
         controller.add_item(&menu, "", None, STATUS);
         controller.add_item(&menu, "", None, CONNECTION);
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
         controller.add_item(
             &menu,
@@ -381,7 +358,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             Some(sel!(myRemoteLocalNetwork:)),
             LOCAL_NETWORK,
         );
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "", None, UPDATE_STATUS);
         controller.add_item(
             &menu,
@@ -391,21 +367,9 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         );
         controller.add_item(
             &menu,
-            "Check for Updates Automatically",
-            Some(sel!(myRemoteAutoCheck:)),
-            AUTO_CHECK,
-        );
-        controller.add_item(
-            &menu,
             "Install Updates Automatically",
             Some(sel!(myRemoteAutoInstall:)),
             AUTO_INSTALL,
-        );
-        controller.add_item(
-            &menu,
-            "Remote Diagnostics…",
-            Some(sel!(myRemoteDiagnostics:)),
-            DIAGNOSTICS,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Quit myRemote", Some(sel!(myRemoteQuit:)), 0);
