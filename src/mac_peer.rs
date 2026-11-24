@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use block2::{Block, RcBlock};
 use dispatch2::{DispatchData, DispatchQueue, DispatchRetained};
-use myremote::{DiscoveryRecord, PeerTarget};
+use myremote::{DiscoveryRecord, PeerTarget, PEER_AIRPLAY_SERVICE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
@@ -26,14 +26,34 @@ const LISTENER_FAILED: u32 = 3;
 const LISTENER_CANCELLED: u32 = 4;
 const MAX_CONNECTIONS: usize = 32;
 const BUFFER: usize = 16 * 1024;
+const NEARBY_SUFFIX: &str = " · Nearby";
 
 pub fn nearby_name(name: &str) -> String {
-    const SUFFIX: &str = " · Nearby";
-    let mut end = name.len().min(63 - SUFFIX.len());
+    nearby_instance("", name)
+}
+
+fn nearby_instance(prefix: &str, name: &str) -> String {
+    let mut end = name.len().min(63 - NEARBY_SUFFIX.len() - prefix.len());
     while !name.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}{SUFFIX}", &name[..end])
+    format!("{prefix}{}{NEARBY_SUFFIX}", &name[..end])
+}
+
+fn record_instance(name: &str, record: &DiscoveryRecord) -> io::Result<CString> {
+    if record.service_type != PEER_AIRPLAY_SERVICE {
+        return Ok(CString::new(name)?);
+    }
+    // Match the device-ID-prefixed service instance used for peer AirPlay discovery.
+    let id = record
+        .txt
+        .iter()
+        .find(|(key, _)| key == "deviceid")
+        .map(|(_, value)| value.replace(':', ""))
+        .filter(|value| value.len() == 12 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .ok_or_else(|| io::Error::other("Missing Nearby AirPlay device identifier"))?;
+    let stem = name.strip_suffix(NEARBY_SUFFIX).unwrap_or(name);
+    Ok(CString::new(nearby_instance(&format!("{id}@"), stem))?)
 }
 
 #[link(name = "Network", kind = "framework")]
@@ -106,16 +126,15 @@ pub struct Nearby {
 impl Nearby {
     pub fn start(runtime: &Handle, target: Arc<PeerTarget>) -> io::Result<Self> {
         let queue = DispatchQueue::new("com.oseanstudio.myremote.nearby", None);
-        let name = CString::new(target.name())?;
         let listeners = target
             .records()
             .into_iter()
-            .map(|record| Listener::start(runtime, queue.clone(), &name, target.clone(), record))
+            .map(|record| Listener::start(runtime, queue.clone(), target.clone(), record))
             .collect::<io::Result<Vec<_>>>()?;
         Ok(Self { listeners })
     }
 
-    pub fn ports(&self) -> Option<Vec<u16>> {
+    fn ports(&self) -> Option<Vec<u16>> {
         self.listeners
             .iter()
             .map(|listener| {
@@ -163,10 +182,10 @@ impl Listener {
     fn start(
         runtime: &Handle,
         queue: DispatchRetained<DispatchQueue>,
-        name: &CString,
         target: Arc<PeerTarget>,
         record: DiscoveryRecord,
     ) -> io::Result<Self> {
+        let name = record_instance(target.name(), &record)?;
         let service = CString::new(record.service_type.as_str())?;
         let txt = crate::mac_bonjour::txt_record(&record.txt)?;
         let configure_tcp = RcBlock::new(|options: Raw| unsafe {

@@ -384,8 +384,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         if options.verbose {
             let ports = nearby.wait_for_ports().await?;
             println!(
-                "Nearby ports   discovery {}   companion {}   AirPlay discovery {}",
-                ports[0], ports[1], ports[2]
+                "Nearby ports   discovery {}   companion {}   AirPlay discovery {}   AirPlay peer discovery {}",
+                ports[0], ports[1], ports[2], ports[3]
             );
         }
         Some(nearby)

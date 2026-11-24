@@ -21,6 +21,8 @@ use crate::{Error, PairingState, RemoteInput, Result, TrackpadMode};
 const MAX_FRAME_SIZE: usize = 64 * 1024;
 const MAX_CONNECTIONS: usize = 32;
 pub const TAILNET_PORTS: [u16; 3] = [49152, 49153, 49154];
+#[cfg(target_os = "macos")]
+pub const PEER_AIRPLAY_SERVICE: &str = "_airplay-p2p._tcp";
 
 pub struct Receiver {
     mdns: Option<(ServiceDaemon, Vec<String>)>,
@@ -59,8 +61,15 @@ impl PeerTarget {
         }
     }
 
-    pub fn records(&self) -> Vec<DiscoveryRecord> {
-        discovery_records(&self.name, &self.pairing, [0; 3])
+    pub fn records(&self) -> [DiscoveryRecord; 4] {
+        let [media, companion, airplay] = discovery_records(&self.name, &self.pairing, [0; 3]);
+        // Both AirPlay discovery records use the same pairing identity and capabilities.
+        let peer_airplay = DiscoveryRecord {
+            service_type: PEER_AIRPLAY_SERVICE.to_owned(),
+            port: airplay.port,
+            txt: airplay.txt.clone(),
+        };
+        [media, companion, airplay, peer_airplay]
     }
 
     pub fn name(&self) -> &str {
@@ -84,7 +93,9 @@ impl PeerTarget {
                     debug!("Nearby Companion connection ended: {error}");
                 }
             }
-            "_airplay._tcp" => respond_to_discovery(stream, true, &self.pairing).await,
+            "_airplay._tcp" | PEER_AIRPLAY_SERVICE => {
+                respond_to_discovery(stream, true, &self.pairing).await;
+            }
             "_mediaremotetv._tcp" => respond_to_discovery(stream, false, &self.pairing).await,
             _ => {}
         }
@@ -252,7 +263,7 @@ impl Receiver {
                 listeners,
                 ports,
             },
-            records,
+            records.into(),
         ))
     }
 
@@ -334,7 +345,11 @@ async fn bind(ip: IpAddr, preferred: u16) -> io::Result<TcpListener> {
     }
 }
 
-fn discovery_records(name: &str, identity: &PairingState, ports: [u16; 3]) -> Vec<DiscoveryRecord> {
+fn discovery_records(
+    name: &str,
+    identity: &PairingState,
+    [media_port, companion_port, airplay_port]: [u16; 3],
+) -> [DiscoveryRecord; 3] {
     let mac = identity.mac.map(|byte| format!("{byte:02X}")).join(":");
     let unique = identity.identifier.replace('-', "");
     let mac_id = mac.replace(':', "");
@@ -381,13 +396,11 @@ fn discovery_records(name: &str, identity: &PairingState, ports: [u16; 3]) -> Ve
         ("name", name),
     ];
     [
-        ("_mediaremotetv._tcp", &mrp[..]),
-        ("_companion-link._tcp", &companion[..]),
-        ("_airplay._tcp", &airplay[..]),
+        ("_mediaremotetv._tcp", &mrp[..], media_port),
+        ("_companion-link._tcp", &companion[..], companion_port),
+        ("_airplay._tcp", &airplay[..], airplay_port),
     ]
-    .into_iter()
-    .zip(ports)
-    .map(|((service_type, txt), port)| DiscoveryRecord {
+    .map(|(service_type, txt, port)| DiscoveryRecord {
         service_type: service_type.to_owned(),
         port,
         txt: txt
@@ -395,7 +408,6 @@ fn discovery_records(name: &str, identity: &PairingState, ports: [u16; 3]) -> Ve
             .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
             .collect(),
     })
-    .collect()
 }
 
 fn mdns_error(error: mdns_sd::Error) -> Error {
