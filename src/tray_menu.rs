@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use tokio::runtime::Runtime;
 use tray_icon::{
-    menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem},
+    menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem},
     Icon, TrayIconBuilder, TrayIconEvent,
 };
 
@@ -27,19 +27,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let update_status = MenuItem::new("", false, None);
     let mut displayed_update_title = updater.action_title().to_owned();
     let update_now = MenuItem::new(&displayed_update_title, true, None);
-    let install_updates = CheckMenuItem::new(
-        "Install Updates Automatically",
-        true,
-        updater.automatic(),
-        None,
-    );
     let quit = MenuItem::new("Quit myRemote", true, None);
     menu.append_items(&[
         &version,
         &pair,
         &code,
         &update_now,
-        &install_updates,
         &PredefinedMenuItem::separator(),
         &quit,
     ])?;
@@ -75,13 +68,9 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let mut displayed_update = String::new();
     let mut pending_event = None;
     let events = MenuEvent::receiver();
-    let tray_events = TrayIconEvent::receiver();
+    // Menu commands arrive on MenuEvent. Discard unused tray pointer events.
+    TrayIconEvent::set_event_handler(Some(|_| {}));
     while !quit_requested.load(Ordering::Relaxed) {
-        while let Ok(event) = tray_events.try_recv() {
-            if matches!(event, TrayIconEvent::Click { .. }) {
-                updater.refresh_for_menu();
-            }
-        }
         while let Some(event) = pending_event.take().or_else(|| events.try_recv().ok()) {
             if event.id == *quit.id() {
                 quit_requested.store(true, Ordering::Relaxed);
@@ -101,10 +90,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             }
             if event.id == *update_now.id() {
                 updater.update_now();
-            }
-            if event.id == *install_updates.id() {
-                updater.toggle_installation();
-                install_updates.set_checked(updater.automatic());
             }
         }
         let pin = active

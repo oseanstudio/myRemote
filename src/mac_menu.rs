@@ -23,7 +23,6 @@ const PAIR: isize = 2;
 const START_RECEIVER: isize = 3;
 const UPDATE_STATUS: isize = 4;
 const UPDATE_ACTION: isize = 5;
-const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
 const LOCAL_NETWORK: isize = 9;
 const CONNECTION: isize = 14;
@@ -89,8 +88,7 @@ define_class!(
                     Some(mac_bonjour::Status::LocalNetworkPermission | mac_bonjour::Status::Failed)
                 ));
             }
-            let mut updater = self.ivars().updater.borrow_mut();
-            updater.refresh_for_menu();
+            let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
                 item.setTitle(&NSString::from_str(updater.action_title()));
             }
@@ -100,9 +98,6 @@ define_class!(
                 if !status.is_empty() {
                     item.setTitle(&NSString::from_str(status));
                 }
-            }
-            if let Some(item) = menu.itemWithTag(AUTO_INSTALL) {
-                item.setState(isize::from(updater.automatic()));
             }
         }
     }
@@ -151,11 +146,6 @@ define_class!(
         #[unsafe(method(myRemoteUpdateNow:))]
         fn update_now(&self, _sender: &NSMenuItem) {
             self.ivars().updater.borrow_mut().update_now();
-        }
-
-        #[unsafe(method(myRemoteAutoInstall:))]
-        fn toggle_install(&self, _sender: &NSMenuItem) {
-            self.ivars().updater.borrow_mut().toggle_installation();
         }
 
         #[unsafe(method(myRemotePollUpdates:))]
@@ -364,12 +354,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             controller.ivars().updater.borrow().action_title(),
             Some(sel!(myRemoteUpdateNow:)),
             UPDATE_ACTION,
-        );
-        controller.add_item(
-            &menu,
-            "Install Updates Automatically",
-            Some(sel!(myRemoteAutoInstall:)),
-            AUTO_INSTALL,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Quit myRemote", Some(sel!(myRemoteQuit:)), 0);

@@ -5,7 +5,7 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -21,17 +21,34 @@ pub use install::{
 };
 
 const REPO: &str = "oseanstudio/myRemote";
-const INTERVAL: Duration = Duration::from_secs(60 * 60);
-const MENU_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
+const STARTUP_DELAY: Duration = Duration::from_secs(5);
 const MANUAL_STATUS_DURATION: Duration = Duration::from_secs(15);
 const MAX_PACKAGE: u64 = 100 * 1024 * 1024;
 const UPDATE_NOW: &str = "Update Now";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
-struct Preferences {
-    install: bool,
+struct CheckState {
+    last_check: Option<SystemTime>,
+    available_version: Option<String>,
+}
+
+impl CheckState {
+    fn read(path: Option<&Path>) -> Self {
+        path.and_then(|path| fs::read(path).ok())
+            .and_then(|data| serde_json::from_slice(&data).ok())
+            .unwrap_or_default()
+    }
+
+    fn next_check_at(&self, now: SystemTime) -> SystemTime {
+        let scheduled = self
+            .last_check
+            .filter(|last| *last <= now)
+            .map_or(now, |last| last + INTERVAL);
+        scheduled.max(now + STARTUP_DELAY)
+    }
 }
 
 #[derive(Deserialize)]
@@ -70,9 +87,8 @@ struct UpdateTask {
 
 pub struct Updater {
     path: Option<PathBuf>,
-    preferences: Preferences,
-    next_check: Instant,
-    next_menu_check: Instant,
+    check_state: CheckState,
+    next_check: SystemTime,
     task: Option<UpdateTask>,
     action_title: String,
     status: String,
@@ -86,38 +102,30 @@ impl Updater {
             .clone()
             .or_else(default_state_dir)
             .map(|directory| directory.join("updates.json"));
-        let preferences = path
-            .as_ref()
-            .and_then(|path| fs::read(path).ok())
-            .and_then(|data| serde_json::from_slice(&data).ok())
-            .unwrap_or_default();
+        let mut check_state = CheckState::read(path.as_deref());
+        let current = Version::parse(VERSION).expect("Cargo package version is valid");
+        check_state.available_version = check_state.available_version.filter(|version| {
+            Version::parse(version).is_ok_and(|version| is_newer_stable(&version, &current))
+        });
+        let action_title = update_title(check_state.available_version.as_deref());
         let previous_error = default_state_dir().and_then(|directory| {
             let file = directory.join("update-error.txt");
             let message = fs::read_to_string(&file).ok()?;
             let _ = fs::remove_file(file);
             Some(message)
         });
-        let delay = if previous_error.is_some() {
-            INTERVAL
-        } else {
-            Duration::from_secs(5)
-        };
-        let next_check = Instant::now() + delay;
+        let next_check = check_state.next_check_at(SystemTime::now());
         Self {
             path,
-            preferences,
+            check_state,
             next_check,
-            next_menu_check: next_check,
             task: None,
-            action_title: UPDATE_NOW.to_owned(),
+            action_title,
             status: previous_error.unwrap_or_default(),
             status_expires: None,
         }
     }
 
-    pub fn automatic(&self) -> bool {
-        self.preferences.install
-    }
     fn busy(&self) -> bool {
         self.task.is_some()
     }
@@ -133,20 +141,6 @@ impl Updater {
             ""
         } else {
             &self.status
-        }
-    }
-
-    pub fn refresh_for_menu(&mut self) {
-        if !self.busy() && Instant::now() >= self.next_menu_check {
-            self.check(false);
-        }
-    }
-
-    pub fn toggle_installation(&mut self) {
-        let install = !self.automatic();
-        self.save(Preferences { install });
-        if self.automatic() {
-            self.next_check = Instant::now();
         }
     }
 
@@ -169,17 +163,16 @@ impl Updater {
                 Ok(finished) => {
                     let manual = task.manual;
                     self.task = None;
-                    self.next_check = Instant::now() + INTERVAL;
                     match finished {
                         Finished::Checked(Ok(Some(download))) => {
-                            self.action_title = format!("Update to {}…", download.version);
+                            self.set_available(Some(download.version.to_string()));
                             self.status.clear();
-                            if manual || self.automatic() {
-                                self.prepare(download, manual);
+                            if manual {
+                                self.prepare(download);
                             }
                         }
                         Finished::Checked(Ok(None)) => {
-                            self.action_title = UPDATE_NOW.to_owned();
+                            self.set_available(None);
                             if manual {
                                 self.status = "No update found".into();
                                 self.status_expires = Some(Instant::now() + MANUAL_STATUS_DURATION);
@@ -187,17 +180,10 @@ impl Updater {
                                 self.status.clear();
                             }
                         }
-                        Finished::Prepared(Ok(ready)) if manual || self.automatic() => {
-                            match install::launch(ready) {
-                                Ok(()) => return true,
-                                Err(err) => {
-                                    self.status = format!("Could not install update: {err}")
-                                }
-                            }
-                        }
-                        Finished::Prepared(Ok(_)) => {
-                            self.status = "Automatic installation paused".into()
-                        }
+                        Finished::Prepared(Ok(ready)) => match install::launch(ready) {
+                            Ok(()) => return true,
+                            Err(err) => self.status = format!("Could not install update: {err}"),
+                        },
                         Finished::Checked(Err(error)) | Finished::Prepared(Err(error)) => {
                             self.status = error;
                         }
@@ -210,26 +196,22 @@ impl Updater {
                 }
             }
         }
-        if !self.busy() && Instant::now() >= self.next_check {
+        if !self.busy() && SystemTime::now() >= self.next_check {
             self.check(false);
         }
         false
     }
 
-    fn save(&mut self, preferences: Preferences) {
-        let result = self
-            .path
-            .as_deref()
-            .ok_or_else(|| io::Error::other("settings directory unavailable"))
-            .and_then(|path| save_preferences(path, preferences));
-        match result {
-            Ok(()) => {
-                self.preferences = preferences;
-                self.next_check = Instant::now() + Duration::from_secs(5);
-            }
-            Err(err) => {
-                self.status_expires = None;
-                self.status = format!("Could not save update settings: {err}");
+    fn set_available(&mut self, version: Option<String>) {
+        self.action_title = update_title(version.as_deref());
+        self.check_state.available_version = version;
+        self.save_check_state();
+    }
+
+    fn save_check_state(&self) {
+        if let Some(path) = self.path.as_deref() {
+            if let Err(error) = save_check_state(path, &self.check_state) {
+                tracing::warn!("Could not save the last update check: {error}");
             }
         }
     }
@@ -241,9 +223,10 @@ impl Updater {
         } else if was_transient {
             self.status.clear();
         }
-        let now = Instant::now();
+        let now = SystemTime::now();
         self.next_check = now + INTERVAL;
-        self.next_menu_check = now + MENU_CHECK_INTERVAL;
+        self.check_state.last_check = Some(now);
+        self.save_check_state();
         let (tx, rx) = mpsc::channel();
         self.task = Some(UpdateTask { result: rx, manual });
         std::thread::spawn(move || {
@@ -252,10 +235,13 @@ impl Updater {
         });
     }
 
-    fn prepare(&mut self, download: Download, manual: bool) {
+    fn prepare(&mut self, download: Download) {
         self.status = "Downloading update…".into();
         let (tx, rx) = mpsc::channel();
-        self.task = Some(UpdateTask { result: rx, manual });
+        self.task = Some(UpdateTask {
+            result: rx,
+            manual: true,
+        });
         std::thread::spawn(move || {
             let result =
                 prepare(download).map_err(|error| format!("Could not prepare update: {error}"));
@@ -264,13 +250,20 @@ impl Updater {
     }
 }
 
-fn save_preferences(path: &Path, preferences: Preferences) -> io::Result<()> {
+fn update_title(version: Option<&str>) -> String {
+    version.map_or_else(
+        || UPDATE_NOW.to_owned(),
+        |version| format!("Update to {version}…"),
+    )
+}
+
+fn save_check_state(path: &Path, state: &CheckState) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::other("settings directory unavailable"))?;
     fs::create_dir_all(parent)?;
     let mut temp = NamedTempFile::new_in(parent)?;
-    serde_json::to_writer(temp.as_file_mut(), &preferences)?;
+    serde_json::to_writer(temp.as_file_mut(), state)?;
     temp.as_file().sync_all()?;
     temp.persist(path)?;
     Ok(())
@@ -310,7 +303,7 @@ fn choose_release(
             .strip_prefix('v')
             .ok_or("invalid release tag")?,
     )?;
-    if !version.pre.is_empty() || !version.build.is_empty() || &version <= current {
+    if !is_newer_stable(&version, current) {
         return Ok(None);
     }
     let package = release
@@ -324,6 +317,10 @@ fn choose_release(
         size: package.size,
         digest: parse_digest(package.digest.as_deref())?,
     }))
+}
+
+fn is_newer_stable(version: &Version, current: &Version) -> bool {
+    version.pre.is_empty() && version.build.is_empty() && version > current
 }
 
 fn prepare(download: Download) -> Result<install::Ready> {
@@ -426,17 +423,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn install_preference_is_opt_in_and_reads_existing_settings() {
-        let defaults = Preferences::default();
-        assert!(!defaults.install);
+    fn background_check_waits_a_day_after_relaunch() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("updates.json");
-        let legacy: Preferences =
-            serde_json::from_str(r#"{"check":false,"install":true}"#).unwrap();
-        assert!(legacy.install);
-        save_preferences(&path, legacy).unwrap();
-        let saved: Preferences = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert!(saved.install);
+        let checked_at = SystemTime::UNIX_EPOCH + Duration::from_secs(100_000);
+        let shortly_after = checked_at + Duration::from_secs(30);
+        let overdue = checked_at + INTERVAL + Duration::from_secs(30);
+        fs::write(&path, r#"{"check":true,"install":true}"#).unwrap();
+        let legacy = CheckState::read(Some(&path));
+        assert_eq!(legacy.next_check_at(checked_at), checked_at + STARTUP_DELAY);
+
+        let state = CheckState {
+            last_check: Some(checked_at),
+            available_version: Some("2.0.0".into()),
+        };
+        save_check_state(&path, &state).unwrap();
+        let saved = CheckState::read(Some(&path));
+        assert_eq!(saved.next_check_at(shortly_after), checked_at + INTERVAL);
+        assert_eq!(saved.next_check_at(overdue), overdue + STARTUP_DELAY);
+        assert_eq!(saved.available_version.as_deref(), Some("2.0.0"));
     }
 
     #[test]
@@ -479,12 +484,13 @@ mod tests {
 
     #[test]
     fn update_action_shows_available_version_without_a_status_line() {
-        let future = Instant::now() + INTERVAL;
+        let future = SystemTime::now() + INTERVAL;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("updates.json");
         let mut updater = Updater {
-            path: None,
-            preferences: Preferences::default(),
+            path: Some(path.clone()),
+            check_state: CheckState::default(),
             next_check: future,
-            next_menu_check: future,
             task: None,
             action_title: UPDATE_NOW.to_owned(),
             status: String::new(),
@@ -529,6 +535,9 @@ mod tests {
         assert!(!updater.poll());
         assert_eq!(updater.action_title(), "Update to 2.0.0…");
         assert_eq!(updater.status(), "");
+        assert!(updater.task.is_none());
+        let saved = CheckState::read(Some(&path));
+        assert_eq!(saved.available_version.as_deref(), Some("2.0.0"));
 
         let (sender, result) = mpsc::channel();
         updater.task = Some(UpdateTask {
