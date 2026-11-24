@@ -139,6 +139,7 @@ pub struct Desktop {
     drag_number: Option<i64>,
     pointer: Option<(Instant, Point)>,
     displays: Vec<DisplayBounds>,
+    displays_checked: Option<Instant>,
 }
 
 pub(super) struct OwnedCf(pub(super) *const c_void);
@@ -376,6 +377,7 @@ impl Desktop {
             drag_number: None,
             pointer: None,
             displays: Vec::new(),
+            displays_checked: None,
         })
     }
 
@@ -461,7 +463,6 @@ impl Desktop {
     }
 
     pub fn move_pointer(&mut self, dx: f64, dy: f64, dragging: bool) {
-        let now = Instant::now();
         let point = match self.recent_pointer() {
             Some(point) => point,
             None => {
@@ -471,7 +472,15 @@ impl Desktop {
                 let Some(point) = pointer_location() else {
                     return;
                 };
-                self.displays = active_displays();
+                // Refresh the cursor after short gaps without re-enumerating
+                // displays on every fresh batch of motion.
+                if self
+                    .displays_checked
+                    .is_none_or(|checked| checked.elapsed() >= Duration::from_secs(1))
+                {
+                    self.displays = active_displays();
+                    self.displays_checked = Some(Instant::now());
+                }
                 point
             }
         };
@@ -486,10 +495,10 @@ impl Desktop {
         if next != point {
             let kind = if dragging { 6 } else { 5 };
             if post_mouse(kind, next, 0, self.drag_number, None) {
-                self.pointer = Some((now, next));
+                self.pointer = Some((Instant::now(), next));
             }
         } else {
-            self.pointer = Some((now, point));
+            self.pointer = Some((Instant::now(), point));
         }
     }
 

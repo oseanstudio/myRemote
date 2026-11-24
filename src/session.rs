@@ -2,7 +2,7 @@
 //! channel, including legacy Rapport and TVRemoteCore input messages.
 
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
@@ -10,7 +10,7 @@ use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio::net::tcp::OwnedWriteHalf;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tracing::{debug, info};
@@ -83,7 +83,7 @@ enum TouchPhase {
 struct ActiveTouch {
     origin: (f64, f64),
     last: (f64, f64),
-    started: Instant,
+    started: TapTime,
     updated: Instant,
     distance: f64,
     second_tap: bool,
@@ -99,13 +99,17 @@ struct TapTime {
 }
 
 impl TapTime {
-    fn follows(self, previous: Self, within: Duration) -> bool {
+    fn elapsed_since(self, previous: Self) -> Duration {
         if let (Some(previous), Some(current)) = (previous.phone_ns, self.phone_ns) {
             if let Some(elapsed) = current.checked_sub(previous).filter(|elapsed| *elapsed > 0) {
-                return Duration::from_nanos(elapsed) < within;
+                return Duration::from_nanos(elapsed);
             }
         }
-        self.received.saturating_duration_since(previous.received) < within
+        self.received.saturating_duration_since(previous.received)
+    }
+
+    fn follows(self, previous: Self, within: Duration) -> bool {
+        self.elapsed_since(previous) < within
     }
 }
 
@@ -119,6 +123,59 @@ struct SeekHold {
     action: PlaybackAction,
     next: Instant,
     expires: Instant,
+    active: Arc<()>,
+}
+
+enum MediaCommand {
+    Button(&'static str),
+    Playback(VideoSource, PlaybackAction),
+}
+
+struct QueuedMediaCommand {
+    command: MediaCommand,
+    expires: Instant,
+    seek: Option<Weak<()>>,
+}
+
+struct MediaCommands {
+    sender: mpsc::Sender<QueuedMediaCommand>,
+    worker: tokio::task::JoinHandle<()>,
+}
+
+impl MediaCommands {
+    fn start(input: Arc<dyn RemoteInput>) -> Self {
+        let (sender, mut receiver) = mpsc::channel::<QueuedMediaCommand>(16);
+        let worker = tokio::spawn(async move {
+            // A browser can stall in Accessibility calls. Run these in order
+            // on a separate lane so a slow action cannot hold up input frames.
+            let mut work = JoinSet::new();
+            while let Some(command) = receiver.recv().await {
+                let input = input.clone();
+                work.spawn_blocking(move || {
+                    if Instant::now() >= command.expires
+                        || command.seek.is_some_and(|hold| hold.strong_count() == 0)
+                    {
+                        return;
+                    }
+                    match command.command {
+                        MediaCommand::Button(button) => input.button(button),
+                        MediaCommand::Playback(source, action) if input.playback_enabled() => {
+                            input.playback_action(source, action);
+                        }
+                        MediaCommand::Playback(..) => {}
+                    }
+                });
+                let _ = work.join_next().await;
+            }
+        });
+        Self { sender, worker }
+    }
+}
+
+impl Drop for MediaCommands {
+    fn drop(&mut self) {
+        self.worker.abort();
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -162,6 +219,7 @@ pub(crate) struct CompanionSession {
     keyboard_edit_scope: Option<KeyboardEditScope>,
     focus_missing: bool,
     playback: Option<PlaybackState>,
+    media_commands: Option<MediaCommands>,
     seek_hold: Option<SeekHold>,
     next_event_id: u32,
     touch: Option<ActiveTouch>,
@@ -212,6 +270,7 @@ impl CompanionSession {
             keyboard_edit_scope: None,
             focus_missing: false,
             playback: None,
+            media_commands: None,
             seek_hold: None,
             next_event_id: 0x8000_0000 | rand::random::<u32>(),
             touch: None,
@@ -703,6 +762,7 @@ impl CompanionSession {
                     }
                     self.playback = None;
                     self.seek_hold = None;
+                    self.media_commands = None;
                     self.keyboard_edit_scope = None;
                     if self.keyboard.is_some() {
                         self.update_keyboard(None);
@@ -786,8 +846,7 @@ impl CompanionSession {
                 self.handle_media_control(xid, content, is_event).await?
             }
             Some("ToggleCaptions") => {
-                self.apply_playback_action(PlaybackAction::ToggleCaptions)
-                    .await;
+                self.queue_playback_action(PlaybackAction::ToggleCaptions, None);
                 if !is_event {
                     self.send_response(xid, None, 0).await?;
                 }
@@ -897,17 +956,36 @@ impl CompanionSession {
         Ok(())
     }
 
-    async fn apply_playback_action(&mut self, action: PlaybackAction) {
-        let Some(playback) = self.playback else {
-            return;
-        };
-        let input = self.input.clone();
-        if tokio::task::spawn_blocking(move || input.playback_action(playback.source, action))
-            .await
-            .unwrap_or(false)
+    fn queue_media_command(&mut self, command: MediaCommand, seek: Option<Weak<()>>) {
+        let expires = Instant::now()
+            + if seek.is_some() {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(2)
+            };
+        let queue = self
+            .media_commands
+            .get_or_insert_with(|| MediaCommands::start(self.input.clone()));
+        // Under sustained stalls, bound the pending work and avoid replaying
+        // old presses once the browser starts responding again.
+        if queue
+            .sender
+            .try_send(QueuedMediaCommand {
+                command,
+                expires,
+                seek,
+            })
+            .is_ok()
         {
             self.record_input();
         }
+    }
+
+    fn queue_playback_action(&mut self, action: PlaybackAction, seek: Option<Weak<()>>) {
+        let Some(playback) = self.playback else {
+            return;
+        };
+        self.queue_media_command(MediaCommand::Playback(playback.source, action), seek);
     }
 
     pub(crate) fn seek_deadline(&self) -> Option<Instant> {
@@ -916,7 +994,7 @@ impl CompanionSession {
             .map(|hold| hold.next.min(hold.expires))
     }
 
-    pub(crate) async fn repeat_seek(&mut self) {
+    pub(crate) fn repeat_seek(&mut self) {
         let now = Instant::now();
         let Some(hold) = &mut self.seek_hold else {
             return;
@@ -927,7 +1005,8 @@ impl CompanionSession {
         }
         hold.next = now + Duration::from_millis(500);
         let action = hold.action;
-        self.apply_playback_action(action).await;
+        let seek = Arc::downgrade(&hold.active);
+        self.queue_playback_action(action, Some(seek));
     }
 
     async fn focused_text_field(&self) -> Option<u64> {
@@ -1153,9 +1232,9 @@ impl CompanionSession {
                     false,
                 );
             }
-        } else if matches!(button, "play_pause" | "home" | "menu") {
-            let input = self.input.clone();
-            let _ = tokio::task::spawn_blocking(move || input.button(button)).await;
+        } else if matches!(button, "play_pause" | "home" | "menu") && self.input.playback_enabled()
+        {
+            self.queue_media_command(MediaCommand::Button(button), None);
         } else {
             self.input.button(button);
         }
@@ -1239,7 +1318,7 @@ impl CompanionSession {
                 } else {
                     PlaybackAction::Pause
                 };
-                self.apply_playback_action(action).await;
+                self.queue_playback_action(action, None);
                 None
             }
             Some(5) => {
@@ -1288,7 +1367,7 @@ impl CompanionSession {
                     } else {
                         PlaybackAction::SkipBackward
                     };
-                    self.apply_playback_action(action).await;
+                    self.queue_playback_action(action, None);
                 }
                 None
             }
@@ -1301,10 +1380,11 @@ impl CompanionSession {
                 let now = Instant::now();
                 self.seek_hold = Some(SeekHold {
                     action,
-                    next: now,
+                    next: now + Duration::from_millis(500),
                     expires: now + Duration::from_secs(8),
+                    active: Arc::new(()),
                 });
-                self.repeat_seek().await;
+                self.queue_playback_action(action, None);
                 None
             }
             Some(9 | 11) => {
@@ -1321,8 +1401,7 @@ impl CompanionSession {
             )])),
             Some(13) => {
                 if let Some(Value::Bool(enabled)) = content.get("_cse") {
-                    self.apply_playback_action(PlaybackAction::SetCaptions(*enabled))
-                        .await;
+                    self.queue_playback_action(PlaybackAction::SetCaptions(*enabled), None);
                 }
                 None
             }
@@ -1442,13 +1521,13 @@ impl CompanionSession {
         if touch.dragging {
             Some(touch.updated + DRAG_IDLE_LIMIT)
         } else if touch.second_tap && !touch.drag_attempted {
-            Some(touch.started + DRAG_HOLD)
+            Some(touch.started.received + DRAG_HOLD)
         } else if self.mode == TrackpadMode::Mouse
             && !touch.second_tap
             && !touch.right_clicked
             && touch.distance < DRAG_MOVE_DISTANCE
         {
-            Some(touch.started + RIGHT_CLICK_HOLD)
+            Some(touch.started.received + RIGHT_CLICK_HOLD)
         } else {
             None
         }
@@ -1527,7 +1606,7 @@ impl CompanionSession {
                 self.touch = Some(ActiveTouch {
                     origin: point,
                     last: point,
-                    started: now,
+                    started: time,
                     updated: now,
                     distance: 0.0,
                     second_tap,
@@ -1545,8 +1624,9 @@ impl CompanionSession {
                 let distance = dx.abs().max(dy.abs());
                 touch.distance = touch.distance.max(distance);
                 touch.updated = now;
+                let elapsed = time.elapsed_since(touch.started);
                 if touch.second_tap && !touch.drag_attempted {
-                    if phase == TouchPhase::Moved && now - touch.started >= DRAG_HOLD {
+                    if phase == TouchPhase::Moved && elapsed >= DRAG_HOLD {
                         touch.drag_attempted = true;
                         touch.dragging = self.input.start_drag();
                     } else if touch.distance >= DRAG_MOVE_DISTANCE {
@@ -1554,13 +1634,16 @@ impl CompanionSession {
                         touch.drag_attempted = true;
                     }
                 }
-                if touch.dragging {
-                    self.input.move_drag(x - touch.last.0, y - touch.last.1);
-                } else if self.mode == TrackpadMode::Mouse
-                    && !touch.right_clicked
-                    && (phase == TouchPhase::Moved || touch.distance >= TAP_MAX_DISTANCE)
-                {
-                    self.input.move_pointer(x - touch.last.0, y - touch.last.1);
+                if point != touch.last {
+                    let (dx, dy) = (x - touch.last.0, y - touch.last.1);
+                    if touch.dragging {
+                        self.input.move_drag(dx, dy);
+                    } else if self.mode == TrackpadMode::Mouse
+                        && !touch.right_clicked
+                        && (phase == TouchPhase::Moved || touch.distance >= TAP_MAX_DISTANCE)
+                    {
+                        self.input.move_pointer(dx, dy);
+                    }
                 }
                 if phase == TouchPhase::Moved {
                     touch.last = point;
@@ -1575,16 +1658,15 @@ impl CompanionSession {
                 } else if self.mode == TrackpadMode::Mouse
                     && !touch.second_tap
                     && touch.distance < DRAG_MOVE_DISTANCE
-                    && now - touch.started >= RIGHT_CLICK_HOLD
+                    && elapsed >= RIGHT_CLICK_HOLD
                 {
                     self.input.right_click();
                     self.suppress_click_echo(now);
                 } else if touch.distance < TAP_MAX_DISTANCE
                     && !touch.drag_attempted
-                    && (self.mode == TrackpadMode::Direction
-                        || now - touch.started < RIGHT_CLICK_HOLD)
+                    && (self.mode == TrackpadMode::Direction || elapsed < RIGHT_CLICK_HOLD)
                 {
-                    self.select(Some(touch.started), time, touch.second_tap);
+                    self.select(Some(touch.started.received), time, touch.second_tap);
                 } else if self.mode == TrackpadMode::Direction && distance >= SWIPE_MIN_DISTANCE {
                     let button = if dx.abs() > dy.abs() {
                         if dx > 0.0 {
@@ -1662,4 +1744,138 @@ fn verification_cipher(shared: &[u8; 32]) -> Result<CompanionCipher> {
 
 fn awake() -> Value {
     Value::dict(vec![Value::kv("state", Value::Int(3))])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{mpsc as blocking, Mutex};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    struct SlowPlayback {
+        received: mpsc::UnboundedSender<&'static str>,
+        resume: Mutex<blocking::Receiver<()>>,
+    }
+
+    impl RemoteInput for SlowPlayback {
+        fn button(&self, _: &str) {
+            self.received.send("button").unwrap();
+        }
+
+        fn move_pointer(&self, dx: f64, dy: f64) {
+            assert_eq!((dx, dy), (70.0, 0.0));
+            self.received.send("pointer").unwrap();
+        }
+
+        fn click(&self) {
+            self.received.send("click").unwrap();
+        }
+
+        fn right_click(&self) {
+            self.received.send("right click").unwrap();
+        }
+
+        fn playback_enabled(&self) -> bool {
+            true
+        }
+
+        fn playback_action(&self, _: VideoSource, action: PlaybackAction) -> bool {
+            assert_eq!(action, PlaybackAction::SkipForward);
+            self.received.send("seek").unwrap();
+            self.resume.lock().unwrap().recv().is_ok()
+        }
+    }
+
+    #[tokio::test]
+    async fn slow_media_keeps_pointer_live_and_drops_released_seek_repeats() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let _phone = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let (_, writer) = server.into_split();
+        let (received, mut events) = mpsc::unbounded_channel();
+        let (resume, paused) = blocking::channel();
+        let input = Arc::new(SlowPlayback {
+            received,
+            resume: Mutex::new(paused),
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let pairing = Arc::new(PairingState::open(directory.path()).unwrap());
+        let (mut session, _replaced) = CompanionSession::new(
+            writer,
+            input,
+            pairing,
+            "test".into(),
+            TrackpadMode::Mouse,
+            None,
+        );
+        session.controller = Some([1; 32]);
+        session.playback = Some(PlaybackState {
+            source: VideoSource::Jellyfin,
+            playing: Some(true),
+            captions: None,
+            duration_seconds: None,
+        });
+
+        async fn event(session: &mut CompanionSession, name: &str, fields: Vec<(Value, Value)>) {
+            timeout(
+                Duration::from_secs(1),
+                session.handle_control(&Value::dict(vec![
+                    Value::kv("_t", Value::Int(1)),
+                    Value::kv("_i", Value::str(name)),
+                    Value::kv("_c", Value::Dict(fields)),
+                ])),
+            )
+            .await
+            .expect("input must stay responsive while playback is blocked")
+            .unwrap();
+        }
+
+        async fn expect(events: &mut mpsc::UnboundedReceiver<&'static str>, expected: &str) {
+            let actual = timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap();
+            assert_eq!(actual, Some(expected));
+        }
+
+        fn touch(phase: u64, x: f64, ns: u64) -> Vec<(Value, Value)> {
+            vec![
+                Value::kv("TouchPhase", Value::Int(phase)),
+                Value::kv("CoordinateX", Value::Double(x)),
+                Value::kv("CoordinateY", Value::Double(100.0)),
+                Value::kv("Nanoseconds", Value::Int(ns)),
+            ]
+        }
+
+        event(&mut session, "_mcc", vec![Value::kv("_mcc", Value::Int(8))]).await;
+        expect(&mut events, "seek").await;
+        session.repeat_seek();
+        event(&mut session, "_mcc", vec![Value::kv("_mcc", Value::Int(9))]).await;
+
+        event(&mut session, "HIDTouch", touch(1, 100.0, 10_000_000)).await;
+        event(&mut session, "HIDTouch", touch(2, 170.0, 20_000_000)).await;
+        event(&mut session, "HIDTouch", touch(3, 170.0, 30_000_000)).await;
+        expect(&mut events, "pointer").await;
+
+        event(&mut session, "HIDTouch", touch(1, 100.0, 100_000_000)).await;
+        // A lift that has already reached the receiver can arrive with a
+        // short phone duration even if the local hold timer is overdue.
+        session.touch.as_mut().unwrap().started.received -= RIGHT_CLICK_HOLD;
+        event(&mut session, "HIDTouch", touch(3, 100.0, 160_000_000)).await;
+        expect(&mut events, "click").await;
+
+        event(
+            &mut session,
+            "HIDCommand",
+            vec![
+                Value::kv("HIDCommand", Value::Int(7)),
+                Value::kv("HIDButtonState", Value::Int(2)),
+            ],
+        )
+        .await;
+        resume.send(()).unwrap();
+        expect(&mut events, "button").await;
+    }
 }

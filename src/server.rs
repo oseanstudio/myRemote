@@ -477,12 +477,9 @@ async fn read_session(
             loop {
                 let touch_deadline = session.touch_deadline();
                 let seek_deadline = session.seek_deadline();
-                if touch_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                    session.touch_timer();
-                    continue;
-                }
                 tokio::select! {
                     biased;
+                    // A buffered move or lift takes precedence over a local hold timer.
                     result = &mut read => {
                         result.map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))??;
                         break;
@@ -491,9 +488,7 @@ async fn read_session(
                         session.touch_timer();
                     }
                     _ = tokio::time::sleep_until(seek_deadline.unwrap_or(header_deadline)), if seek_deadline.is_some() => {
-                        timeout(Duration::from_secs(2), session.repeat_seek())
-                            .await
-                            .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?;
+                        session.repeat_seek();
                     }
                     _ = focus_poll.tick(), if session.watches_keyboard_focus() && keyboard_probes.is_empty() => {
                         session.queue_keyboard_probe(&mut keyboard_probes);
