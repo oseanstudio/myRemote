@@ -12,7 +12,7 @@ use tokio::runtime::Runtime;
 
 use crate::{
     input,
-    mac_accessibility::{refresh_updated_permissions, ApprovalWatch, RELAUNCHED_ENV},
+    mac_accessibility::{refresh_updated_permissions, ApprovalWatch, Permission},
     mac_bonjour, start_receiver,
     update::{self, Updater},
     ActiveReceiver, Options, VERSION,
@@ -22,6 +22,7 @@ const STATUS: isize = 1;
 const PAIR: isize = 2;
 const START_RECEIVER: isize = 3;
 const UPDATE_STATUS: isize = 4;
+const UPDATE_ACTION: isize = 5;
 const AUTO_CHECK: isize = 6;
 const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
@@ -95,6 +96,9 @@ define_class!(
             }
             let mut updater = self.ivars().updater.borrow_mut();
             updater.refresh_for_menu();
+            if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
+                item.setTitle(&NSString::from_str(updater.action_title()));
+            }
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
                 let status = updater.status();
                 item.setHidden(status.is_empty());
@@ -147,7 +151,7 @@ define_class!(
 
         #[unsafe(method(myRemoteCheckAccessibility:))]
         fn check_accessibility(&self, _timer: &NSTimer) {
-            self.request_accessibility(std::env::var_os(RELAUNCHED_ENV).is_none());
+            self.request_accessibility(false);
         }
 
         #[unsafe(method(myRemoteLocalNetwork:))]
@@ -223,47 +227,56 @@ impl MenuController {
     }
 
     fn needs_accessibility(&self) -> bool {
-        !self.ivars().options.dry_run && !input::can_post_input()
+        !self.ivars().options.dry_run && Permission::current() != Permission::PostEvents
     }
 
-    fn request_accessibility(&self, watch_for_grant: bool) {
-        if !self.needs_accessibility() {
+    fn request_accessibility(&self, manual: bool) {
+        let state = self.ivars();
+        if state.options.dry_run {
             return;
         }
-        if watch_for_grant {
-            let state = self.ivars();
+        let current = Permission::current();
+        if current == Permission::PostEvents {
+            return;
+        }
+        let baseline = if manual {
+            current
+        } else {
+            current.max(Permission::previous_relaunch())
+        };
+        if baseline < Permission::PostEvents {
             let mut approval = state.accessibility_approval.borrow_mut();
-            if approval.as_ref().is_none_or(ApprovalWatch::expired) {
+            if manual || approval.is_none() {
                 if let Ok(bundle) = update::app_bundle_path() {
-                    *approval = Some(ApprovalWatch::start(bundle, &state.runtime));
+                    *approval = Some(ApprovalWatch::start(bundle, &state.runtime, baseline));
                 }
             }
         }
-        if input::request_accessibility_entry() && self.needs_accessibility() {
+        if (current == Permission::Accessibility || input::request_accessibility_entry())
+            && !input::can_post_input()
+        {
             input::request_input_permission();
         }
     }
 
     fn poll_accessibility_setup(&self) -> bool {
         let mut approval = self.ivars().accessibility_approval.borrow_mut();
-        let Some(watch) = approval.as_mut() else {
+        let Some(permission) = approval.as_mut().and_then(ApprovalWatch::granted) else {
             return false;
         };
-        if watch.expired() {
-            approval.take();
-        } else if watch.granted() {
-            approval.take();
-            drop(approval);
-            match update::prepare_accessibility_relaunch() {
-                Ok(()) => {
-                    self.stop();
-                    NSApplication::sharedApplication(self.mtm()).terminate(None);
-                    return true;
-                }
-                Err(error) => tracing::warn!("Unable to relaunch myRemote: {error}"),
+        approval.take();
+        drop(approval);
+        match update::prepare_accessibility_relaunch(permission) {
+            Ok(()) => {
+                self.stop();
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+                true
+            }
+            Err(error) => {
+                tracing::warn!("Unable to relaunch myRemote: {error}");
+                false
             }
         }
-        false
     }
 
     fn stop(&self) {
@@ -358,12 +371,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         );
         controller.add_item(
             &menu,
-            "Remote Diagnostics…",
-            Some(sel!(myRemoteDiagnostics:)),
-            DIAGNOSTICS,
-        );
-        controller.add_item(
-            &menu,
             "Allow Accessibility…",
             Some(sel!(myRemoteAccessibility:)),
             ACCESSIBILITY,
@@ -376,7 +383,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "", None, UPDATE_STATUS);
-        controller.add_item(&menu, "Update Now", Some(sel!(myRemoteUpdateNow:)), 0);
+        controller.add_item(
+            &menu,
+            controller.ivars().updater.borrow().action_title(),
+            Some(sel!(myRemoteUpdateNow:)),
+            UPDATE_ACTION,
+        );
         controller.add_item(
             &menu,
             "Check for Updates Automatically",
@@ -388,6 +400,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             "Install Updates Automatically",
             Some(sel!(myRemoteAutoInstall:)),
             AUTO_INSTALL,
+        );
+        controller.add_item(
+            &menu,
+            "Remote Diagnostics…",
+            Some(sel!(myRemoteDiagnostics:)),
+            DIAGNOSTICS,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Quit myRemote", Some(sel!(myRemoteQuit:)), 0);

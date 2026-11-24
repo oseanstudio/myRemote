@@ -15,25 +15,42 @@ use crate::{input, VERSION};
 
 const PROBE_ARG: &str = "--probe-input-permission";
 pub const RELAUNCHED_ENV: &str = "MYREMOTE_ACCESSIBILITY_RELAUNCHED";
-const WATCH_TIME: Duration = Duration::from_secs(5 * 60);
+const FAST_WATCH_TIME: Duration = Duration::from_secs(5 * 60);
 const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const BUNDLE_ID: &str = "com.oseanstudio.myremote";
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Permission {
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Permission {
     Missing,
     Accessibility,
     PostEvents,
 }
 
 impl Permission {
-    fn current() -> Self {
-        if input::can_post_input() {
-            Self::PostEvents
-        } else if input::accessibility_is_trusted() {
-            Self::Accessibility
-        } else {
+    pub fn current() -> Self {
+        if !input::accessibility_is_trusted() {
             Self::Missing
+        } else if input::can_post_input() {
+            Self::PostEvents
+        } else {
+            Self::Accessibility
+        }
+    }
+
+    pub fn previous_relaunch() -> Self {
+        match env::var(RELAUNCHED_ENV).as_deref() {
+            Ok("accessibility" | "1") => Self::Accessibility,
+            Ok("granted") => Self::PostEvents,
+            _ => Self::Missing,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Missing => "denied",
+            Self::Accessibility => "accessibility",
+            Self::PostEvents => "granted",
         }
     }
 
@@ -47,88 +64,54 @@ impl Permission {
     }
 }
 
-struct GrantProgress {
-    awaiting_accessibility: bool,
-}
-
-impl GrantProgress {
-    fn new() -> Self {
-        Self {
-            awaiting_accessibility: !input::accessibility_is_trusted(),
-        }
-    }
-
-    fn granted(&mut self, permission: Permission) -> bool {
-        match permission {
-            Permission::PostEvents => true,
-            Permission::Accessibility => self.awaiting_accessibility,
-            Permission::Missing => {
-                self.awaiting_accessibility = true;
-                false
-            }
-        }
-    }
-}
-
 pub fn run_probe() -> Option<ExitCode> {
     if !env::args_os().nth(1).is_some_and(|arg| arg == PROBE_ARG) {
         return None;
     }
-    println!(
-        "{}",
-        match Permission::current() {
-            Permission::Missing => "denied",
-            Permission::Accessibility => "accessibility",
-            Permission::PostEvents => "granted",
-        }
-    );
+    println!("{}", Permission::current().label());
     Some(ExitCode::SUCCESS)
 }
 
 pub struct ApprovalWatch {
-    deadline: Instant,
-    granted: oneshot::Receiver<()>,
+    baseline: Permission,
+    granted: oneshot::Receiver<Permission>,
     worker: JoinHandle<()>,
-    progress: GrantProgress,
 }
 
 impl ApprovalWatch {
-    pub fn start(bundle: PathBuf, runtime: &Runtime) -> Self {
-        let deadline = Instant::now() + WATCH_TIME;
+    pub fn start(bundle: PathBuf, runtime: &Runtime, baseline: Permission) -> Self {
         let (notify, granted) = oneshot::channel();
-        let mut probe_progress = GrantProgress::new();
         let worker = runtime.spawn(async move {
-            let watch = async {
-                loop {
-                    sleep(PROBE_INTERVAL).await;
-                    match probe_fresh_process(&bundle).await {
-                        Ok(permission) if probe_progress.granted(permission) => {
-                            let _ = notify.send(());
-                            break;
-                        }
-                        Ok(_) => {}
-                        Err(error) => tracing::debug!(
-                            "Could not check Accessibility in a fresh process: {error}"
-                        ),
+            let started = Instant::now();
+            loop {
+                let interval = if started.elapsed() < FAST_WATCH_TIME {
+                    PROBE_INTERVAL
+                } else {
+                    SLOW_PROBE_INTERVAL
+                };
+                sleep(interval).await;
+                match probe_fresh_process(&bundle).await {
+                    Ok(permission) if permission > baseline => {
+                        let _ = notify.send(permission);
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::debug!("Could not check Accessibility in a fresh process: {error}")
                     }
                 }
-            };
-            let _ = timeout(WATCH_TIME, watch).await;
+            }
         });
         Self {
-            deadline,
+            baseline,
             granted,
             worker,
-            progress: GrantProgress::new(),
         }
     }
 
-    pub fn expired(&self) -> bool {
-        Instant::now() >= self.deadline
-    }
-
-    pub fn granted(&mut self) -> bool {
-        self.progress.granted(Permission::current()) || self.granted.try_recv().is_ok()
+    pub fn granted(&mut self) -> Option<Permission> {
+        let fresh = self.granted.try_recv().unwrap_or(Permission::Missing);
+        new_grant(self.baseline, Permission::current(), fresh)
     }
 }
 
@@ -136,6 +119,11 @@ impl Drop for ApprovalWatch {
     fn drop(&mut self) {
         self.worker.abort();
     }
+}
+
+fn new_grant(baseline: Permission, current: Permission, fresh: Permission) -> Option<Permission> {
+    let granted = current.max(fresh);
+    (granted > baseline).then_some(granted)
 }
 
 async fn probe_fresh_process(bundle: &Path) -> io::Result<Permission> {
@@ -232,14 +220,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn accessibility_transition_can_trigger_a_restart_before_events_are_allowed() {
-        let mut progress = GrantProgress {
-            awaiting_accessibility: false,
-        };
-        assert!(!progress.granted(Permission::Accessibility));
-        assert!(!progress.granted(Permission::Missing));
-        assert!(progress.granted(Permission::Accessibility));
-        assert!(progress.granted(Permission::PostEvents));
+    fn watches_both_grants_without_relaunching_twice_for_the_same_permission() {
+        use Permission::*;
+
+        assert_eq!(new_grant(Missing, Missing, Missing), None);
+        assert_eq!(
+            new_grant(Missing, Missing, Accessibility),
+            Some(Accessibility)
+        );
+        assert_eq!(new_grant(Accessibility, Accessibility, Accessibility), None);
+        assert_eq!(
+            new_grant(Accessibility, Accessibility, PostEvents),
+            Some(PostEvents)
+        );
+        assert_eq!(
+            new_grant(Accessibility, PostEvents, Missing),
+            Some(PostEvents)
+        );
+        assert_eq!(new_grant(PostEvents, Accessibility, PostEvents), None);
     }
 
     #[test]

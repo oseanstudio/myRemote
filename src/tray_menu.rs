@@ -25,7 +25,8 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
     let retry = MenuItem::new("Retry Starting Receiver", true, None);
     let mut updater = Updater::new(&options);
     let update_status = MenuItem::new("", false, None);
-    let update_now = MenuItem::new("Update Now", true, None);
+    let mut displayed_update_title = updater.action_title().to_owned();
+    let update_now = MenuItem::new(&displayed_update_title, true, None);
     let check_updates = CheckMenuItem::new(
         "Check for Updates Automatically",
         true,
@@ -140,6 +141,11 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
         if updater.poll() {
             break;
+        }
+        let title = updater.action_title();
+        if displayed_update_title != title {
+            update_now.set_text(title);
+            displayed_update_title = title.to_owned();
         }
         let status = updater.status();
         if displayed_update != status {

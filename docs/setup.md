@@ -21,7 +21,7 @@ To use two iPhones at once, pair each one individually. They share the same desk
 | macOS 14+ | Open the universal DMG and drag **myRemote** into **Applications**. Open the app to start the receiver. Allow Accessibility and Local Network access when macOS asks. |
 | Linux | Make the AppImage executable and launch it. The tray requires a desktop that supports StatusNotifier/AppIndicator. The receiver uses `/dev/uinput` for Wayland and X11. |
 
-myRemote uses the macOS permission prompt when mouse and keyboard access is missing. Choose **Allow Accessibility…** from the menu to request access again. In the system prompt, open System Settings and enable **myRemote**. When macOS reports the grant, myRemote quits and reopens automatically.
+myRemote uses the macOS permission prompt when mouse and keyboard access is missing. In the prompt, open System Settings and enable **myRemote**. myRemote reopens automatically after the grant and continues checking if macOS asks separately for permission to send input events. The menu action **Allow Accessibility…** lets you request permission again if you dismissed the prompt.
 
 The macOS build is ad-hoc signed. If access is missing at the first launch of a new release, myRemote asks macOS to clear its old Accessibility and mouse and keyboard permissions so the new copy can request them. Approve the new grant in System Settings. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it.
 
@@ -31,7 +31,7 @@ If your iPhone connects but the controls do nothing, press Back on the iPhone an
 
 ### Updates
 
-**Check for Updates Automatically** is on by default. myRemote checks GitHub shortly after launch and every hour. Opening the Mac menu also checks if at least five minutes have passed since the last check. **Update Now** checks, downloads, verifies, installs, and relaunches myRemote when a newer release is available. Enable **Install Updates Automatically** to do the same whenever a check finds an update. Turning off automatic checks also turns off automatic installation.
+**Check for Updates Automatically** is on by default. myRemote checks GitHub shortly after launch and every hour. Opening the Mac menu also checks if at least five minutes have passed since the last check. **Update Now** shows the available version when an update is found. Click it to check, download, verify, install, and relaunch myRemote. Enable **Install Updates Automatically** to do the same whenever a check finds an update. Turning off automatic checks also turns off automatic installation.
 
 Install myRemote in a writable folder to enable replacement. On macOS, move the app out of the DMG first. On Linux, launch the AppImage itself and have `curl` installed. An update briefly interrupts the receiver and preserves pairing and settings.
 

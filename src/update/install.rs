@@ -11,6 +11,8 @@ use semver::Version;
 use tempfile::TempDir;
 
 use super::Result;
+#[cfg(target_os = "macos")]
+use crate::mac_accessibility::{Permission, RELAUNCHED_ENV};
 
 #[cfg(target_os = "macos")]
 pub const ASSET: &str = "myRemote-macOS-Universal.dmg";
@@ -316,11 +318,12 @@ fn replace_with_retry(candidate: &Path, target: &Path) -> Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-pub fn prepare_accessibility_relaunch() -> Result<()> {
+pub fn prepare_accessibility_relaunch(permission: Permission) -> Result<()> {
     destination()?;
     let helper = Command::new(env::current_exe()?)
         .arg(ACCESSIBILITY_RELAUNCH_ARG)
         .args(env::args_os().skip(1))
+        .env(RELAUNCHED_ENV, permission.label())
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -341,25 +344,29 @@ pub fn run_accessibility_relaunch() -> Result<()> {
         return Err("Invalid relaunch signal".into());
     }
     let arguments: Vec<_> = env::args_os().skip(2).collect();
-    relaunch_mac(&destination()?, &arguments, true)
+    relaunch_mac(
+        &destination()?,
+        &arguments,
+        Some(Permission::previous_relaunch()),
+    )
 }
 
 #[cfg(target_os = "macos")]
 fn relaunch(target: &Path, arguments: &[std::ffi::OsString]) -> Result<()> {
-    relaunch_mac(target, arguments, false)
+    relaunch_mac(target, arguments, None)
 }
 
 #[cfg(target_os = "macos")]
 fn relaunch_mac(
     target: &Path,
     arguments: &[std::ffi::OsString],
-    after_accessibility_grant: bool,
+    after_accessibility_grant: Option<Permission>,
 ) -> Result<()> {
     let mut command = Command::new("/usr/bin/open");
     command.arg("-n");
-    if after_accessibility_grant {
+    if let Some(permission) = after_accessibility_grant {
         command.args(["-g", "--env"]);
-        command.arg(format!("{}=1", crate::mac_accessibility::RELAUNCHED_ENV));
+        command.arg(format!("{RELAUNCHED_ENV}={}", permission.label()));
     }
     command.arg(target);
     if !arguments.is_empty() {

@@ -25,6 +25,7 @@ const INTERVAL: Duration = Duration::from_secs(60 * 60);
 const MENU_CHECK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 const MANUAL_STATUS_DURATION: Duration = Duration::from_secs(15);
 const MAX_PACKAGE: u64 = 100 * 1024 * 1024;
+const UPDATE_NOW: &str = "Update Now";
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -83,6 +84,7 @@ pub struct Updater {
     next_check: Instant,
     next_menu_check: Instant,
     task: Option<UpdateTask>,
+    action_title: String,
     status: String,
     status_expires: Option<Instant>,
 }
@@ -117,6 +119,7 @@ impl Updater {
             next_check,
             next_menu_check: next_check,
             task: None,
+            action_title: UPDATE_NOW.to_owned(),
             status: previous_error.unwrap_or_default(),
             status_expires: None,
         }
@@ -131,6 +134,10 @@ impl Updater {
     fn busy(&self) -> bool {
         self.task.is_some()
     }
+    pub fn action_title(&self) -> &str {
+        &self.action_title
+    }
+
     pub fn status(&self) -> &str {
         if self
             .status_expires
@@ -188,17 +195,22 @@ impl Updater {
                     self.task = None;
                     self.next_check = Instant::now() + INTERVAL;
                     match finished {
-                        Finished::Checked(Ok(Some(download))) if manual || self.automatic() => {
-                            self.prepare(download, manual);
-                        }
                         Finished::Checked(Ok(Some(download))) => {
-                            self.status = format!("Version {} is available", download.version);
+                            self.action_title = format!("Update to {}…", download.version);
+                            self.status.clear();
+                            if manual || self.automatic() {
+                                self.prepare(download, manual);
+                            }
                         }
-                        Finished::Checked(Ok(None)) if manual => {
-                            self.status = "No update found".into();
-                            self.status_expires = Some(Instant::now() + MANUAL_STATUS_DURATION);
+                        Finished::Checked(Ok(None)) => {
+                            self.action_title = UPDATE_NOW.to_owned();
+                            if manual {
+                                self.status = "No update found".into();
+                                self.status_expires = Some(Instant::now() + MANUAL_STATUS_DURATION);
+                            } else {
+                                self.status.clear();
+                            }
                         }
-                        Finished::Checked(Ok(None)) => self.status.clear(),
                         Finished::Prepared(Ok(ready)) if manual || self.automatic() => {
                             match install::launch(ready) {
                                 Ok(()) => return true,
@@ -265,7 +277,7 @@ impl Updater {
     }
 
     fn prepare(&mut self, download: Download, manual: bool) {
-        self.status = format!("Downloading myRemote {}…", download.version);
+        self.status = "Downloading update…".into();
         let (tx, rx) = mpsc::channel();
         self.task = Some(UpdateTask { result: rx, manual });
         std::thread::spawn(move || {
@@ -496,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn update_status_hides_idle_results_and_shows_new_releases() {
+    fn update_action_shows_available_version_without_a_status_line() {
         let future = Instant::now() + INTERVAL;
         let mut updater = Updater {
             path: None,
@@ -504,6 +516,7 @@ mod tests {
             next_check: future,
             next_menu_check: future,
             task: None,
+            action_title: UPDATE_NOW.to_owned(),
             status: String::new(),
             status_expires: None,
         };
@@ -515,6 +528,7 @@ mod tests {
         sender.send(Finished::Checked(Ok(None))).unwrap();
         assert!(!updater.poll());
         assert_eq!(updater.status(), "");
+        assert_eq!(updater.action_title(), "Update Now");
 
         let (sender, result) = mpsc::channel();
         updater.task = Some(UpdateTask {
@@ -543,6 +557,17 @@ mod tests {
             }))))
             .unwrap();
         assert!(!updater.poll());
-        assert_eq!(updater.status(), "Version 2.0.0 is available");
+        assert_eq!(updater.action_title(), "Update to 2.0.0…");
+        assert_eq!(updater.status(), "");
+
+        let (sender, result) = mpsc::channel();
+        updater.task = Some(UpdateTask {
+            result,
+            manual: false,
+        });
+        sender.send(Finished::Checked(Ok(None))).unwrap();
+        assert!(!updater.poll());
+        assert_eq!(updater.action_title(), "Update Now");
+        assert_eq!(updater.status(), "");
     }
 }
