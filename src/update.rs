@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::{NamedTempFile, TempDir};
 
-use crate::{default_state_dir, Options, VERSION};
+use crate::{default_state_dir, version_label, Options, VERSION};
 pub use install::{clean_helper, run_helper};
 #[cfg(target_os = "macos")]
 pub use install::{
@@ -129,6 +129,12 @@ impl Updater {
     fn busy(&self) -> bool {
         self.task.is_some()
     }
+
+    #[cfg(target_os = "macos")]
+    pub fn has_update(&self) -> bool {
+        self.check_state.available_version.is_some()
+    }
+
     pub fn action_title(&self) -> &str {
         &self.action_title
     }
@@ -253,7 +259,7 @@ impl Updater {
 fn update_title(version: Option<&str>) -> String {
     version.map_or_else(
         || UPDATE_NOW.to_owned(),
-        |version| format!("Update to {version}…"),
+        |version| format!("Update to {}…", version_label(version)),
     )
 }
 
@@ -448,7 +454,7 @@ mod tests {
     fn chooses_only_new_stable_release_with_package_and_checksum() {
         let asset = "app.zip";
         let release = Release {
-            tag_name: "v2.0.0".into(),
+            tag_name: "v2.3.0".into(),
             draft: false,
             prerelease: false,
             assets: vec![Asset {
@@ -458,7 +464,7 @@ mod tests {
             }],
         };
         assert_eq!(
-            choose_release(release, &Version::new(1, 0, 0), asset)
+            choose_release(release, &Version::new(0, 2, 32), asset)
                 .unwrap()
                 .unwrap()
                 .digest,
@@ -533,7 +539,8 @@ mod tests {
             }))))
             .unwrap();
         assert!(!updater.poll());
-        assert_eq!(updater.action_title(), "Update to 2.0.0…");
+        assert_eq!(updater.action_title(), "Update to 2.0…");
+        assert_eq!(update_title(Some("2.3.1")), "Update to 2.3.1…");
         assert_eq!(updater.status(), "");
         assert!(updater.task.is_none());
         let saved = CheckState::read(Some(&path));

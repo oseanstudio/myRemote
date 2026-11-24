@@ -22,6 +22,10 @@ mod update;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+fn version_label(version: &str) -> &str {
+    version.strip_suffix(".0").unwrap_or(version)
+}
+
 const HELP: &str = r#"myRemote — use the built-in Apple TV Remote to control this desktop
 
 Usage: myremote [OPTIONS]

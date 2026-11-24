@@ -15,7 +15,7 @@ use crate::{
     mac_accessibility::{refresh_updated_permissions, ApprovalWatch, Permission},
     mac_bonjour, start_receiver,
     update::{self, Updater},
-    ActiveReceiver, Options, VERSION,
+    version_label, ActiveReceiver, Options, VERSION,
 };
 
 const STATUS: isize = 1;
@@ -90,7 +90,19 @@ define_class!(
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
-                item.setTitle(&NSString::from_str(updater.action_title()));
+                let label = updater.has_update().then(|| NSString::from_str(updater.action_title()));
+                let icon = label.as_ref().and_then(|label| {
+                    NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        objc2_foundation::ns_string!("arrow.down.circle.fill"),
+                        Some(label),
+                    )
+                });
+                if let Some(icon) = icon.as_ref() {
+                    icon.setTemplate(true);
+                }
+                item.setImage(icon.as_deref());
+                item.setToolTip(label.as_deref());
+                item.setEnabled(label.is_some());
             }
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
                 let status = updater.status();
@@ -232,10 +244,10 @@ impl MenuController {
         let Some(permission) = approval.as_mut().and_then(ApprovalWatch::granted) else {
             return false;
         };
-        approval.take();
-        drop(approval);
         match update::prepare_accessibility_relaunch(permission) {
             Ok(()) => {
+                approval.take();
+                drop(approval);
                 self.stop();
                 NSApplication::sharedApplication(self.mtm()).terminate(None);
                 true
@@ -326,7 +338,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         let menu = NSMenu::new(mtm);
         menu.setAutoenablesItems(false);
         menu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
-        controller.add_item(&menu, &format!("myRemote {VERSION}"), None, 0);
+        controller.add_item(
+            &menu,
+            &format!("myRemote {}", version_label(VERSION)),
+            Some(sel!(myRemoteUpdateNow:)),
+            UPDATE_ACTION,
+        );
         controller.add_item(&menu, "", None, STATUS);
         controller.add_item(&menu, "", None, CONNECTION);
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
@@ -349,12 +366,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             LOCAL_NETWORK,
         );
         controller.add_item(&menu, "", None, UPDATE_STATUS);
-        controller.add_item(
-            &menu,
-            controller.ivars().updater.borrow().action_title(),
-            Some(sel!(myRemoteUpdateNow:)),
-            UPDATE_ACTION,
-        );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Quit myRemote", Some(sel!(myRemoteQuit:)), 0);
 

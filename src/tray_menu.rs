@@ -11,14 +11,18 @@ use tray_icon::{
     Icon, TrayIconBuilder, TrayIconEvent,
 };
 
-use crate::{shutdown_signal, start_receiver, update::Updater, ActiveReceiver, Options, VERSION};
+use crate::{
+    shutdown_signal, start_receiver, update::Updater, version_label, ActiveReceiver, Options,
+    VERSION,
+};
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
     #[cfg(windows)]
     windows_loop::hide_standalone_console();
 
     let menu = Menu::new();
-    let version = MenuItem::new(format!("myRemote {VERSION}"), false, None);
+    let app_title = format!("myRemote {}", version_label(VERSION));
+    let version = MenuItem::new(&app_title, false, None);
     let startup_error = MenuItem::new("", false, None);
     let pair = MenuItem::new("Pair iPhone…", false, None);
     let code = MenuItem::new("Pairing closed", false, None);
@@ -37,7 +41,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         &quit,
     ])?;
     let _icon = TrayIconBuilder::new()
-        .with_tooltip(format!("myRemote {VERSION}"))
+        .with_tooltip(app_title)
         .with_icon(make_icon()?)
         .with_menu(Box::new(menu.clone()))
         .with_menu_on_left_click(true)

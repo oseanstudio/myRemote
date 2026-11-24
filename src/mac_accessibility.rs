@@ -16,7 +16,7 @@ use crate::{input, VERSION};
 const PROBE_ARG: &str = "--probe-input-permission";
 pub const RELAUNCHED_ENV: &str = "MYREMOTE_ACCESSIBILITY_RELAUNCHED";
 const FAST_WATCH_TIME: Duration = Duration::from_secs(5 * 60);
-const PROBE_INTERVAL: Duration = Duration::from_secs(3);
+const PROBE_INTERVAL: Duration = Duration::from_secs(1);
 const SLOW_PROBE_INTERVAL: Duration = Duration::from_secs(30);
 const BUNDLE_ID: &str = "com.oseanstudio.myremote";
 
@@ -75,6 +75,7 @@ pub fn run_probe() -> Option<ExitCode> {
 pub struct ApprovalWatch {
     baseline: Permission,
     granted: oneshot::Receiver<Permission>,
+    fresh: Permission,
     worker: JoinHandle<()>,
 }
 
@@ -89,7 +90,6 @@ impl ApprovalWatch {
                 } else {
                     SLOW_PROBE_INTERVAL
                 };
-                sleep(interval).await;
                 match probe_fresh_process(&bundle).await {
                     Ok(permission) if permission > baseline => {
                         let _ = notify.send(permission);
@@ -100,18 +100,22 @@ impl ApprovalWatch {
                         tracing::debug!("Could not check Accessibility in a fresh process: {error}")
                     }
                 }
+                sleep(interval).await;
             }
         });
         Self {
             baseline,
             granted,
+            fresh: Permission::Missing,
             worker,
         }
     }
 
     pub fn granted(&mut self) -> Option<Permission> {
-        let fresh = self.granted.try_recv().unwrap_or(Permission::Missing);
-        new_grant(self.baseline, Permission::current(), fresh)
+        if let Ok(permission) = self.granted.try_recv() {
+            self.fresh = permission;
+        }
+        new_grant(self.baseline, Permission::current(), self.fresh)
     }
 }
 
@@ -133,7 +137,7 @@ async fn probe_fresh_process(bundle: &Path) -> io::Result<Permission> {
     let status = timeout(
         Duration::from_secs(8),
         Command::new("/usr/bin/open")
-            .args(["-n", "-g", "-j", "-W", "--stdout"])
+            .args(["-n", "-g", "-j", "--stdout"])
             .arg(output.path())
             .arg(bundle)
             .args(["--args", PROBE_ARG])
@@ -150,7 +154,18 @@ async fn probe_fresh_process(bundle: &Path) -> io::Result<Permission> {
             "Launch Services rejected the permission check",
         ));
     }
-    Permission::from_probe(&fs::read(output.path())?)
+    // Read the probe response as soon as it arrives, independently of app termination.
+    timeout(Duration::from_secs(3), async {
+        loop {
+            let answer = fs::read(output.path())?;
+            if answer.ends_with(b"\n") {
+                return Permission::from_probe(&answer);
+            }
+            sleep(Duration::from_millis(40)).await;
+        }
+    })
+    .await
+    .map_err(|error| io::Error::new(io::ErrorKind::TimedOut, error))?
 }
 
 pub async fn refresh_updated_permissions(bundle: &Path, state_dir: &Path) -> io::Result<()> {

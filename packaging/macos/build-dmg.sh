@@ -47,8 +47,11 @@ test "$("$app/Contents/MacOS/myremote" --version)" = "myRemote $version"
 if [[ "${GITHUB_ACTIONS:-}" == "true" ]]; then
     python3 - "$app" "$staging/input-permission" <<'PY'
 from pathlib import Path
+import select
 import subprocess
 import sys
+import tempfile
+import time
 
 app, result = sys.argv[1:]
 signature = subprocess.run(
@@ -59,20 +62,37 @@ signature = subprocess.run(
 ).stderr.splitlines()
 assert {"Identifier=com.oseanstudio.myremote", "Signature=adhoc"} <= set(signature)
 
-Path(result).touch(exist_ok=False)
-subprocess.run(
-    ["/usr/bin/open", "-n", "-g", "-j", "-W", "--stdout", result, app,
-     "--args", "--probe-input-permission"],
-    check=True,
-    timeout=15,
-)
-assert Path(result).read_bytes() in {b"granted\n", b"accessibility\n", b"denied\n"}
-Path(result).unlink()
+binary = str(Path(app) / "Contents/MacOS/myremote")
+with tempfile.TemporaryDirectory() as state:
+    with subprocess.Popen(
+        [binary, "--dry-run", "--ip", "127.0.0.1", "--state-dir", state],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+    ) as receiver:
+        try:
+            # A fresh probe must answer while the original signed executable is still running.
+            assert select.select([receiver.stdout], [], [], 10)[0], "Receiver did not start"
+            assert b" is listening on " in receiver.stdout.readline()
+            Path(result).touch(exist_ok=False)
+            subprocess.run(
+                ["/usr/bin/open", "-n", "-g", "-j", "--stdout", result, app,
+                 "--args", "--probe-input-permission"],
+                check=True,
+                timeout=8,
+            )
+            deadline = time.monotonic() + 3
+            while not (answer := Path(result).read_bytes()).endswith(b"\n"):
+                assert time.monotonic() < deadline, "Fresh permission probe did not answer"
+                time.sleep(0.04)
+            assert answer in {b"granted\n", b"accessibility\n", b"denied\n"}
+            assert receiver.poll() is None
+        finally:
+            receiver.kill()
+            Path(result).unlink(missing_ok=True)
 
 # The helper must wait for its parent to close the pipe before launching another instance.
 with subprocess.Popen(
-    [str(Path(app) / "Contents/MacOS/myremote"), "--relaunch-after-accessibility",
-     "--probe-input-permission"],
+    [binary, "--relaunch-after-accessibility", "--probe-input-permission"],
     stdin=subprocess.PIPE,
 ) as helper:
     try:

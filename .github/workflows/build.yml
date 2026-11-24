@@ -15,6 +15,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      version_label: ${{ steps.version.outputs.version_label }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
@@ -30,6 +31,7 @@ jobs:
             test "$GITHUB_REF_NAME" = "v$version"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "version_label=${version%.0}" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -133,6 +135,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ needs.prepare.outputs.version }}
+          VERSION_LABEL: ${{ needs.prepare.outputs.version_label }}
         run: |
           set -euo pipefail
           cd release
@@ -153,7 +156,7 @@ jobs:
             if [[ "$draft" == false ]]; then exit 0; fi
             gh release upload "$tag" "${assets[@]}" --clobber
           else
-            gh release create "$tag" "${assets[@]}" --verify-tag --draft --title "myRemote $VERSION" \
+            gh release create "$tag" "${assets[@]}" --verify-tag --draft --title "myRemote $VERSION_LABEL" \
               --notes "Includes a universal macOS DMG (ad-hoc signed), Linux AppImages, and a Windows x64 ZIP. If you are running 0.2.1, download and install this version once to switch to GitHub's built-in asset verification. See the [setup guide](https://github.com/$GH_REPO/blob/$tag/docs/setup.md) for permissions and pairing."
           fi
           uploaded=$(gh release view "$tag" --json assets --jq '.assets[].name')
