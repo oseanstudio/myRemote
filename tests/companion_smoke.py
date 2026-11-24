@@ -121,9 +121,10 @@ ACCEPTED_WORD = base64.b64decode(
 
 
 @contextmanager
-def receiver(binary, state, *options):
+def receiver(binary, state, *options, nearby=False):
+    network = ["--nearby"] if nearby else ["--ip", "127.0.0.1"]
     process = subprocess.Popen(
-        [binary, "--dry-run", "--verbose", "--ip", "127.0.0.1",
+        [binary, "--dry-run", "--verbose", *network,
          "--name", "myRemote smoke test", "--state-dir", state, *options],
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
         text=True, encoding="utf-8",
@@ -147,7 +148,8 @@ def receiver(binary, state, *options):
 
     Thread(target=collect, daemon=True).start()
     try:
-        port = int(expect(r"companion (\d+)")[1])
+        pattern = r"^Nearby ports.*companion (\d+)" if nearby else r"^TCP ports.*companion (\d+)"
+        port = int(expect(pattern)[1])
         yield port, expect
     finally:
         process.terminate()
@@ -180,7 +182,7 @@ async def command(client, name, values, frame=FrameType.E_OPACK):
     return await client.exchange_opack(frame, {"_i": name, "_t": 2, "_c": values}, timeout=2.0)
 
 
-async def start_remote(client):
+async def start_remote(client, name="myRemote smoke test"):
     reply = await client.exchange_opack(
         FrameType.E_OPACK,
         {
@@ -194,7 +196,7 @@ async def start_remote(client):
     assert set(reply) == {"_t", "_x", "_c"}
     assert reply["_c"]["_stA"] == ["com.apple.tvremoteservices"]
     assert reply["_c"]["model"] == "AppleTV14,1"
-    assert reply["_c"]["name"] == "myRemote smoke test"
+    assert reply["_c"]["name"] == name
     assert reply["_c"]["_lP"] == client.connection.port
     device = reply["_c"]
 
@@ -894,9 +896,35 @@ async def exercise(binary, state):
         await exercise_media(port, credentials, expect)
 
 
+async def exercise_nearby(binary, state):
+    with receiver(binary, state, "--pair", nearby=True) as (port, expect):
+        pin = int(expect(r"Pairing code (\d{4})")[1])
+        credentials = await pair(port, pin, allowed=True)
+        client = protocol(port, credentials)
+        try:
+            await client.start()
+            identity, _ = await start_remote(client, "myRemote smoke test · Nearby")
+            await command(client, "_hidC", {"_hidC": 1, "_hBtS": 2})
+            expect(r"^Received button up$")
+        finally:
+            client.stop()
+    with receiver(binary, state) as (port, _):
+        client = protocol(port, credentials)
+        try:
+            await client.start()
+            lan_identity, _ = await start_remote(client)
+            assert lan_identity == identity
+        finally:
+            client.stop()
+
+
 if __name__ == "__main__":
     executable = Path(sys.argv[1]).resolve(strict=True)
     # Resolve the executable before creating a short-lived pairing directory.
     with TemporaryDirectory(prefix="myremote-smoke-", dir=executable.parent) as directory:
-        asyncio.run(exercise(executable, directory))
-    print("Companion pairing, reconnect, simultaneous controllers, keyboard, gestures, and media passed.")
+        if sys.argv[2:] == ["--nearby"]:
+            asyncio.run(exercise_nearby(executable, directory))
+            print("Nearby Companion pairing, verified input, and shared LAN identity passed.")
+        else:
+            asyncio.run(exercise(executable, directory))
+            print("Companion pairing, reconnect, simultaneous controllers, keyboard, gestures, and media passed.")

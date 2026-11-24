@@ -1,4 +1,6 @@
 use std::cell::{Cell, RefCell};
+use std::io;
+use std::path::PathBuf;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
@@ -15,7 +17,7 @@ use tokio::runtime::Runtime;
 use crate::{
     input,
     mac_accessibility::{refresh_updated_permissions, ApprovalWatch, Permission},
-    mac_bonjour, start_receiver,
+    mac_bonjour, mac_peer, start_receiver,
     update::{self, Updater},
     version_label, ActiveReceiver, Options, VERSION,
 };
@@ -28,6 +30,8 @@ const UPDATE_ACTION: isize = 5;
 const ACCESSIBILITY: isize = 8;
 const LOCAL_NETWORK: isize = 9;
 const CONNECTION: isize = 14;
+const NEARBY: isize = 15;
+const NEARBY_STATUS: isize = 16;
 
 struct State {
     options: Options,
@@ -36,6 +40,10 @@ struct State {
     error: RefCell<Option<String>>,
     accessibility_approval: RefCell<Option<ApprovalWatch>>,
     post_events_requested: Cell<bool>,
+    nearby_enabled: Cell<bool>,
+    nearby_preference: Option<PathBuf>,
+    nearby: RefCell<Option<mac_peer::Nearby>>,
+    nearby_failed: Cell<bool>,
     updater: RefCell<Updater>,
 }
 
@@ -90,6 +98,17 @@ define_class!(
                     discovery,
                     Some(mac_bonjour::Status::LocalNetworkPermission | mac_bonjour::Status::Failed)
                 ));
+            }
+            let nearby_supported = active.as_ref().is_some_and(|receiver| receiver.peer_target.is_some());
+            if let Some(item) = menu.itemWithTag(NEARBY) {
+                item.setHidden(!nearby_supported);
+                item.setState(isize::from(self.ivars().nearby_enabled.get()));
+                item.setToolTip(Some(objc2_foundation::ns_string!("Try connecting a nearby iPhone without joining the same Wi‑Fi network")));
+            }
+            if let Some(item) = menu.itemWithTag(NEARBY_STATUS) {
+                let failed = self.ivars().nearby_failed.get()
+                    || self.ivars().nearby.borrow().as_ref().is_some_and(mac_peer::Nearby::unavailable);
+                item.setHidden(!nearby_supported || !failed);
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
@@ -156,6 +175,28 @@ define_class!(
             open_settings("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork");
         }
 
+        #[unsafe(method(myRemoteToggleNearby:))]
+        fn toggle_nearby(&self, _sender: &NSMenuItem) {
+            let state = self.ivars();
+            let enabled = !state.nearby_enabled.get();
+            if let Some(path) = &state.nearby_preference {
+                let saved = if enabled {
+                    std::fs::write(path, b"enabled\n")
+                } else {
+                    match std::fs::remove_file(path) {
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                        result => result,
+                    }
+                };
+                if let Err(error) = saved {
+                    self.alert("Could not save Nearby iPhone", &error.to_string());
+                    return;
+                }
+            }
+            state.nearby_enabled.set(enabled);
+            self.refresh_nearby();
+        }
+
         #[unsafe(method(myRemoteQuit:))]
         fn quit(&self, _sender: &NSMenuItem) {
             self.stop();
@@ -192,6 +233,15 @@ impl MenuController {
                 .ok()
                 .map(|bundle| ApprovalWatch::start(bundle, &runtime, Permission::current()))
         };
+        let nearby_preference = options
+            .state_dir
+            .clone()
+            .or_else(crate::default_state_dir)
+            .map(|path| path.join("nearby-beta"));
+        let nearby_enabled = options.nearby
+            || nearby_preference
+                .as_ref()
+                .is_some_and(|path| path.is_file());
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
@@ -199,6 +249,10 @@ impl MenuController {
             error: RefCell::new(None),
             accessibility_approval: RefCell::new(approval),
             post_events_requested: Cell::new(false),
+            nearby_enabled: Cell::new(nearby_enabled),
+            nearby_preference,
+            nearby: RefCell::new(None),
+            nearby_failed: Cell::new(false),
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -214,6 +268,32 @@ impl MenuController {
             }
             Err(error) => {
                 state.error.replace(Some(error.to_string()));
+            }
+        }
+        self.refresh_nearby();
+    }
+
+    fn refresh_nearby(&self) {
+        let state = self.ivars();
+        state.nearby.take();
+        state.nearby_failed.set(false);
+        if !state.nearby_enabled.get() {
+            return;
+        }
+        let target = state
+            .active
+            .borrow()
+            .as_ref()
+            .and_then(|receiver| receiver.peer_target.clone());
+        if let Some(target) = target {
+            match mac_peer::Nearby::start(state.runtime.handle(), target) {
+                Ok(nearby) => {
+                    state.nearby.replace(Some(nearby));
+                }
+                Err(error) => {
+                    tracing::warn!("Could not start Nearby iPhone: {error}");
+                    state.nearby_failed.set(true);
+                }
             }
         }
     }
@@ -285,6 +365,7 @@ impl MenuController {
 
     fn stop(&self) {
         let state = self.ivars();
+        state.nearby.take();
         if let Some(active) = state.active.take() {
             state.runtime.block_on(active.stop());
         }
@@ -371,6 +452,13 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.add_item(&menu, "", None, STATUS);
         controller.add_item(&menu, "", None, CONNECTION);
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
+        controller.add_item(
+            &menu,
+            "Nearby iPhone (Beta)",
+            Some(sel!(myRemoteToggleNearby:)),
+            NEARBY,
+        );
+        controller.add_item(&menu, "Nearby iPhone unavailable", None, NEARBY_STATUS);
         controller.add_item(
             &menu,
             "Retry Starting Receiver",

@@ -8,8 +8,8 @@ use mdns_sd::{DaemonEvent, IfKind, ServiceDaemon, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use socket2::{Domain, Protocol, SockRef, Socket, TcpKeepalive, Type};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
-use tokio::net::{tcp::OwnedReadHalf, TcpListener, TcpStream};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::{timeout, timeout_at, Instant};
 use tracing::{debug, warn};
@@ -33,6 +33,62 @@ pub struct DiscoveryRecord {
     pub service_type: String,
     pub port: u16,
     pub txt: Vec<(String, String)>,
+}
+
+#[cfg(target_os = "macos")]
+pub struct PeerTarget {
+    name: Arc<str>,
+    pairing: Arc<PairingState>,
+    mode: TrackpadMode,
+    input: Arc<dyn RemoteInput>,
+}
+
+#[cfg(target_os = "macos")]
+impl PeerTarget {
+    pub fn new(
+        name: String,
+        pairing: Arc<PairingState>,
+        mode: TrackpadMode,
+        input: Arc<dyn RemoteInput>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            pairing,
+            mode,
+            input,
+        }
+    }
+
+    pub fn records(&self) -> Vec<DiscoveryRecord> {
+        discovery_records(&self.name, &self.pairing, [0; 3])
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub async fn serve(&self, service: &str, stream: tokio::io::DuplexStream, port: u16) {
+        match service {
+            "_companion-link._tcp" => {
+                let (reader, writer) = tokio::io::split(stream);
+                if let Err(error) = run_session(
+                    (reader, writer),
+                    self.input.clone(),
+                    self.pairing.clone(),
+                    self.name.clone(),
+                    self.mode,
+                    (port != 0).then_some(port),
+                )
+                .await
+                {
+                    debug!("Nearby Companion connection ended: {error}");
+                }
+            }
+            "_airplay._tcp" => respond_to_discovery(stream, true, &self.pairing).await,
+            "_mediaremotetv._tcp" => respond_to_discovery(stream, false, &self.pairing).await,
+            _ => {}
+        }
+    }
 }
 
 impl Receiver {
@@ -369,33 +425,43 @@ async fn discovery_endpoint(listener: TcpListener, airplay: bool, pairing: Arc<P
     loop {
         tokio::select! {
             Some(_) = clients.join_next(), if !clients.is_empty() => {}
-            Ok((mut stream, _)) = listener.accept(), if clients.len() < MAX_CONNECTIONS => {
-                let counter = if airplay {
-                    &pairing.diagnostics.airplay_probes
-                } else {
-                    &pairing.diagnostics.media_probes
-                };
-                counter.fetch_add(1, Ordering::Relaxed);
+            Ok((stream, _)) = listener.accept(), if clients.len() < MAX_CONNECTIONS => {
+                let pairing = pairing.clone();
                 clients.spawn(async move {
-                    if !airplay {
-                        // Keep the discovery connection open while it is active.
-                        // Desktop input only comes through the Companion listener.
-                        let mut buffer = [0; 1024];
-                        while let Ok(Ok(1..)) = timeout(Duration::from_secs(60), stream.read(&mut buffer)).await {}
-                        return;
-                    }
-                    let _ = timeout(Duration::from_secs(3), async {
-                        let mut buf = [0; 1024];
-                        let count = stream.read(&mut buf).await?;
-                        if count > 0 {
-                            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await?;
-                        }
-                        Ok::<_, io::Error>(())
-                    }).await;
+                    respond_to_discovery(stream, airplay, &pairing).await;
                 });
             }
         }
     }
+}
+
+async fn respond_to_discovery(
+    mut stream: impl AsyncRead + AsyncWrite + Unpin,
+    airplay: bool,
+    pairing: &PairingState,
+) {
+    if !airplay {
+        pairing
+            .diagnostics
+            .media_probes
+            .fetch_add(1, Ordering::Relaxed);
+        // Keep the discovery connection open while it is active.
+        // Desktop input only comes through the Companion listener.
+        let mut buffer = [0; 1024];
+        while let Ok(Ok(1..)) = timeout(Duration::from_secs(60), stream.read(&mut buffer)).await {}
+        return;
+    }
+    pairing
+        .diagnostics
+        .airplay_probes
+        .fetch_add(1, Ordering::Relaxed);
+    let _ = timeout(Duration::from_secs(3), async {
+        let mut buffer = [0; 1024];
+        if stream.read(&mut buffer).await? > 0 {
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK").await?;
+        }
+        Ok::<_, io::Error>(())
+    }).await;
 }
 
 async fn companion_endpoint(
@@ -413,7 +479,11 @@ async fn companion_endpoint(
             Ok((stream, peer)) = listener.accept(), if clients.len() < MAX_CONNECTIONS => {
                 let (name, pairing, input) = (name.clone(), pairing.clone(), input.clone());
                 clients.spawn(async move {
-                    if let Err(error) = run_session(stream, input, pairing, name, mode, advertised_port).await {
+                    let result = match tcp_parts(stream) {
+                        Ok(parts) => run_session(parts, input, pairing, name, mode, advertised_port).await,
+                        Err(error) => Err(error.into()),
+                    };
+                    if let Err(error) = result {
                         debug!("Companion connection from {peer} ended: {error}");
                     }
                 });
@@ -422,14 +492,12 @@ async fn companion_endpoint(
     }
 }
 
-async fn run_session(
+fn tcp_parts(
     stream: TcpStream,
-    input: Arc<dyn RemoteInput>,
-    pairing: Arc<PairingState>,
-    name: Arc<str>,
-    mode: TrackpadMode,
-    advertised_port: Option<u16>,
-) -> Result<()> {
+) -> io::Result<(
+    tokio::net::tcp::OwnedReadHalf,
+    tokio::net::tcp::OwnedWriteHalf,
+)> {
     stream.set_nodelay(true)?;
     // Keep verified sockets usable across idle periods while letting the OS
     // reclaim dead connections when an iPhone changes networks.
@@ -437,7 +505,20 @@ async fn run_session(
         .with_time(Duration::from_secs(10))
         .with_interval(Duration::from_secs(3));
     let _ = SockRef::from(&stream).set_tcp_keepalive(&keepalive);
-    let (reader, writer) = stream.into_split();
+    Ok(stream.into_split())
+}
+
+async fn run_session(
+    (reader, writer): (
+        impl AsyncRead + Unpin,
+        impl AsyncWrite + Send + Sync + Unpin + 'static,
+    ),
+    input: Arc<dyn RemoteInput>,
+    pairing: Arc<PairingState>,
+    name: Arc<str>,
+    mode: TrackpadMode,
+    advertised_port: Option<u16>,
+) -> Result<()> {
     let mut reader = BufReader::with_capacity(16 * 1024, reader);
     let (mut session, replaced) =
         CompanionSession::new(writer, input, pairing, name, mode, advertised_port);
@@ -453,7 +534,7 @@ async fn run_session(
 }
 
 async fn read_session(
-    reader: &mut BufReader<OwnedReadHalf>,
+    reader: &mut BufReader<impl AsyncRead + Unpin>,
     session: &mut CompanionSession,
 ) -> Result<()> {
     let auth_deadline = Instant::now() + PAIRING_WINDOW + Duration::from_secs(15);

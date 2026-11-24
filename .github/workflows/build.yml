@@ -67,13 +67,17 @@ jobs:
           cargo build --locked
           python3 tests/bonjour_smoke.py target/debug/myremote
       - name: Test with an independent Companion client
-        if: runner.os == 'Linux' && runner.arch == 'X64'
+        if: runner.os == 'macOS' || (runner.os == 'Linux' && runner.arch == 'X64')
         shell: bash
         run: |
           cargo build --locked
           python3 -m venv target/interop
           target/interop/bin/python -m pip install pyatv==0.18.0 srptools==1.0.1
-          target/interop/bin/python tests/companion_smoke.py target/debug/myremote
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            target/interop/bin/python tests/companion_smoke.py target/debug/myremote --nearby
+          else
+            target/interop/bin/python tests/companion_smoke.py target/debug/myremote
+          fi
       - name: Build a universal macOS DMG
         if: runner.os == 'macOS'
         run: bash packaging/macos/build-dmg.sh "$VERSION"

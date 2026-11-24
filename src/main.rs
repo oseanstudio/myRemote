@@ -15,6 +15,8 @@ mod mac_accessibility;
 mod mac_bonjour;
 #[cfg(target_os = "macos")]
 mod mac_menu;
+#[cfg(target_os = "macos")]
+mod mac_peer;
 mod tailnet;
 #[cfg(any(windows, target_os = "linux"))]
 mod tray_menu;
@@ -60,6 +62,8 @@ struct Options {
     forget: bool,
     dry_run: bool,
     verbose: bool,
+    #[cfg(target_os = "macos")]
+    nearby: bool,
 }
 
 impl Options {
@@ -92,6 +96,8 @@ impl Options {
             forget: false,
             dry_run: false,
             verbose: false,
+            #[cfg(target_os = "macos")]
+            nearby: false,
         };
         while let Some(arg) = args.next() {
             let arg = arg.to_str().ok_or("option must be valid Unicode")?;
@@ -144,8 +150,12 @@ impl Options {
                 "--forget-phones" => options.forget = true,
                 "--dry-run" => options.dry_run = true,
                 "--verbose" => options.verbose = true,
+                #[cfg(target_os = "macos")]
+                "--nearby" => options.nearby = true,
                 "-h" | "--help" => {
                     println!("{HELP}");
+                    #[cfg(target_os = "macos")]
+                    println!("  --nearby            Enable experimental peer-to-peer Wi-Fi");
                     return Ok(None);
                 }
                 "-V" | "--version" => {
@@ -182,6 +192,14 @@ impl Options {
                 "A Tailscale bridge runs on a local network address and uses pairing on the host"
                     .into(),
             );
+        }
+        #[cfg(target_os = "macos")]
+        if options.nearby
+            && (options.ip.is_some()
+                || options.tailnet_host.is_some()
+                || options.tailnet_bridge.is_some())
+        {
+            return Err("--nearby requires the default network settings".into());
         }
         Ok(Some(options))
     }
@@ -238,6 +256,8 @@ struct ActiveReceiver {
     ip: IpAddr,
     #[cfg(target_os = "macos")]
     bonjour: Option<mac_bonjour::Bonjour>,
+    #[cfg(target_os = "macos")]
+    peer_target: Option<Arc<myremote::PeerTarget>>,
     tailnet: Option<tailnet::Host>,
 }
 
@@ -284,6 +304,8 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
                 ip: ip.into(),
                 #[cfg(target_os = "macos")]
                 bonjour: None,
+                #[cfg(target_os = "macos")]
+                peer_target: None,
                 tailnet: Some(tailnet),
             }),
             Err(error) => {
@@ -298,6 +320,14 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
             .ip
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+        let peer_target = options.ip.is_none().then(|| {
+            Arc::new(myremote::PeerTarget::new(
+                mac_peer::nearby_name(&options.name),
+                state.clone(),
+                options.mode,
+                input.clone(),
+            ))
+        });
         let (receiver, records) =
             Receiver::listen(options.name.clone(), ip, state.clone(), options.mode, input).await?;
         match mac_bonjour::Bonjour::start(&options.name, options.ip, records) {
@@ -306,6 +336,7 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
                 receiver,
                 ip,
                 bonjour: Some(bonjour),
+                peer_target,
                 tailnet: None,
             }),
             Err(error) => {
@@ -343,6 +374,24 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let active = start_receiver(&options).await?;
+    #[cfg(target_os = "macos")]
+    let nearby = if options.nearby {
+        let target = active
+            .peer_target
+            .as_ref()
+            .ok_or("Nearby requires default network settings")?;
+        let nearby = mac_peer::Nearby::start(&tokio::runtime::Handle::current(), target.clone())?;
+        if options.verbose {
+            let ports = nearby.wait_for_ports().await?;
+            println!(
+                "Nearby ports   discovery {}   companion {}   AirPlay discovery {}",
+                ports[0], ports[1], ports[2]
+            );
+        }
+        Some(nearby)
+    } else {
+        None
+    };
     println!("{} is listening on {}.", options.name, active.ip);
     if options.verbose {
         println!(
@@ -378,6 +427,8 @@ async fn run(options: Options) -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     };
+    #[cfg(target_os = "macos")]
+    drop(nearby);
     active.stop().await;
     result?;
     Ok(())

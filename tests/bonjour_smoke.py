@@ -41,16 +41,18 @@ async def smoke(binary, directory):
     name = f"myRemote-Bonjour-{uuid4().hex[:8]}"
     server = await asyncio.create_subprocess_exec(
         str(binary), "--name", name, "--dry-run", "--verbose", "--state-dir", directory,
+        "--nearby",
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     try:
-        ports = await asyncio.wait_for(
-            find(server, r"discovery (\d+)\s+companion (\d+)\s+AirPlay discovery (\d+)"), 10,
-        )
-        for service, port in zip(
-            ["_mediaremotetv._tcp", "_companion-link._tcp", "_airplay._tcp"], ports.groups()
-        ):
-            await lookup(name, service, int(port))
+        endpoints = r".*discovery (\d+)\s+companion (\d+)\s+AirPlay discovery (\d+)"
+        nearby = await asyncio.wait_for(find(server, r"^Nearby ports" + endpoints), 12)
+        ports = await asyncio.wait_for(find(server, r"^TCP ports" + endpoints), 10)
+        for instance, match in [(name, ports), (name + " · Nearby", nearby)]:
+            for service, port in zip(
+                ["_mediaremotetv._tcp", "_companion-link._tcp", "_airplay._tcp"], match.groups()
+            ):
+                await lookup(instance, service, int(port))
         for address in ["127.0.0.1", "::1"]:
             _, writer = await asyncio.open_connection(address, int(ports[2]))
             writer.close()
@@ -62,4 +64,4 @@ async def smoke(binary, directory):
 if __name__ == "__main__":
     with TemporaryDirectory(prefix="myremote-bonjour-") as directory:
         asyncio.run(smoke(Path(sys.argv[1]).resolve(strict=True), directory))
-    print("Apple Bonjour resolved all three advertised services. IPv4 and IPv6 accepted connections.")
+    print("Apple Bonjour resolved all LAN and Nearby services. IPv4 and IPv6 accepted LAN connections.")

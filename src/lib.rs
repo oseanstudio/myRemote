@@ -17,6 +17,8 @@ mod tlv;
 pub use delegate::{PlaybackAction, PlaybackState, RemoteInput, TrackpadMode, VideoSource};
 pub use error::{Error, Result};
 pub use pairing::PairingState;
+#[cfg(target_os = "macos")]
+pub use server::PeerTarget;
 pub use server::{detect_local_ip, DiscoveryRecord, Receiver, TAILNET_PORTS};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

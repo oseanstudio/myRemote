@@ -240,14 +240,7 @@ fn register(
     status: &AtomicI32,
 ) -> Result<Registration, i32> {
     let service_type = CString::new(record.service_type.as_str()).map_err(|_| -65540)?;
-    let mut txt = Vec::new();
-    for (key, value) in &record.txt {
-        let len = key.len() + 1 + value.len();
-        txt.push(u8::try_from(len).map_err(|_| -65540)?);
-        txt.extend_from_slice(key.as_bytes());
-        txt.push(b'=');
-        txt.extend_from_slice(value.as_bytes());
-    }
+    let txt = txt_record(&record.txt).map_err(|_| -65540)?;
     let mut reference = null_mut();
     // Local domain, system hostname, network byte order for the service port.
     // status points into the owned Arc and outlives every DNSServiceRef.
@@ -272,6 +265,20 @@ fn register(
     } else {
         Err(code)
     }
+}
+
+pub fn txt_record(entries: &[(String, String)]) -> io::Result<Vec<u8>> {
+    let mut txt = Vec::new();
+    for (key, value) in entries {
+        let len = u8::try_from(key.len() + 1 + value.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "Bonjour TXT entry is too long")
+        })?;
+        txt.push(len);
+        txt.extend_from_slice(key.as_bytes());
+        txt.push(b'=');
+        txt.extend_from_slice(value.as_bytes());
+    }
+    Ok(txt)
 }
 
 unsafe extern "C" fn registered(

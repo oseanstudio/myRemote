@@ -8,8 +8,7 @@ use std::time::Duration;
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-use tokio::net::tcp::OwnedWriteHalf;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio::time::Instant;
@@ -229,7 +228,7 @@ enum KeyboardEditScope {
 
 /// One Companion connection's state machine.
 pub(crate) struct CompanionSession {
-    writer: OwnedWriteHalf,
+    writer: Box<dyn AsyncWrite + Send + Sync + Unpin>,
     input: Arc<dyn RemoteInput>,
     pairing: Arc<PairingState>,
     device_name: Arc<str>,
@@ -269,7 +268,7 @@ pub(crate) struct CompanionSession {
 
 impl CompanionSession {
     pub(crate) fn new(
-        writer: OwnedWriteHalf,
+        writer: impl AsyncWrite + Send + Sync + Unpin + 'static,
         input: Arc<dyn RemoteInput>,
         pairing: Arc<PairingState>,
         device_name: Arc<str>,
@@ -283,7 +282,7 @@ impl CompanionSession {
             + 1;
         let (close_signal, replaced) = oneshot::channel();
         let session = Self {
-            writer,
+            writer: Box::new(writer),
             input,
             signing_key: SigningKey::from_bytes(&pairing.private_key),
             pairing,
