@@ -192,6 +192,12 @@ impl RemoteInput for Desktop {
         platform::Desktop::type_text(field, backspaces, deletes, text)
     }
 
+    #[cfg(target_os = "macos")]
+    fn accept_suggestion(&self, field: u64, typed: &str, word: &str, following: &str) -> bool {
+        let _keyboard = self.keyboard.lock().unwrap();
+        platform::Desktop::accept_suggestion(field, typed, word, following)
+    }
+
     fn volume(&self) -> Option<f64> {
         #[cfg(target_os = "macos")]
         return platform::Desktop::volume();

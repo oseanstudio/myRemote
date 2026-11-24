@@ -96,6 +96,30 @@ COMMIT_WITH_SPACE = base64.b64decode(
 )
 
 
+# Apple RTI output for selecting a candidate without an insertion string.
+ACCEPTED_WORD = base64.b64decode(
+    "YnBsaXN0MDDUAQIDBAUGBwpYJHZlcnNpb25ZJGFyY2hpdmVyVCR0b3BYJG9iamVjdHMSAAGGoF8QEFJU"
+    "SUtleWVkQXJjaGl2ZXLRCAledGV4dE9wZXJhdGlvbnOAAa0LDBUZN0IvQ0RFRk5SVSRudWxs1A0ODxAR"
+    "ERMUXxAXaXNBdXRvRmlsbFRleHRPcGVyYXRpb25fEBxpc0V4cGxpY2l0QXV0b0ZpbGxJbnZvY2F0aW9u"
+    "XmtleWJvYXJkT3V0cHV0ViRjbGFzcwgIgAKADNIQFhcYXxARYWNjZXB0ZWRDYW5kaWRhdGWAC4AD3xAV"
+    "GhscHR4fECAhIiMkJSYnKCkqKywtLi8wMDIzNDU2NzczETMRMzMREUAzXxAWc3VwcGxlbWVudGFsSXRl"
+    "bVByZWZpeF8QEWNhbmRpZGF0ZVByb3BlcnR5XxATYXBwbGljYXRpb25CdW5kbGVJZF5hcHBsaWNhdGlv"
+    "bktleVljYW5kaWRhdGVWc2xvdElEXxATY2FuZGlkYXRlQ29uZmlkZW5jZVVpbnB1dFpzb3VyY2VNYXNr"
+    "XmN1cnNvck1vdmVtZW50XmN1c3RvbUluZm9UeXBlXxAcaXNTZWN1cmVDYW5kaWRhdGVEb3VibGVMaW5l"
+    "c18QEWxlYXJuaW5nRmxhZ3NNYXNrXxAUcmVzcG9uc2VLaXRDYW5kaWRhdGVcdHlwaW5nRW5naW5lXxAT"
+    "c2VjdXJlQ2FuZGlkYXRlSGFzaF8QEmV4dGVuc2lvbkNhbmRpZGF0ZV8QJ2lzT25lVGltZUNvZGVUaGF0"
+    "UmVxdWlyZXNBdXRoZW50aWNhdGlvbl8QFHNlY3VyZUNhbmRpZGF0ZVdpZHRoXxAPaW5kZXhGb3JNZXRy"
+    "aWNzgAYQAIAIgAiAB4AEgAoQA4AJEACABAiABAiABIAECAiABYAEIwAAAAAAAAAAVVN3aXBlUFNzd2nS"
+    "R0hJSlokY2xhc3NuYW1lWCRjbGFzc2VzXxAZVElLZXlib2FyZENhbmRpZGF0ZVNpbmdsZaNLTE1fEBlU"
+    "SUtleWJvYXJkQ2FuZGlkYXRlU2luZ2xlXxATVElLZXlib2FyZENhbmRpZGF0ZVhOU09iamVjdNJHSE9Q"
+    "XxAQVElLZXlib2FyZE91dHB1dKJRTV8QEFRJS2V5Ym9hcmRPdXRwdXTSR0hTVF8QEVJUSVRleHRPcGVy"
+    "YXRpb25zolVNXxARUlRJVGV4dE9wZXJhdGlvbnMACAARABoAJAApADIANwBKAE0AXABeAGwAcgB7AJUA"
+    "tADDAMoAywDMAM4A0ADVAOkA6wDtARoBMwFHAV0BbAF2AX0BkwGZAaQBswHCAeEB9QIMAhkCLwJEAm4C"
+    "hQKXApkCmwKdAp8CoQKjAqUCpwKpAqsCrQKuArACsQKzArUCtgK3ArkCuwLEAsoCywLPAtQC3wLoAwQD"
+    "CAMkAzoDQwNIA1sDXgNxA3YDigONAAAAAAAAAgEAAAAAAAAAVgAAAAAAAAAAAAAAAAAAA6E="
+)
+
+
 @contextmanager
 def receiver(binary, state, *options):
     process = subprocess.Popen(
@@ -320,6 +344,31 @@ async def exercise_two_phones(port, credentials, second_credentials, expect):
         keyboard_edit(first, UNMARK_WORD)
         await command(first, "FetchAttentionState", {})
         assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 5 characters)"
+
+        keyboard_edit(first, ACCEPTED_WORD)
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 5 characters)"
+
+        # Selecting a prediction can carry the word in acceptedCandidate
+        # and only a space in the explicit insertion.
+        prediction = plistlib.loads(ACCEPTED_WORD)
+        objects = prediction["$objects"]
+        operation = objects[prediction["$top"]["textOperations"].data]
+        output = objects[operation["keyboardOutput"].data]
+        candidate = objects[output["acceptedCandidate"].data]
+        objects[candidate["input"].data] = "hel"
+        objects[candidate["candidate"].data] = "hello"
+        output["insertionText"] = plistlib.UID(len(objects))
+        objects.append(" ")
+        keyboard_edit(first, plistlib.dumps(prediction, fmt=plistlib.FMT_BINARY))
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
+
+        # An explicit insertion already carries the edit for this candidate.
+        objects[output["insertionText"].data] = "hello "
+        keyboard_edit(first, plistlib.dumps(prediction, fmt=plistlib.FMT_BINARY))
+        await command(first, "FetchAttentionState", {})
+        assert expect(r"^Received (.*)$")[1] == "keyboard edit (0 backspaces, 0 deletes, 6 characters)"
 
         keyboard_edit(first, b"not a plist")
         keyboard_edit(first, get_rti_input_text_payload(second_id, "wrong session"))

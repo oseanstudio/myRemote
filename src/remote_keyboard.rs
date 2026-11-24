@@ -20,7 +20,13 @@ pub(crate) struct TextEdit {
     insertion: String,
     commit: Option<String>,
     pub marked: Option<String>,
+    pub suggestion: Option<AcceptedSuggestion>,
     unmark: bool,
+}
+
+pub(crate) struct AcceptedSuggestion {
+    pub typed: String,
+    pub word: String,
 }
 
 pub(crate) struct KeyboardField {
@@ -32,6 +38,7 @@ pub(crate) struct KeyboardInput {
     pub backspaces: u8,
     pub deletes: u8,
     pub text: String,
+    pub suggestion: Option<AcceptedSuggestion>,
 }
 
 impl KeyboardField {
@@ -43,6 +50,15 @@ impl KeyboardField {
     }
 
     pub fn apply(&mut self, edit: TextEdit) -> Option<KeyboardInput> {
+        if let Some(suggestion) = edit.suggestion {
+            self.marked = edit.marked.unwrap_or_default();
+            return Some(KeyboardInput {
+                backspaces: 0,
+                deletes: 0,
+                text: edit.insertion,
+                suggestion: Some(suggestion),
+            });
+        }
         let mut backspaces = edit.backspaces;
         let mut text = edit.insertion;
         // Composed text lives on the phone until committed. A delete inside
@@ -77,6 +93,7 @@ impl KeyboardField {
             backspaces,
             deletes: edit.deletes,
             text,
+            suggestion: None,
         })
     }
 }
@@ -226,6 +243,12 @@ impl KeyboardSession {
             .unwrap_or("");
         let commit =
             property(objects, output, "textToCommit").and_then(|value| read_string(objects, value));
+        // Some accepted predictions carry the word in acceptedCandidate and
+        // only the separator (or nothing) in insertionText. An explicit text
+        // edit takes precedence when the phone sends one.
+        let suggestion = (commit.is_none() && insertion.chars().all(char::is_whitespace))
+            .then(|| read_suggestion(objects, output))
+            .flatten();
         let marked = [
             ("styledIntermediateText", "styledDisplayString"),
             ("intermediateText", "displayString"),
@@ -242,6 +265,7 @@ impl KeyboardSession {
             && insertion.is_empty()
             && commit.is_none()
             && marked.is_none()
+            && suggestion.is_none()
             && !unmark
         {
             match property(objects, operations, "editingActionSelector").and_then(Value::as_string)
@@ -255,6 +279,9 @@ impl KeyboardSession {
         }
         if insertion.len() + commit.map_or(0, str::len) > 8 * 1024
             || marked.is_some_and(|text| text.len() > 8 * 1024)
+            || suggestion
+                .as_ref()
+                .is_some_and(|candidate| candidate.word.len() + insertion.len() > 8 * 1024)
         {
             return Err(Output);
         }
@@ -265,9 +292,26 @@ impl KeyboardSession {
             insertion: insertion.to_owned(),
             commit: commit.map(str::to_owned),
             marked: marked.map(str::to_owned),
+            suggestion,
             unmark,
         })
     }
+}
+
+fn read_suggestion(objects: &[Value], output: &Dictionary) -> Option<AcceptedSuggestion> {
+    let candidate = property(objects, output, "acceptedCandidate")?.as_dictionary()?;
+    let word = read_string(objects, property(objects, candidate, "candidate")?)?;
+    if word.is_empty() || word.len() > 8 * 1024 || word.chars().any(char::is_control) {
+        return None;
+    }
+    let typed = property(objects, candidate, "input")
+        .and_then(|value| read_string(objects, value))
+        .filter(|text| text.len() <= 1024 && !text.chars().any(char::is_control))
+        .unwrap_or("");
+    Some(AcceptedSuggestion {
+        typed: typed.to_owned(),
+        word: word.to_owned(),
+    })
 }
 
 fn class_name<'a>(objects: &'a [Value], dict: &'a Dictionary) -> Option<&'a str> {

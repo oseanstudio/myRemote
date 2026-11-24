@@ -80,12 +80,12 @@ The receiver uses Bonjour for discovery. On macOS, it advertises through the sys
 
 The menu app opens a two-minute pairing window when a phone requests a code. The code is shown only on the target computer, and pairing closes once the phone is enrolled. The server verifies each paired controller and encrypts the input session. To revoke access, stop myRemote and run `myremote --forget-phones` with the same `--state-dir` override, if used. If the iPhone still shows outdated credentials, remove the old device from the picker if available, reopen Control Center, and pair again.
 
-## Tailscale
+## Tailscale command-line setup
 
 If the iPhone and computer share a LAN, use normal Bonjour discovery even while Tailscale is connected. For different networks, run a myRemote bridge on a computer that shares the iPhone's Wi‑Fi and can reach the target over Tailscale. Tailscale carries the connection between the bridge and the target. The Apple TV Remote still discovers the bridge on local Wi‑Fi.
 
-1. Open and connect Tailscale on both computers. On the computer you want to control, enable **Tailscale → Share This Computer** in myRemote.
-2. On a computer connected to the iPhone’s Wi-Fi network, enable **Tailscale → Bridge Remote Computers to This Wi-Fi** in myRemote. The bridge finds computers sharing myRemote automatically. Both settings are remembered.
+1. Connect both computers to Tailscale. Quit any existing myRemote instance on the computer you want to control, then run `myremote --tailscale-host TARGET_IP` using that computer’s Tailscale IPv4 address.
+2. On a computer connected to the iPhone’s Wi-Fi network, run `myremote --tailscale-bridge TARGET_IP` with the same target address.
 3. On the iPhone, open Apple TV Remote and pick the target’s name. If the phone needs to pair, enter the code shown on the target computer. You can pair on the target’s local network before traveling.
 
 Allow the bridge to reach the target on TCP ports 49151–49154 in your tailnet policy. Pairing and encryption still terminate at the target. The bridge forwards encrypted input without handling the pairing keys.

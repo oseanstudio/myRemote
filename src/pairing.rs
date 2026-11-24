@@ -74,6 +74,7 @@ pub(crate) struct Diagnostics {
     pub keyboard_matched: AtomicU32,
     pub keyboard_posted: AtomicU32,
     pub keyboard_composition_updates: AtomicU32,
+    pub keyboard_suggestions: AtomicU32,
     pub keyboard_session_edits: AtomicU32,
     pub keyboard_scope_rejections: AtomicU32,
     pub keyboard_failures: [AtomicU32; KeyboardEditError::NoEdit as usize + 1],
@@ -156,7 +157,7 @@ impl PairingState {
             .map_or_else(|| "—".to_owned(), |version| version.to_string());
         let failed = |error: KeyboardEditError| read(&counters.keyboard_failures[error as usize]);
         format!(
-            "Companion sockets / verified: {} / {}\nStale sockets replaced / warm reopens: {} / {}\nLast socket → verified: {}\nLast verified → first Remote ready: {}\nVerify rejects / timeouts / protocol errors: {} / {} / {}\nMedia Remote / AirPlay probes: {} / {}\nKeyboard requests / fields offered: {} / {}\nKeyboard messages / decoded / matched / posted: {} / {} / {} / {}\nKeyboard composition updates: {}\nKeyboard envelope / archive / operation errors: {} / {} / {}\nKeyboard target / output errors / no edit: {} / {} / {}\nKeyboard session-scoped / scope rejected: {} / {}\nLast keyboard version: {keyboard_version}\nLast player advertised: {player}\nNative skip commands / Back presses: {} / {}\nDouble-click events sent: {}",
+            "Companion sockets / verified: {} / {}\nStale sockets replaced / warm reopens: {} / {}\nLast socket → verified: {}\nLast verified → first Remote ready: {}\nVerify rejects / timeouts / protocol errors: {} / {} / {}\nMedia Remote / AirPlay probes: {} / {}\nKeyboard requests / fields offered: {} / {}\nKeyboard messages / decoded / matched / posted: {} / {} / {} / {}\nKeyboard composition updates / suggestions: {} / {}\nKeyboard envelope / archive / operation errors: {} / {} / {}\nKeyboard target / output errors / no edit: {} / {} / {}\nKeyboard session-scoped / scope rejected: {} / {}\nLast keyboard version: {keyboard_version}\nLast player advertised: {player}\nNative skip commands / Back presses: {} / {}\nDouble-click events sent: {}",
             counters.connections.load(Ordering::Relaxed),
             read(&counters.verified_connections),
             read(&counters.replaced_connections),
@@ -175,6 +176,7 @@ impl PairingState {
             read(&counters.keyboard_matched),
             read(&counters.keyboard_posted),
             read(&counters.keyboard_composition_updates),
+            read(&counters.keyboard_suggestions),
             failed(KeyboardEditError::Envelope),
             failed(KeyboardEditError::Archive),
             failed(KeyboardEditError::Operation),

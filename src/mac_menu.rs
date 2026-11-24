@@ -15,7 +15,6 @@ use crate::{
     input,
     mac_accessibility::{refresh_updated_permissions, ApprovalWatch, RELAUNCHED_ENV},
     mac_bonjour, start_receiver,
-    tailnet_menu::MenuNetwork,
     update::{self, Updater},
     ActiveReceiver, Options, VERSION,
 };
@@ -29,10 +28,6 @@ const AUTO_CHECK: isize = 6;
 const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
 const LOCAL_NETWORK: isize = 9;
-const TAILSCALE: isize = 10;
-const TAILSCALE_STATUS: isize = 11;
-const TAILSCALE_SHARE: isize = 12;
-const TAILSCALE_BRIDGE: isize = 13;
 const CONNECTION: isize = 14;
 const MEDIA_CONTROLS: isize = 15;
 const DIAGNOSTICS: isize = 16;
@@ -43,7 +38,6 @@ struct State {
     active: RefCell<Option<ActiveReceiver>>,
     error: RefCell<Option<String>>,
     accessibility_approval: RefCell<Option<ApprovalWatch>>,
-    network: RefCell<MenuNetwork>,
     updater: RefCell<Updater>,
 }
 
@@ -68,7 +62,7 @@ define_class!(
                 Some(mac_bonjour::Status::Ready) => "Receiver ready on the local network",
                 Some(mac_bonjour::Status::LocalNetworkPermission) => "Local Network permission needed",
                 Some(mac_bonjour::Status::Failed) => "Bonjour discovery could not start",
-                None if active.is_some() => "Receiver ready for a Tailscale bridge",
+                None if active.is_some() => "Receiver listening",
                 None if self.ivars().error.borrow().is_some() => "Receiver could not start",
                 None => "Receiver stopped",
             };
@@ -97,23 +91,11 @@ define_class!(
             if let Some(item) = menu.itemWithTag(ACCESSIBILITY) {
                 item.setHidden(!self.needs_accessibility());
             }
-            let network = self.ivars().network.borrow();
             if let Some(item) = menu.itemWithTag(LOCAL_NETWORK) {
                 item.setHidden(!matches!(
                     discovery,
                     Some(mac_bonjour::Status::LocalNetworkPermission | mac_bonjour::Status::Failed)
-                ) && (discovery.is_some() || !network.bridging()));
-            }
-            let submenu = menu.itemWithTag(TAILSCALE).and_then(|item| item.submenu());
-            let tailscale_menu = submenu.as_deref().unwrap_or(menu);
-            if let Some(item) = tailscale_menu.itemWithTag(TAILSCALE_STATUS) {
-                item.setTitle(&NSString::from_str(&network.status()));
-            }
-            if let Some(item) = tailscale_menu.itemWithTag(TAILSCALE_SHARE) {
-                item.setState(isize::from(network.sharing()));
-            }
-            if let Some(item) = tailscale_menu.itemWithTag(TAILSCALE_BRIDGE) {
-                item.setState(isize::from(network.bridging()));
+                ));
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_STATUS) {
@@ -185,20 +167,6 @@ define_class!(
             open_settings("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork");
         }
 
-        #[unsafe(method(myRemoteTailscaleShare:))]
-        fn tailscale_share(&self, _sender: &NSMenuItem) {
-            let state = self.ivars();
-            state.network.borrow_mut().toggle_share(
-                &state.runtime, &state.options, state.active.borrow().as_ref(),
-            );
-        }
-
-        #[unsafe(method(myRemoteTailscaleBridge:))]
-        fn tailscale_bridge(&self, _sender: &NSMenuItem) {
-            let state = self.ivars();
-            state.network.borrow_mut().toggle_bridge(&state.runtime, &state.options);
-        }
-
         #[unsafe(method(myRemoteQuit:))]
         fn quit(&self, _sender: &NSMenuItem) {
             self.stop();
@@ -241,14 +209,12 @@ define_class!(
 impl MenuController {
     fn new(mtm: MainThreadMarker, options: Options, runtime: Runtime) -> Retained<Self> {
         let updater = RefCell::new(Updater::new(&options));
-        let network = RefCell::new(MenuNetwork::new(&options));
         let this = Self::alloc(mtm).set_ivars(State {
             options,
             runtime,
             active: RefCell::new(None),
             error: RefCell::new(None),
             accessibility_approval: RefCell::new(None),
-            network,
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -259,11 +225,6 @@ impl MenuController {
         let state = self.ivars();
         match state.runtime.block_on(start_receiver(&state.options)) {
             Ok(receiver) => {
-                state.network.borrow_mut().sync_receiver(
-                    &state.runtime,
-                    &state.options,
-                    Some(&receiver),
-                );
                 state.active.replace(Some(receiver));
                 state.error.replace(None);
             }
@@ -319,10 +280,6 @@ impl MenuController {
 
     fn stop(&self) {
         let state = self.ivars();
-        state
-            .network
-            .borrow_mut()
-            .sync_receiver(&state.runtime, &state.options, None);
         if let Some(active) = state.active.take() {
             state.runtime.block_on(active.stop());
         }
@@ -431,28 +388,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             LOCAL_NETWORK,
         );
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        controller.add_item(&menu, "Tailscale", None, TAILSCALE);
-        if let Some(item) = menu.itemWithTag(TAILSCALE) {
-            let submenu = NSMenu::new(mtm);
-            submenu.setAutoenablesItems(false);
-            submenu.setDelegate(Some(ProtocolObject::from_ref(&*controller)));
-            controller.add_item(&submenu, "Tailscale is off", None, TAILSCALE_STATUS);
-            controller.add_item(
-                &submenu,
-                "Share This Computer",
-                Some(sel!(myRemoteTailscaleShare:)),
-                TAILSCALE_SHARE,
-            );
-            controller.add_item(
-                &submenu,
-                "Bridge Remote Computers to This Wi-Fi",
-                Some(sel!(myRemoteTailscaleBridge:)),
-                TAILSCALE_BRIDGE,
-            );
-            item.setSubmenu(Some(&submenu));
-            item.setEnabled(true);
-        }
-        menu.addItem(&NSMenuItem::separatorItem(mtm));
         controller.add_item(&menu, "Updates", None, UPDATE_STATUS);
         controller.add_item(
             &menu,
@@ -493,13 +428,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
         item.setMenu(Some(&menu));
         controller.start();
-        {
-            let state = controller.ivars();
-            state
-                .network
-                .borrow_mut()
-                .start_bridge(&state.runtime, &state.options);
-        }
         if controller.ivars().options.pair {
             controller.show_pairing();
         }

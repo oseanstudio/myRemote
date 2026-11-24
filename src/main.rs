@@ -18,7 +18,6 @@ mod mac_bonjour;
 #[cfg(target_os = "macos")]
 mod mac_menu;
 mod tailnet;
-mod tailnet_menu;
 #[cfg(any(windows, target_os = "linux"))]
 mod tray_menu;
 mod update;
@@ -272,7 +271,6 @@ fn show_pairing(state: &PairingState) {
 
 struct ActiveReceiver {
     state: Arc<PairingState>,
-    input: Arc<dyn RemoteInput>,
     receiver: Receiver,
     ip: IpAddr,
     #[cfg(target_os = "macos")]
@@ -313,14 +311,9 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
         state.enable_pairing_on_request();
     }
     if let Some(ip) = options.tailnet_host {
-        let (receiver, records) = Receiver::listen_tailnet(
-            options.name.clone(),
-            ip,
-            state.clone(),
-            options.mode,
-            input.clone(),
-        )
-        .await?;
+        let (receiver, records) =
+            Receiver::listen_tailnet(options.name.clone(), ip, state.clone(), options.mode, input)
+                .await?;
         let catalog = tailnet::Catalog {
             name: options.name.clone(),
             records,
@@ -328,7 +321,6 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
         return match tailnet::Host::start(ip, catalog).await {
             Ok(tailnet) => Ok(ActiveReceiver {
                 state,
-                input,
                 receiver,
                 ip: ip.into(),
                 #[cfg(target_os = "macos")]
@@ -347,18 +339,11 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
             .ip
             .map(IpAddr::V4)
             .unwrap_or(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
-        let (receiver, records) = Receiver::listen(
-            options.name.clone(),
-            ip,
-            state.clone(),
-            options.mode,
-            input.clone(),
-        )
-        .await?;
+        let (receiver, records) =
+            Receiver::listen(options.name.clone(), ip, state.clone(), options.mode, input).await?;
         match mac_bonjour::Bonjour::start(&options.name, options.ip, records) {
             Ok(bonjour) => Ok(ActiveReceiver {
                 state,
-                input,
                 receiver,
                 ip,
                 bonjour: Some(bonjour),
@@ -376,17 +361,10 @@ async fn start_receiver(options: &Options) -> Result<ActiveReceiver, Box<dyn std
             Some(ip) => ip,
             None => detect_local_ip()?,
         };
-        let receiver = Receiver::start(
-            options.name.clone(),
-            ip,
-            state.clone(),
-            options.mode,
-            input.clone(),
-        )
-        .await?;
+        let receiver =
+            Receiver::start(options.name.clone(), ip, state.clone(), options.mode, input).await?;
         Ok(ActiveReceiver {
             state,
-            input,
             receiver,
             ip: ip.into(),
             tailnet: None,
@@ -463,8 +441,6 @@ async fn run_bridge(options: &Options, remote: Ipv4Addr) -> tailnet::Result<()> 
 struct Bridge {
     #[cfg(target_os = "macos")]
     bonjour: mac_bonjour::Bonjour,
-    #[cfg(not(target_os = "macos"))]
-    lan_ip: Ipv4Addr,
     receiver: Receiver,
     port: u16,
 }
@@ -515,8 +491,6 @@ impl Bridge {
         Ok(Self {
             #[cfg(target_os = "macos")]
             bonjour,
-            #[cfg(not(target_os = "macos"))]
-            lan_ip: local_ip,
             receiver,
             port,
         })

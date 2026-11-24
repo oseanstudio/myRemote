@@ -17,6 +17,15 @@ struct Point {
 }
 
 #[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct TextRange {
+    location: isize,
+    length: isize,
+}
+
+const AX_VALUE_CF_RANGE: u32 = 4;
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct DisplayBounds {
     origin: Point,
@@ -51,6 +60,15 @@ unsafe extern "C" {
         attribute: *const c_void,
         value: *mut *const c_void,
     ) -> i32;
+    fn AXUIElementCopyParameterizedAttributeValue(
+        element: *const c_void,
+        attribute: *const c_void,
+        parameter: *const c_void,
+        value: *mut *const c_void,
+    ) -> i32;
+    fn AXValueGetTypeID() -> usize;
+    fn AXValueCreate(kind: u32, value: *const c_void) -> *const c_void;
+    fn AXValueGetValue(value: *const c_void, kind: u32, result: *mut c_void) -> u8;
     fn AXUIElementIsAttributeSettable(
         element: *const c_void,
         attribute: *const c_void,
@@ -77,7 +95,15 @@ unsafe extern "C" {
         string: *const c_char,
         encoding: u32,
     ) -> *const c_void;
+    fn CFStringCreateWithBytes(
+        allocator: *const c_void,
+        bytes: *const u8,
+        length: isize,
+        encoding: u32,
+        external: u8,
+    ) -> *const c_void;
     fn CFEqual(first: *const c_void, second: *const c_void) -> bool;
+    fn CFGetTypeID(object: *const c_void) -> usize;
     fn CFHash(object: *const c_void) -> usize;
     fn CFRelease(object: *const c_void);
 }
@@ -149,7 +175,65 @@ impl Drop for OwnedCf {
     }
 }
 
-fn focused_text_field() -> Option<u64> {
+struct FocusedField {
+    id: u64,
+    element: OwnedCf,
+    secure: bool,
+}
+
+impl FocusedField {
+    fn caret(&self) -> Option<isize> {
+        if self.secure {
+            return None;
+        }
+        let value = self.element.attribute(c"AXSelectedTextRange").ok()?;
+        let mut range = TextRange::default();
+        let valid = unsafe {
+            CFGetTypeID(value.0) == AXValueGetTypeID()
+                && AXValueGetValue(
+                    value.0,
+                    AX_VALUE_CF_RANGE,
+                    (&mut range as *mut TextRange).cast(),
+                ) != 0
+        };
+        (valid && range.length == 0 && range.location >= 0).then_some(range.location)
+    }
+
+    fn ends_with(&self, caret: isize, text: &str) -> Option<bool> {
+        const UTF8: u32 = 0x0800_0100;
+        let length = text.encode_utf16().count() as isize;
+        if length == 0 || caret < length {
+            return Some(false);
+        }
+        let range = TextRange {
+            location: caret - length,
+            length,
+        };
+        let argument = OwnedCf::new(unsafe {
+            AXValueCreate(AX_VALUE_CF_RANGE, (&range as *const TextRange).cast())
+        })?;
+        let attribute = OwnedCf::string(c"AXStringForRange")?;
+        let mut result = null();
+        let status = unsafe {
+            AXUIElementCopyParameterizedAttributeValue(
+                self.element.0,
+                attribute.0,
+                argument.0,
+                &mut result,
+            )
+        };
+        let actual = OwnedCf::new(result)?;
+        if status != 0 {
+            return None;
+        }
+        let expected = OwnedCf::new(unsafe {
+            CFStringCreateWithBytes(null(), text.as_ptr(), text.len() as isize, UTF8, 0)
+        })?;
+        Some(unsafe { CFEqual(actual.0, expected.0) })
+    }
+}
+
+fn focused_field() -> Option<FocusedField> {
     const AX_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
     const AX_NO_VALUE: i32 = -25212;
 
@@ -188,7 +272,32 @@ fn focused_text_field() -> Option<u64> {
     pid.hash(&mut id);
     unsafe { CFHash(field.0) }.hash(&mut id);
     secure.hash(&mut id);
-    Some(id.finish())
+    Some(FocusedField {
+        id: id.finish(),
+        element: field,
+        secure,
+    })
+}
+
+fn suggestion_keys<'a>(
+    typed: &str,
+    word: &'a str,
+    typed_matches: bool,
+    word_matches: bool,
+) -> (u8, &'a str) {
+    if word_matches {
+        return (0, "");
+    }
+    if typed_matches && !typed.is_empty() {
+        if let Some(suffix) = word.strip_prefix(typed) {
+            return (0, suffix);
+        }
+        let count = typed.graphemes(true).take(65).count();
+        if count <= 64 {
+            return (count as u8, word);
+        }
+    }
+    (0, word)
 }
 
 pub(super) fn post_key(key: u16, flags: u64, text: &[u16]) -> bool {
@@ -271,13 +380,38 @@ impl Desktop {
     }
 
     pub fn focused_text_field() -> Option<u64> {
-        focused_text_field()
+        focused_field().map(|field| field.id)
     }
 
     pub fn type_text(field: u64, backspaces: u8, deletes: u8, text: &str) -> bool {
-        if focused_text_field() != Some(field) {
+        if Self::focused_text_field() != Some(field) {
             return false;
         }
+        Self::post_text(backspaces, deletes, text)
+    }
+
+    pub fn accept_suggestion(field: u64, typed: &str, word: &str, following: &str) -> bool {
+        let Some(focus) = focused_field().filter(|focus| focus.id == field) else {
+            return false;
+        };
+        let caret = focus.caret();
+        let word_matches = caret.and_then(|position| focus.ends_with(position, word)) == Some(true);
+        let typed_matches = !word_matches
+            && caret.and_then(|position| focus.ends_with(position, typed)) == Some(true);
+        let (backspaces, insertion) = suggestion_keys(typed, word, typed_matches, word_matches);
+        if insertion.is_empty() && following.is_empty() {
+            return false;
+        }
+        // Only erase a prefix we observed immediately before the caret.
+        if Self::focused_text_field() != Some(field)
+            || ((typed_matches || word_matches) && focus.caret() != caret)
+        {
+            return false;
+        }
+        Self::post_text(backspaces, 0, &format!("{insertion}{following}"))
+    }
+
+    fn post_text(backspaces: u8, deletes: u8, text: &str) -> bool {
         let mut posted = true;
         for _ in 0..backspaces {
             posted &= post_key(51, 0, &[]);
@@ -588,7 +722,15 @@ fn media_key(key: isize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{desktop_destination, post_text_graphemes, DisplayBounds, Point};
+    use super::{desktop_destination, post_text_graphemes, suggestion_keys, DisplayBounds, Point};
+
+    #[test]
+    fn keyboard_suggestions_complete_only_the_verified_prefix() {
+        assert_eq!(suggestion_keys("hel", "hello", true, false), (0, "lo"));
+        assert_eq!(suggestion_keys("teh", "the", true, false), (3, "the"));
+        assert_eq!(suggestion_keys("swi", "Swipe", false, false), (0, "Swipe"));
+        assert_eq!(suggestion_keys("hel", "hello", true, true), (0, ""));
+    }
 
     #[test]
     fn text_events_preserve_spaces_and_combined_characters() {

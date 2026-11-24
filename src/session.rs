@@ -1025,6 +1025,11 @@ impl CompanionSession {
                 .keyboard_composition_updates
                 .fetch_add(1, Ordering::Relaxed);
         }
+        if edit.suggestion.is_some() {
+            diagnostics
+                .keyboard_suggestions
+                .fetch_add(1, Ordering::Relaxed);
+        }
         let target = match edit.target {
             Some(target) => target,
             None => {
@@ -1065,12 +1070,21 @@ impl CompanionSession {
                 };
                 (field.id, keystrokes)
             };
-            input.type_text(
-                field,
-                keystrokes.backspaces,
-                keystrokes.deletes,
-                &keystrokes.text,
-            )
+            if let Some(suggestion) = keystrokes.suggestion {
+                input.accept_suggestion(
+                    field,
+                    &suggestion.typed,
+                    &suggestion.word,
+                    &keystrokes.text,
+                )
+            } else {
+                input.type_text(
+                    field,
+                    keystrokes.backspaces,
+                    keystrokes.deletes,
+                    &keystrokes.text,
+                )
+            }
         })
         .await
         .unwrap_or(false);
