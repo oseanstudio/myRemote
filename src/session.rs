@@ -1306,8 +1306,7 @@ impl CompanionSession {
                     None => self.select(None, time, None),
                 }
             }
-        } else if matches!(button, "play_pause" | "home" | "menu") && self.input.playback_enabled()
-        {
+        } else if matches!(button, "play_pause" | "home") && self.input.playback_enabled() {
             self.queue_media_command(MediaCommand::Button(button), None);
         } else {
             self.input.button(button);

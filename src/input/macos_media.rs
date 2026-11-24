@@ -22,7 +22,6 @@ unsafe extern "C" {
         max_values: isize,
         values: *mut *const c_void,
     ) -> i32;
-    fn AXUIElementPerformAction(element: *const c_void, action: *const c_void) -> i32;
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -91,7 +90,7 @@ impl Player {
 }
 
 pub(super) fn handle(action: &str) -> bool {
-    if !matches!(action, "play_pause" | "home" | "menu") || !can_post_input() {
+    if !matches!(action, "play_pause" | "home") || !can_post_input() {
         return false;
     }
     autoreleasepool(|_| {
@@ -102,19 +101,7 @@ pub(super) fn handle(action: &str) -> bool {
             .and_then(|bundle| Player::identify(&bundle.to_string()))
             .or_else(|| BrowserVideo::from_app(app.clone()).map(|_| Player::Browser))?;
         if Desktop::focused_text_field().is_some() {
-            // A browser search box should keep its normal Escape behavior.
-            return Some(action != "menu");
-        }
-        let pid = app.processIdentifier();
-        if action == "menu" {
-            if player != Player::Browser {
-                return None;
-            }
-            let button = intro_button(pid)?;
-            let press = OwnedCf::string(c"AXPress")?;
-            return Some(
-                app.isActive() && unsafe { AXUIElementPerformAction(button.0, press.0) } == 0,
-            );
+            return Some(true);
         }
         let (key, flags) = player.shortcut(action)?;
         if app.isActive() {
@@ -498,27 +485,6 @@ fn flag(element: &OwnedCf, name: &CStr) -> Option<bool> {
     }
 }
 
-fn focused_window(pid: i32) -> Option<OwnedCf> {
-    let app = OwnedCf::new(unsafe { AXUIElementCreateApplication(pid) })?;
-    app.attribute(c"AXFocusedWindow").ok()
-}
-
-fn intro_button(pid: i32) -> Option<OwnedCf> {
-    find_element(focused_window(pid)?, |element| {
-        let has_label = |name| {
-            element
-                .attribute(name)
-                .is_ok_and(|label| label.is(c"Skip Intro") || label.is(c"Skip intro"))
-        };
-        element
-            .attribute(c"AXRole")
-            .is_ok_and(|role| role.is(c"AXButton"))
-            && (has_label(c"AXTitle") || has_label(c"AXDescription"))
-            && flag(element, c"AXEnabled") == Some(true)
-            && flag(element, c"AXHidden") != Some(true)
-    })
-}
-
 fn find_element(root: OwnedCf, mut matches: impl FnMut(&OwnedCf) -> bool) -> Option<OwnedCf> {
     let children = OwnedCf::string(c"AXChildren")?;
     let mut pending = VecDeque::from([root]);
@@ -548,7 +514,7 @@ fn find_element(root: OwnedCf, mut matches: impl FnMut(&OwnedCf) -> bool) -> Opt
 
 #[cfg(test)]
 mod tests {
-    use super::{clock_seconds, video_source, Player, VideoSource};
+    use super::{clock_seconds, handle, video_source, Player, VideoSource};
 
     #[test]
     fn browser_uses_player_keys_instead_of_global_media_keys() {
@@ -556,6 +522,7 @@ mod tests {
         assert_eq!(browser.shortcut("play_pause"), Some((49, 0)));
         assert_eq!(browser.shortcut("home"), Some((3, 0)));
         assert_eq!(browser.shortcut("menu"), None);
+        assert!(!handle("menu"));
         assert!(Player::identify("com.spotify.client").is_none());
         assert!(
             Player::identify("app.zen-browser.zen").is_some_and(|player| player == Player::Browser)

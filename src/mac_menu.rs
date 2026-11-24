@@ -1,5 +1,4 @@
 use std::cell::RefCell;
-use std::sync::atomic::Ordering;
 
 use objc2::rc::{autoreleasepool, Retained};
 use objc2::runtime::{ProtocolObject, Sel};
@@ -28,7 +27,6 @@ const AUTO_INSTALL: isize = 7;
 const ACCESSIBILITY: isize = 8;
 const LOCAL_NETWORK: isize = 9;
 const CONNECTION: isize = 14;
-const MEDIA_CONTROLS: isize = 15;
 const DIAGNOSTICS: isize = 16;
 
 struct State {
@@ -77,9 +75,6 @@ define_class!(
                     item.setTitle(&NSString::from_str(status));
                 }
             }
-            if let Some(item) = menu.itemWithTag(MEDIA_CONTROLS) {
-                item.setState(isize::from(self.ivars().options.media_controls.load(Ordering::Relaxed)));
-            }
             if let Some(item) = menu.itemWithTag(DIAGNOSTICS) {
                 item.setEnabled(active.is_some());
             }
@@ -123,15 +118,6 @@ define_class!(
                 .map(|active| active.state.remote_diagnostics());
             if let Some(report) = report {
                 self.alert("Remote Diagnostics", &report);
-            }
-        }
-
-        #[unsafe(method(myRemoteToggleMediaControls:))]
-        fn toggle_media_controls(&self, _sender: &NSMenuItem) {
-            let options = &self.ivars().options;
-            let enabled = !options.media_controls.load(Ordering::Relaxed);
-            if let Err(error) = options.set_media_controls(enabled) {
-                self.alert("Could not save media controls", &error.to_string());
             }
         }
 
@@ -369,12 +355,6 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             "Retry Starting Receiver",
             Some(sel!(myRemoteStartReceiver:)),
             START_RECEIVER,
-        );
-        controller.add_item(
-            &menu,
-            "Foreground Media Controls",
-            Some(sel!(myRemoteToggleMediaControls:)),
-            MEDIA_CONTROLS,
         );
         controller.add_item(
             &menu,

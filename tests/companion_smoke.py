@@ -783,9 +783,10 @@ async def exercise_media(port, credentials, expect):
 
         await command(client, "HIDCommand", {"HIDCommand": 5, "HIDButtonState": 2})
         expect(r"^Received button menu$")
-        await state(0x0100, "$null", "$null", "$null")
+        assert (await command(client, "FetchMediaControlStatus", {}))["_c"]["MediaControlFlags"] == 0x0733
         await command(client, "_mcc", {"_mcc": 7, "_skpS": float("inf")})
-        await command(client, "_mcc", {"_mcc": 7, "_skpS": -10.0})
+        await command(client, "_mcc", {"_mcc": 7, "_skpS": 10.0})
+        assert expect(r"^Received (.*)$")[1] == "playback Jellyfin SkipForward"
         await command(client, "HIDCommand", {"HIDCommand": 4, "HIDButtonState": 2})
         assert expect(r"^Received (.*)$")[1] == "button right"
     finally:

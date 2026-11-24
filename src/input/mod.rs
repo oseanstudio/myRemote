@@ -1,10 +1,5 @@
 use std::io;
 use std::sync::Mutex;
-#[cfg(target_os = "macos")]
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 
 use myremote::{PlaybackAction, PlaybackState, RemoteInput, VideoSource};
 
@@ -35,8 +30,6 @@ pub struct Desktop {
     state: Mutex<PointerState>,
     speed: f64,
     #[cfg(target_os = "macos")]
-    media_controls: Arc<AtomicBool>,
-    #[cfg(target_os = "macos")]
     playback: Mutex<PlaybackCache>,
     #[cfg(target_os = "macos")]
     keyboard: Mutex<()>,
@@ -58,10 +51,7 @@ struct PointerState {
 }
 
 impl Desktop {
-    pub fn open(
-        speed: f64,
-        #[cfg(target_os = "macos")] media_controls: Arc<AtomicBool>,
-    ) -> io::Result<Self> {
+    pub fn open(speed: f64) -> io::Result<Self> {
         Ok(Self {
             state: Mutex::new(PointerState {
                 device: platform::Desktop::open()?,
@@ -71,8 +61,6 @@ impl Desktop {
                 dragging: false,
             }),
             speed,
-            #[cfg(target_os = "macos")]
-            media_controls,
             #[cfg(target_os = "macos")]
             playback: Mutex::new(PlaybackCache::default()),
             #[cfg(target_os = "macos")]
@@ -113,7 +101,7 @@ impl Desktop {
 impl RemoteInput for Desktop {
     fn button(&self, name: &str) {
         #[cfg(target_os = "macos")]
-        if self.media_controls.load(Ordering::Relaxed) && macos_media::handle(name) {
+        if macos_media::handle(name) {
             return;
         }
         self.state.lock().unwrap().device.button(name);
@@ -178,7 +166,7 @@ impl RemoteInput for Desktop {
 
     #[cfg(target_os = "macos")]
     fn playback_enabled(&self) -> bool {
-        self.media_controls.load(Ordering::Relaxed)
+        true
     }
 
     #[cfg(target_os = "macos")]
@@ -196,9 +184,6 @@ impl RemoteInput for Desktop {
 
     #[cfg(target_os = "macos")]
     fn playback_action(&self, source: VideoSource, action: PlaybackAction) -> bool {
-        if !self.playback_enabled() {
-            return false;
-        }
         let applied = macos_media::playback_action(source, action);
         if applied {
             self.playback.lock().unwrap().checked = None;
@@ -255,23 +240,19 @@ impl RemoteInput for DryRun {
         if name == "menu" {
             self.text_focus.lock().unwrap().1 = false;
         }
-        // Media buttons also simulate entering and leaving a player in smoke tests.
-        match name {
-            "play_pause" | "home" => {
-                let source = if name == "home" {
-                    VideoSource::Jellyfin
-                } else {
-                    VideoSource::YouTube
-                };
-                *self.playback.lock().unwrap() = Some(PlaybackState {
-                    source,
-                    playing: Some(true),
-                    captions: (source == VideoSource::YouTube).then_some(false),
-                    duration_seconds: Some(600),
-                });
-            }
-            "menu" => *self.playback.lock().unwrap() = None,
-            _ => {}
+        // Media buttons also simulate entering a player in smoke tests.
+        if matches!(name, "play_pause" | "home") {
+            let source = if name == "home" {
+                VideoSource::Jellyfin
+            } else {
+                VideoSource::YouTube
+            };
+            *self.playback.lock().unwrap() = Some(PlaybackState {
+                source,
+                playing: Some(true),
+                captions: (source == VideoSource::YouTube).then_some(false),
+                duration_seconds: Some(600),
+            });
         }
         println!("Received button {name}");
     }
