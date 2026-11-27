@@ -190,6 +190,16 @@ define_class!(
             open_settings("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork");
         }
 
+        #[unsafe(method(myRemoteReceiveAirPlayAudio:))]
+        fn receive_airplay_audio(&self, _sender: &NSMenuItem) {
+            if !open_settings("x-apple.systempreferences:com.apple.AirDrop-Handoff-Settings.extension") {
+                self.alert(
+                    "AirPlay Receiver Settings",
+                    "Open System Settings → General → AirDrop & Continuity (or AirDrop & Handoff) to manage AirPlay Receiver.",
+                );
+            }
+        }
+
         #[unsafe(method(myRemoteToggleNearby:))]
         fn toggle_nearby(&self, _sender: &NSMenuItem) {
             let state = self.ivars();
@@ -513,10 +523,9 @@ impl MenuController {
     }
 }
 
-fn open_settings(location: &str) {
-    if let Some(url) = NSURL::URLWithString(&NSString::from_str(location)) {
-        NSWorkspace::sharedWorkspace().openURL(&url);
-    }
+fn open_settings(location: &str) -> bool {
+    NSURL::URLWithString(&NSString::from_str(location))
+        .is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url))
 }
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
@@ -546,6 +555,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.add_item(&menu, "", None, STATUS);
         controller.add_item(&menu, "", None, CONNECTION);
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
+        controller.add_item(
+            &menu,
+            "Receive AirPlay Audio…",
+            Some(sel!(myRemoteReceiveAirPlayAudio:)),
+            0,
+        );
         controller.add_item(
             &menu,
             "Nearby iPhone (Beta)",

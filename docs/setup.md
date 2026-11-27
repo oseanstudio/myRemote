@@ -67,6 +67,12 @@ On macOS, Play/Pause and TV control playback and fullscreen in the active browse
 
 While a Jellyfin or YouTube video page is in the foreground, myRemote uses macOS Accessibility to identify the player and advertise the built-in Remote's skip controls. This works with browsers that expose the foreground web page, including Zen. YouTube's shortcuts skip 10 seconds. In Jellyfin, set both **Skip forward length** and **Skip back length** to **10 seconds** in **Settings → Playback**. myRemote also reports subtitle availability when it can read the YouTube player's caption toggle.
 
+### Receive AirPlay audio on Mac
+
+Choose **Receive AirPlay Audio…** in the myRemote menu to open the Mac’s AirPlay Receiver settings. Turn on **AirPlay Receiver** and choose **Current User** if both devices use the same Apple Account. You can turn the receiver off from the same settings.
+
+Connect the iPhone and Mac to the same local network. Start a song on the iPhone, open the **AirPlay** output picker in its Now Playing controls, and select the Mac’s computer name. The iPhone keeps its place in the song while the Mac plays the audio. The **myRemote · COMPUTERNAME** entry is for desktop controls.
+
 ## Configuration
 
 ```sh
