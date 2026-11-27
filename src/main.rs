@@ -12,6 +12,8 @@ mod input;
 #[cfg(target_os = "macos")]
 mod mac_accessibility;
 #[cfg(target_os = "macos")]
+mod mac_airplay;
+#[cfg(target_os = "macos")]
 mod mac_bonjour;
 #[cfg(target_os = "macos")]
 mod mac_menu;

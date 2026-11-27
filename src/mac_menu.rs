@@ -34,6 +34,7 @@ const CONNECTION: isize = 14;
 const NEARBY: isize = 15;
 const NEARBY_STATUS: isize = 16;
 const NEARBY_DIAGNOSTIC: isize = 17;
+const AIRPLAY_AUDIO: isize = 18;
 const NEARBY_DIAGNOSTIC_TITLE: &str = "Run Nearby Diagnostic…";
 
 type NearbyDiagnostic = JoinHandle<io::Result<Option<String>>>;
@@ -93,6 +94,11 @@ define_class!(
             }
             if let Some(item) = menu.itemWithTag(PAIR) {
                 item.setEnabled(active.is_some());
+            }
+            if let Some(item) = menu.itemWithTag(AIRPLAY_AUDIO) {
+                let setting = crate::mac_airplay::setting();
+                item.setState(isize::from(setting.enabled));
+                item.setEnabled(setting.editable);
             }
             if let Some(item) = menu.itemWithTag(START_RECEIVER) {
                 item.setHidden(active.is_some());
@@ -191,13 +197,17 @@ define_class!(
         }
 
         #[unsafe(method(myRemoteReceiveAirPlayAudio:))]
-        fn receive_airplay_audio(&self, _sender: &NSMenuItem) {
-            if !open_settings("x-apple.systempreferences:com.apple.AirDrop-Handoff-Settings.extension") {
+        fn receive_airplay_audio(&self, sender: &NSMenuItem) {
+            let setting = crate::mac_airplay::setting();
+            if setting.editable && !crate::mac_airplay::set_enabled(!setting.enabled) {
                 self.alert(
-                    "AirPlay Receiver Settings",
-                    "Open System Settings → General → AirDrop & Continuity (or AirDrop & Handoff) to manage AirPlay Receiver.",
+                    "Could Not Change AirPlay Receiver",
+                    "macOS did not save the new setting. Check AirPlay Receiver in System Settings → General → AirDrop & Continuity.",
                 );
             }
+            let setting = crate::mac_airplay::setting();
+            sender.setState(isize::from(setting.enabled));
+            sender.setEnabled(setting.editable);
         }
 
         #[unsafe(method(myRemoteToggleNearby:))]
@@ -523,9 +533,10 @@ impl MenuController {
     }
 }
 
-fn open_settings(location: &str) -> bool {
-    NSURL::URLWithString(&NSString::from_str(location))
-        .is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url))
+fn open_settings(location: &str) {
+    if let Some(url) = NSURL::URLWithString(&NSString::from_str(location)) {
+        NSWorkspace::sharedWorkspace().openURL(&url);
+    }
 }
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
@@ -557,9 +568,9 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         controller.add_item(&menu, "Pair iPhone…", Some(sel!(myRemotePair:)), PAIR);
         controller.add_item(
             &menu,
-            "Receive AirPlay Audio…",
+            "Receive AirPlay Audio",
             Some(sel!(myRemoteReceiveAirPlayAudio:)),
-            0,
+            AIRPLAY_AUDIO,
         );
         controller.add_item(
             &menu,

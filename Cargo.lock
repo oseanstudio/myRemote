@@ -906,7 +906,7 @@ dependencies = [
 
 [[package]]
 name = "myremote"
-version = "2.10.0"
+version = "2.11.0"
 dependencies = [
  "block2",
  "chacha20poly1305",
@@ -922,6 +922,7 @@ dependencies = [
  "num-traits",
  "objc2",
  "objc2-app-kit",
+ "objc2-core-foundation",
  "objc2-foundation",
  "plist",
  "rand",

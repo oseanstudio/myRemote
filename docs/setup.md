@@ -69,7 +69,7 @@ While a Jellyfin or YouTube video page is in the foreground, myRemote uses macOS
 
 ### Receive AirPlay audio on Mac
 
-Choose **Receive AirPlay Audio…** in the myRemote menu to open the Mac’s AirPlay Receiver settings. Turn on **AirPlay Receiver** and choose **Current User** if both devices use the same Apple Account. You can turn the receiver off from the same settings.
+Click **Receive AirPlay Audio** in the myRemote menu to turn the Mac’s built-in AirPlay Receiver on or off. A checkmark shows that receiving is enabled. To change who can stream to the Mac, use **Allow AirPlay for** in **System Settings → General → AirDrop & Continuity**.
 
 Connect the iPhone and Mac to the same local network. Start a song on the iPhone, open the **AirPlay** output picker in its Now Playing controls, and select the Mac’s computer name. The iPhone keeps its place in the song while the Mac plays the audio. The **myRemote · COMPUTERNAME** entry is for desktop controls.
 
