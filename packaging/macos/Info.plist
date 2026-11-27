@@ -23,13 +23,16 @@
     <key>LSUIElement</key>
     <true/>
     <key>NSLocalNetworkUsageDescription</key>
-    <string>myRemote uses your local network to pair with Apple TV Remote on your iPhone.</string>
+    <string>myRemote uses your local network for iPhone remote control and optional music handoff.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>myRemote controls Music when you ask it to continue a song at the iPhone’s playback position.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_mediaremotetv._tcp</string>
         <string>_companion-link._tcp</string>
         <string>_airplay._tcp</string>
         <string>_airplay-p2p._tcp</string>
+        <string>_raop._tcp</string>
     </array>
 </dict>
 </plist>

@@ -73,6 +73,15 @@ Click **Receive AirPlay Audio** in the myRemote menu to turn the Mac’s built-i
 
 Connect the iPhone and Mac to the same local network. Start a song on the iPhone, open the **AirPlay** output picker in its Now Playing controls, and select the Mac’s computer name. The iPhone keeps its place in the song while the Mac plays the audio. The **myRemote · COMPUTERNAME** entry is for desktop controls.
 
+### Continue a song in a Mac player
+
+1. Enable **Music Handoff (Beta)** in myRemote. With both devices on the same LAN, select the AirPlay destination ending in **· Music Handoff** on the iPhone. Use the code shown by myRemote if the iPhone asks for a password.
+2. Play a song and wait for its title and elapsed time to appear in the Mac menu. The beta needs an audio source that sends both song details and AirPlay playback progress.
+3. Choose **Continue in Apple Music** to play a matching track from your Music library. Allow macOS Automation access if prompted. If the song is missing, add it to your library and retry.
+4. Or choose **Continue in YouTube Music**. myRemote searches YouTube Music using the title and artist and opens the match at the captured time in your browser. Click Play if your browser requires it, then confirm that the song is playing before stopping AirPlay.
+
+For another Mac player, create a shortcut named **myRemote Continue Playback** and choose **Continue with a Shortcut**. The shortcut receives a JSON file with `title`, `artist`, `album`, `position_ms`, and `duration_ms`. Return the text `playing` once the player has started and sought to the requested position.
+
 ## Configuration
 
 ```sh

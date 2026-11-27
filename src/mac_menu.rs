@@ -18,7 +18,9 @@ use tokio::task::JoinHandle;
 use crate::{
     input,
     mac_accessibility::{refresh_updated_permissions, ApprovalWatch, Permission},
-    mac_bonjour, mac_peer, start_receiver,
+    mac_bonjour,
+    mac_handoff::{self, Destination, Handoff, Outcome, Track},
+    mac_peer, start_receiver,
     update::{self, Updater},
     version_label, ActiveReceiver, Options, VERSION,
 };
@@ -35,9 +37,15 @@ const NEARBY: isize = 15;
 const NEARBY_STATUS: isize = 16;
 const NEARBY_DIAGNOSTIC: isize = 17;
 const AIRPLAY_AUDIO: isize = 18;
+const HANDOFF: isize = 19;
+const HANDOFF_STATUS: isize = 20;
+const HANDOFF_MUSIC: isize = 21;
+const HANDOFF_YOUTUBE: isize = 22;
+const HANDOFF_SHORTCUT: isize = 23;
 const NEARBY_DIAGNOSTIC_TITLE: &str = "Run Nearby Diagnostic…";
 
 type NearbyDiagnostic = JoinHandle<io::Result<Option<String>>>;
+type HandoffAction = JoinHandle<(Track, io::Result<Outcome>)>;
 
 struct State {
     options: Options,
@@ -52,6 +60,8 @@ struct State {
     nearby: RefCell<Option<mac_peer::Nearby>>,
     nearby_failed: Cell<bool>,
     nearby_diagnostic: RefCell<Option<NearbyDiagnostic>>,
+    handoff: RefCell<Option<Handoff>>,
+    handoff_action: RefCell<Option<HandoffAction>>,
     updater: RefCell<Updater>,
 }
 
@@ -100,6 +110,7 @@ define_class!(
                 item.setState(isize::from(setting.enabled));
                 item.setEnabled(setting.editable);
             }
+            self.refresh_handoff_menu(menu);
             if let Some(item) = menu.itemWithTag(START_RECEIVER) {
                 item.setHidden(active.is_some());
             }
@@ -189,6 +200,7 @@ define_class!(
         fn poll_menu(&self, _timer: &NSTimer) {
             self.poll_accessibility_setup();
             self.poll_nearby_diagnostic();
+            self.poll_handoff();
         }
 
         #[unsafe(method(myRemoteLocalNetwork:))]
@@ -208,6 +220,49 @@ define_class!(
             let setting = crate::mac_airplay::setting();
             sender.setState(isize::from(setting.enabled));
             sender.setEnabled(setting.editable);
+        }
+
+        #[unsafe(method(myRemoteToggleMusicHandoff:))]
+        fn toggle_music_handoff(&self, _sender: &NSMenuItem) {
+            let state = self.ivars();
+            if state.handoff.borrow().as_ref().is_some_and(Handoff::running) {
+                self.stop_handoff();
+                return;
+            }
+            match Handoff::start(state.runtime.handle(), &state.options.name) {
+                Ok(receiver) => {
+                    let instructions = format!(
+                        "Choose {} in the iPhone’s AirPlay picker. Enter {} if asked. Then choose a Mac player from the myRemote menu. Keep both devices on the same local network.",
+                        receiver.name, receiver.password
+                    );
+                    state.handoff.replace(Some(receiver));
+                    self.alert("Music Handoff (Beta)", &instructions);
+                }
+                Err(error) => self.alert("Could Not Start Music Handoff", &error.to_string()),
+            }
+        }
+
+        #[unsafe(method(myRemoteContinueMusic:))]
+        fn continue_music(&self, sender: &NSMenuItem) {
+            let state = self.ivars();
+            if state.handoff_action.borrow().is_some() {
+                return;
+            }
+            let destination = match sender.tag() {
+                HANDOFF_MUSIC => Destination::Music,
+                HANDOFF_YOUTUBE => Destination::YouTubeMusic,
+                HANDOFF_SHORTCUT => Destination::Shortcut,
+                _ => return,
+            };
+            let track = state.handoff.borrow().as_ref().and_then(|handoff| handoff.state().track.clone());
+            if let Some(track) = track {
+                state.handoff_action.replace(Some(
+                    state.runtime.spawn(async move {
+                        let outcome = mac_handoff::continue_playback(destination, track.clone()).await;
+                        (track, outcome)
+                    }),
+                ));
+            }
         }
 
         #[unsafe(method(myRemoteToggleNearby:))]
@@ -317,6 +372,8 @@ impl MenuController {
             nearby: RefCell::new(None),
             nearby_failed: Cell::new(false),
             nearby_diagnostic: RefCell::new(None),
+            handoff: RefCell::new(None),
+            handoff_action: RefCell::new(None),
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -429,12 +486,120 @@ impl MenuController {
 
     fn stop(&self) {
         let state = self.ivars();
+        self.stop_handoff();
         if let Some(capture) = state.nearby_diagnostic.take() {
             capture.abort();
         }
         state.nearby.take();
         if let Some(active) = state.active.take() {
             state.runtime.block_on(active.stop());
+        }
+    }
+
+    fn refresh_handoff_menu(&self, menu: &NSMenu) {
+        let state = self.ivars();
+        let receiver = state.handoff.borrow();
+        let running = receiver.as_ref().is_some_and(Handoff::running);
+        let track_ready = running
+            && receiver
+                .as_ref()
+                .is_some_and(|handoff| handoff.state().track.is_some());
+        let busy = state.handoff_action.borrow().is_some();
+        if let Some(item) = menu.itemWithTag(HANDOFF) {
+            item.setState(isize::from(running));
+        }
+        if let Some(item) = menu.itemWithTag(HANDOFF_STATUS) {
+            item.setHidden(receiver.is_none());
+            if let Some(handoff) = receiver.as_ref() {
+                let snapshot = handoff.state();
+                let status = if busy {
+                    "Finding the matching recording…".to_owned()
+                } else if let Some(track) = &snapshot.track {
+                    let seconds = track.position_ms / 1000;
+                    format!(
+                        "{} · {} · {}:{:02}",
+                        track.title,
+                        track.artist,
+                        seconds / 60,
+                        seconds % 60
+                    )
+                } else {
+                    snapshot
+                        .status
+                        .unwrap_or("Waiting for iPhone music")
+                        .to_owned()
+                };
+                item.setTitle(&NSString::from_str(&status));
+            }
+        }
+        for tag in [HANDOFF_MUSIC, HANDOFF_YOUTUBE, HANDOFF_SHORTCUT] {
+            if let Some(item) = menu.itemWithTag(tag) {
+                item.setHidden(!running);
+                item.setEnabled(track_ready && !busy);
+            }
+        }
+    }
+
+    fn stop_handoff(&self) {
+        let state = self.ivars();
+        if let Some(action) = state.handoff_action.take() {
+            action.abort();
+        }
+        state.handoff.take();
+    }
+
+    fn poll_handoff(&self) {
+        let state = self.ivars();
+        if !state
+            .handoff_action
+            .borrow()
+            .as_ref()
+            .is_some_and(JoinHandle::is_finished)
+        {
+            return;
+        }
+        let action = state.handoff_action.take().expect("completed song handoff");
+        state.menu.cancelTracking();
+        match state.runtime.block_on(action) {
+            Ok((track, Ok(Outcome::Playing))) => self.finish_handoff(&track),
+            Ok((track, Ok(Outcome::Browser(url)))) if open_url(&url) => {
+                let alert = self.make_alert(
+                    "Continue in YouTube Music",
+                    "Once the song is playing at the right spot in your browser, stop the iPhone’s AirPlay stream.",
+                );
+                alert.addButtonWithTitle(objc2_foundation::ns_string!("Stop AirPlay Stream"));
+                alert.addButtonWithTitle(objc2_foundation::ns_string!("Keep Streaming"));
+                if alert.runModal() == NSAlertFirstButtonReturn {
+                    self.finish_handoff(&track);
+                }
+            }
+            Ok((_, Ok(Outcome::Browser(_)))) => self.alert(
+                "Could Not Continue Playback",
+                "The Mac could not open YouTube Music in your browser.",
+            ),
+            Ok((_, Err(error))) => self.alert("Could Not Continue Playback", &error.to_string()),
+            Err(_) => self.alert(
+                "Could Not Continue Playback",
+                "The handoff was interrupted.",
+            ),
+        }
+    }
+
+    fn finish_handoff(&self, track: &Track) {
+        let same_recording = self
+            .ivars()
+            .handoff
+            .borrow()
+            .as_ref()
+            .is_some_and(|handoff| {
+                handoff
+                    .state()
+                    .track
+                    .as_ref()
+                    .is_some_and(|current| current.same_recording(track))
+            });
+        if same_recording {
+            self.stop_handoff();
         }
     }
 
@@ -534,9 +699,12 @@ impl MenuController {
 }
 
 fn open_settings(location: &str) {
-    if let Some(url) = NSURL::URLWithString(&NSString::from_str(location)) {
-        NSWorkspace::sharedWorkspace().openURL(&url);
-    }
+    open_url(location);
+}
+
+fn open_url(location: &str) -> bool {
+    NSURL::URLWithString(&NSString::from_str(location))
+        .is_some_and(|url| NSWorkspace::sharedWorkspace().openURL(&url))
 }
 
 pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error::Error>> {
@@ -572,6 +740,20 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             Some(sel!(myRemoteReceiveAirPlayAudio:)),
             AIRPLAY_AUDIO,
         );
+        controller.add_item(
+            &menu,
+            "Music Handoff (Beta)",
+            Some(sel!(myRemoteToggleMusicHandoff:)),
+            HANDOFF,
+        );
+        controller.add_item(&menu, "", None, HANDOFF_STATUS);
+        for (title, tag) in [
+            ("Continue in Apple Music", HANDOFF_MUSIC),
+            ("Continue in YouTube Music", HANDOFF_YOUTUBE),
+            ("Continue with a Shortcut", HANDOFF_SHORTCUT),
+        ] {
+            controller.add_item(&menu, title, Some(sel!(myRemoteContinueMusic:)), tag);
+        }
         controller.add_item(
             &menu,
             "Nearby iPhone (Beta)",

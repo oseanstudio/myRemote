@@ -1,6 +1,6 @@
 [package]
 name = "myremote"
-version = "2.11.0"
+version = "2.12.0"
 edition = "2021"
 rust-version = "1.90"
 license = "MIT"
@@ -52,6 +52,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-foundation = { version = "0.3", default-features = false, features = [
     "std", "NSGeometry", "NSProcessInfo", "NSRunLoop", "NSString", "NSTimer", "NSURL",
 ] }
+openairplay1 = { git = "https://github.com/st3fan/openairplay1", rev = "797837d69d7fe33cb7af6cd7460931599079eaf2", version = "0.3.0" }
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = { version = "0.26.1", default-features = false }

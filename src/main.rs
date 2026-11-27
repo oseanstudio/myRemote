@@ -16,6 +16,8 @@ mod mac_airplay;
 #[cfg(target_os = "macos")]
 mod mac_bonjour;
 #[cfg(target_os = "macos")]
+mod mac_handoff;
+#[cfg(target_os = "macos")]
 mod mac_menu;
 #[cfg(target_os = "macos")]
 mod mac_peer;
@@ -529,6 +531,10 @@ async fn shutdown_signal() -> io::Result<()> {
 }
 
 fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "macos")]
+    if let Some(result) = mac_handoff::run_helper() {
+        return result;
+    }
     #[cfg(target_os = "macos")]
     if let Some(result) = mac_accessibility::run_probe() {
         return result;
