@@ -77,8 +77,8 @@ Connect the iPhone and Mac to the same local network. Start a song on the iPhone
 
 ### Continue a song in a Mac player
 
-1. Enable **Music Handoff (Beta)** in myRemote. With both devices on the same LAN, select the AirPlay destination ending in **· Music Handoff** on the iPhone. Use the code shown by myRemote if the iPhone asks for a password.
-2. Play a song and wait for its title and elapsed time to appear in the Mac menu. The beta needs an audio source that sends both song details and AirPlay playback progress.
+1. Enable **Beta → Music Handoff** in myRemote. With both devices on the same LAN, select the AirPlay destination ending in **· Music Handoff** on the iPhone. Use the code shown by myRemote if the iPhone asks for a password.
+2. Play a song and wait for its title and elapsed time to appear in the **Beta** submenu. The beta needs an audio source that sends both song details and AirPlay playback progress.
 3. Choose **Continue in Apple Music** to play a matching track from your Music library. Allow macOS Automation access if prompted. If the song is missing, add it to your library and retry.
 4. Or choose **Continue in YouTube Music**. myRemote searches YouTube Music using the title and artist and opens the match at the captured time in your browser. Click Play if your browser requires it, then confirm that the song is playing before stopping AirPlay.
 
@@ -94,9 +94,9 @@ For another Mac player, create a shortcut named **myRemote Continue Playback** a
 
 The receiver uses Bonjour for discovery. On macOS, it advertises through the system Bonjour service and listens on IPv4 and IPv6 by default. On Windows and Linux, use `--ip` to select a LAN adapter if needed. Guest Wi‑Fi and client isolation can block discovery.
 
-On macOS, **Nearby iPhone (Beta)** in the menu enables experimental peer-to-peer Wi‑Fi alongside normal discovery. Keep Wi‑Fi and Bluetooth turned on on both devices. To test without a shared network, disconnect both devices from their Wi‑Fi networks while leaving the radios on, unplug Ethernet if connected, and open Apple TV Remote on the nearby iPhone. Look for the name ending in **· Nearby**. If prompted, use **Pair iPhone…** on the Mac. Apple TV Remote discovery and reconnection over this link need testing on an iPhone.
+On macOS, **Beta → Nearby iPhone** in the menu enables experimental peer-to-peer Wi‑Fi alongside normal discovery. Keep Wi‑Fi and Bluetooth turned on on both devices. To test without a shared network, disconnect both devices from their Wi‑Fi networks while leaving the radios on, unplug Ethernet if connected, and open Apple TV Remote on the nearby iPhone. Look for the name ending in **· Nearby**. If prompted, use **Pair iPhone…** on the Mac. Apple TV Remote discovery and reconnection over this link need testing on an iPhone.
 
-If the iPhone does not find myRemote, choose **Run Nearby Diagnostic…** with the beta enabled. Start the check, approve the macOS administrator prompt if it appears, and open the Apple TV Remote device picker during the 30-second check. **Copy Summary** copies only packet counts for troubleshooting.
+If the iPhone does not find myRemote, choose **Beta → Run Nearby Diagnostic…** with Nearby iPhone enabled. Start the check, approve the macOS administrator prompt if it appears, and open the Apple TV Remote device picker during the 30-second check. **Copy Summary** copies only packet counts for troubleshooting.
 
 The menu app opens a two-minute pairing window when a phone requests a code. The code is shown only on the target computer, and pairing closes once the phone is enrolled. The server verifies each paired controller and encrypts the input session. To revoke access, stop myRemote and run `myremote --forget-phones` with the same `--state-dir` override, if used. If the iPhone still shows outdated credentials, remove the old device from the picker if available, reopen Control Center, and pair again.
 

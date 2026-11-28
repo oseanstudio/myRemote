@@ -81,6 +81,11 @@ define_class!(
     unsafe impl NSMenuDelegate for MenuController {
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
+            if !std::ptr::eq(menu, &*self.ivars().menu) {
+                self.refresh_handoff_menu(menu);
+                self.refresh_nearby_menu(menu);
+                return;
+            }
             let active = self.ivars().active.borrow();
             let discovery = active.as_ref().and_then(|receiver| receiver.bonjour.as_ref())
                 .map(mac_bonjour::Bonjour::status);
@@ -117,7 +122,6 @@ define_class!(
             if let Some(item) = menu.itemWithTag(OPEN_AT_LOGIN) {
                 self.refresh_login_item(&item);
             }
-            self.refresh_handoff_menu(menu);
             if let Some(item) = menu.itemWithTag(START_RECEIVER) {
                 item.setHidden(active.is_some());
             }
@@ -129,24 +133,6 @@ define_class!(
                     discovery,
                     Some(mac_bonjour::Status::LocalNetworkPermission | mac_bonjour::Status::Failed)
                 ));
-            }
-            let nearby_supported = active.as_ref().is_some_and(|receiver| receiver.peer_target.is_some());
-            if let Some(item) = menu.itemWithTag(NEARBY) {
-                item.setHidden(!nearby_supported);
-                item.setState(isize::from(self.ivars().nearby_enabled.get()));
-                item.setToolTip(Some(objc2_foundation::ns_string!("Try connecting a nearby iPhone without joining the same Wi‑Fi network")));
-            }
-            if let Some(item) = menu.itemWithTag(NEARBY_STATUS) {
-                let failed = self.ivars().nearby_failed.get()
-                    || self.ivars().nearby.borrow().as_ref().is_some_and(mac_peer::Nearby::unavailable);
-                item.setHidden(!nearby_supported || !failed);
-            }
-            if let Some(item) = menu.itemWithTag(NEARBY_DIAGNOSTIC) {
-                let running = self.ivars().nearby_diagnostic.borrow().is_some();
-                item.setHidden(!nearby_supported || !self.ivars().nearby_enabled.get());
-                item.setEnabled(!running);
-                let title = if running { "Nearby Diagnostic in Progress…" } else { NEARBY_DIAGNOSTIC_TITLE };
-                item.setTitle(&NSString::from_str(title));
             }
             let updater = self.ivars().updater.borrow();
             if let Some(item) = menu.itemWithTag(UPDATE_ACTION) {
@@ -253,7 +239,7 @@ define_class!(
                         receiver.name, receiver.password
                     );
                     state.handoff.replace(Some(receiver));
-                    self.alert("Music Handoff (Beta)", &instructions);
+                    self.alert("Music Handoff", &instructions);
                 }
                 Err(error) => self.alert("Could Not Start Music Handoff", &error.to_string()),
             }
@@ -528,6 +514,42 @@ impl MenuController {
         }
     }
 
+    fn refresh_nearby_menu(&self, menu: &NSMenu) {
+        let state = self.ivars();
+        let supported = state
+            .active
+            .borrow()
+            .as_ref()
+            .is_some_and(|receiver| receiver.peer_target.is_some());
+        if let Some(item) = menu.itemWithTag(NEARBY) {
+            item.setHidden(!supported);
+            item.setState(isize::from(state.nearby_enabled.get()));
+            item.setToolTip(Some(objc2_foundation::ns_string!(
+                "Try connecting a nearby iPhone without joining the same Wi‑Fi network"
+            )));
+        }
+        if let Some(item) = menu.itemWithTag(NEARBY_STATUS) {
+            let failed = state.nearby_failed.get()
+                || state
+                    .nearby
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(mac_peer::Nearby::unavailable);
+            item.setHidden(!supported || !failed);
+        }
+        if let Some(item) = menu.itemWithTag(NEARBY_DIAGNOSTIC) {
+            let running = state.nearby_diagnostic.borrow().is_some();
+            item.setHidden(!supported || !state.nearby_enabled.get());
+            item.setEnabled(!running);
+            let title = if running {
+                "Nearby Diagnostic in Progress…"
+            } else {
+                NEARBY_DIAGNOSTIC_TITLE
+            };
+            item.setTitle(&NSString::from_str(title));
+        }
+    }
+
     fn refresh_handoff_menu(&self, menu: &NSMenu) {
         let state = self.ivars();
         let receiver = state.handoff.borrow();
@@ -728,6 +750,47 @@ impl MenuController {
         item.setEnabled(action.is_some());
         menu.addItem(&item);
     }
+
+    fn add_beta_menu(&self, menu: &NSMenu) {
+        let title = objc2_foundation::ns_string!("Beta");
+        let beta = NSMenu::new(self.mtm());
+        beta.setTitle(title);
+        beta.setAutoenablesItems(false);
+        beta.setDelegate(Some(ProtocolObject::from_ref(self)));
+        self.add_item(
+            &beta,
+            "Music Handoff",
+            Some(sel!(myRemoteToggleMusicHandoff:)),
+            HANDOFF,
+        );
+        self.add_item(&beta, "", None, HANDOFF_STATUS);
+        for (title, tag) in [
+            ("Continue in Apple Music", HANDOFF_MUSIC),
+            ("Continue in YouTube Music", HANDOFF_YOUTUBE),
+            ("Continue with a Shortcut", HANDOFF_SHORTCUT),
+        ] {
+            self.add_item(&beta, title, Some(sel!(myRemoteContinueMusic:)), tag);
+        }
+        self.add_item(
+            &beta,
+            "Nearby iPhone",
+            Some(sel!(myRemoteToggleNearby:)),
+            NEARBY,
+        );
+        self.add_item(
+            &beta,
+            NEARBY_DIAGNOSTIC_TITLE,
+            Some(sel!(myRemoteRunNearbyDiagnostic:)),
+            NEARBY_DIAGNOSTIC,
+        );
+        self.add_item(&beta, "Nearby iPhone unavailable", None, NEARBY_STATUS);
+
+        let item = NSMenuItem::new(self.mtm());
+        item.setTitle(title);
+        item.setSubmenu(Some(&beta));
+        item.setEnabled(true);
+        menu.addItem(&item);
+    }
 }
 
 fn open_settings(location: &str) {
@@ -772,33 +835,7 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
             Some(sel!(myRemoteReceiveAirPlayAudio:)),
             AIRPLAY_AUDIO,
         );
-        controller.add_item(
-            &menu,
-            "Music Handoff (Beta)",
-            Some(sel!(myRemoteToggleMusicHandoff:)),
-            HANDOFF,
-        );
-        controller.add_item(&menu, "", None, HANDOFF_STATUS);
-        for (title, tag) in [
-            ("Continue in Apple Music", HANDOFF_MUSIC),
-            ("Continue in YouTube Music", HANDOFF_YOUTUBE),
-            ("Continue with a Shortcut", HANDOFF_SHORTCUT),
-        ] {
-            controller.add_item(&menu, title, Some(sel!(myRemoteContinueMusic:)), tag);
-        }
-        controller.add_item(
-            &menu,
-            "Nearby iPhone (Beta)",
-            Some(sel!(myRemoteToggleNearby:)),
-            NEARBY,
-        );
-        controller.add_item(
-            &menu,
-            NEARBY_DIAGNOSTIC_TITLE,
-            Some(sel!(myRemoteRunNearbyDiagnostic:)),
-            NEARBY_DIAGNOSTIC,
-        );
-        controller.add_item(&menu, "Nearby iPhone unavailable", None, NEARBY_STATUS);
+        controller.add_beta_menu(&menu);
         controller.add_item(
             &menu,
             "Retry Starting Receiver",
