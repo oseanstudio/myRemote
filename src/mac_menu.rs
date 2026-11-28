@@ -12,6 +12,7 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSArray, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSString, NSTimer, NSURL,
 };
+use objc2_service_management::SMAppServiceStatus;
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 
@@ -20,6 +21,7 @@ use crate::{
     mac_accessibility::{refresh_updated_permissions, ApprovalWatch, Permission},
     mac_bonjour,
     mac_handoff::{self, Destination, Handoff, Outcome, Track},
+    mac_login::LoginItem,
     mac_peer, start_receiver,
     update::{self, Updater},
     version_label, ActiveReceiver, Options, VERSION,
@@ -42,6 +44,7 @@ const HANDOFF_STATUS: isize = 20;
 const HANDOFF_MUSIC: isize = 21;
 const HANDOFF_YOUTUBE: isize = 22;
 const HANDOFF_SHORTCUT: isize = 23;
+const OPEN_AT_LOGIN: isize = 24;
 const NEARBY_DIAGNOSTIC_TITLE: &str = "Run Nearby Diagnostic…";
 
 type NearbyDiagnostic = JoinHandle<io::Result<Option<String>>>;
@@ -62,6 +65,7 @@ struct State {
     nearby_diagnostic: RefCell<Option<NearbyDiagnostic>>,
     handoff: RefCell<Option<Handoff>>,
     handoff_action: RefCell<Option<HandoffAction>>,
+    login_item: Option<LoginItem>,
     updater: RefCell<Updater>,
 }
 
@@ -109,6 +113,9 @@ define_class!(
                 let setting = crate::mac_airplay::setting();
                 item.setState(isize::from(setting.enabled));
                 item.setEnabled(setting.editable);
+            }
+            if let Some(item) = menu.itemWithTag(OPEN_AT_LOGIN) {
+                self.refresh_login_item(&item);
             }
             self.refresh_handoff_menu(menu);
             if let Some(item) = menu.itemWithTag(START_RECEIVER) {
@@ -206,6 +213,16 @@ define_class!(
         #[unsafe(method(myRemoteLocalNetwork:))]
         fn local_network(&self, _sender: &NSMenuItem) {
             open_settings("x-apple.systempreferences:com.apple.preference.security?Privacy_LocalNetwork");
+        }
+
+        #[unsafe(method(myRemoteOpenAtLogin:))]
+        fn open_at_login(&self, sender: &NSMenuItem) {
+            if let Some(login_item) = &self.ivars().login_item {
+                if let Err(error) = login_item.toggle() {
+                    self.alert("Could Not Change Open at Login", &error.localizedDescription().to_string());
+                }
+            }
+            self.refresh_login_item(sender);
         }
 
         #[unsafe(method(myRemoteReceiveAirPlayAudio:))]
@@ -374,6 +391,7 @@ impl MenuController {
             nearby_diagnostic: RefCell::new(None),
             handoff: RefCell::new(None),
             handoff_action: RefCell::new(None),
+            login_item: LoginItem::for_installed_app(),
             updater,
         });
         // Initialize the superclass after assigning the Rust ivars.
@@ -392,6 +410,20 @@ impl MenuController {
             }
         }
         self.refresh_nearby();
+    }
+
+    fn refresh_login_item(&self, item: &NSMenuItem) {
+        item.setHidden(self.ivars().login_item.is_none());
+        if let Some(login_item) = &self.ivars().login_item {
+            let status = login_item.status();
+            let title = if status == SMAppServiceStatus::RequiresApproval {
+                objc2_foundation::ns_string!("Allow Open at Login…")
+            } else {
+                objc2_foundation::ns_string!("Open at Login")
+            };
+            item.setTitle(title);
+            item.setState(isize::from(status == SMAppServiceStatus::Enabled));
+        }
     }
 
     fn refresh_nearby(&self) {
@@ -787,6 +819,12 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         );
         controller.add_item(&menu, "", None, UPDATE_STATUS);
         menu.addItem(&NSMenuItem::separatorItem(mtm));
+        controller.add_item(
+            &menu,
+            "Open at Login",
+            Some(sel!(myRemoteOpenAtLogin:)),
+            OPEN_AT_LOGIN,
+        );
         controller.add_item(&menu, "Quit myRemote", Some(sel!(myRemoteQuit:)), 0);
 
         let bar = NSStatusBar::systemStatusBar();
@@ -807,6 +845,9 @@ pub fn run(options: Options, runtime: Runtime) -> Result<(), Box<dyn std::error:
         }
         item.setMenu(Some(&menu));
         controller.start();
+        if let Some(login_item) = &controller.ivars().login_item {
+            login_item.register_default();
+        }
         // Wait for AppKit's event loop before asking macOS to show a permission prompt.
         // Each selector targets the live controller and takes one NSTimer argument.
         let (prompt_timer, menu_timer, poll_timer) = unsafe {

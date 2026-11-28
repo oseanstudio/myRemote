@@ -18,6 +18,8 @@ mod mac_bonjour;
 #[cfg(target_os = "macos")]
 mod mac_handoff;
 #[cfg(target_os = "macos")]
+mod mac_login;
+#[cfg(target_os = "macos")]
 mod mac_menu;
 #[cfg(target_os = "macos")]
 mod mac_peer;

@@ -25,6 +25,8 @@ myRemote uses the macOS permission prompt when mouse and keyboard access is miss
 
 The macOS build is ad-hoc signed. If access is missing at the first launch of a new release, myRemote asks macOS to clear its old Accessibility and mouse and keyboard permissions so the new copy can request them. Approve the new grant in System Settings. If macOS blocks the first launch, open **System Settings → Privacy & Security → Open Anyway** after attempting to open it.
 
+On Mac, the installed app sets up **Open at Login** the first time you open it. Use **Open at Login** in the myRemote menu to change it. If macOS asks for approval, choose **Allow Open at Login…** to open Login Items in System Settings.
+
 If your iPhone cannot see myRemote, check the status at the top of the Mac menu. Use **Local Network Settings…** if macOS blocked discovery. Connect the iPhone and the computer to the same LAN when using local discovery.
 
 If your iPhone connects but the controls do nothing, press Back on the iPhone and check the myRemote menu. **iPhone input received** confirms that the button reached myRemote. **iPhone verified · waiting for Remote session** means the phone proved its identity and has yet to open the controls. If **Allow Accessibility…** appears, open it and grant this copy of myRemote access.
